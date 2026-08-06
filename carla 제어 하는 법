@@ -1,0 +1,162 @@
+# carla 제어 어떻게 하는 걸까?
+
+# terminator 화면 분할 및 삭제 단축키
+	┌──────────────┬───────────────────────────┐
+	│    단축키    │           기능             │
+	├──────────────┼───────────────────────────┤
+	│ Ctrl+Shift+E │ 세로 분할 (좌우로 나뉨)      │
+	├──────────────┼───────────────────────────┤
+	│ Ctrl+Shift+O │ 가로 분할 (위아래로 나뉨)    │
+	├──────────────┼───────────────────────────┤
+	│ Ctrl+Shift+W │ 현재 분할 창 닫기            │
+	├──────────────┼───────────────────────────┤
+	│ Ctrl+Tab     │ 다음 분할 창으로 이동        │
+	├──────────────┼───────────────────────────┤
+	│ Ctrl+Shift+X │ 현재 창 최대화/복원 토글      │
+	└──────────────┴───────────────────────────┘
+
+# carla 실행   /home/ailab/carla/start_carla.sh       # 모니터에 3D 화면
+
+# 제어 코드 실행 
+	cd ~/carla_control
+	python3 (코드 명).py --(입력 변수) (value) --(입력 변수) (value)
+
+# python에서 변수 입력하는 법
+	입력 변수는 아래와 코드를 통해 받을 수 있음
+	---------------------------------------
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--host", default="localhost")  # 이와 같이 받을 변수 명을 지정
+	parser.add_argument("--port", type=int, default=2000)
+	parser.add_argument("--target-speed", type=float, default=30.0, help="km/h")
+	parser.add_argument("--duration", type=float, default=20.0, help="seconds")
+	parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
+	args = parser.parse_args() # args에 넣어줌
+
+	steps = int(args.duration / args.dt)  # 코드에서는 arhs.변수명으로 사용 가능
+	---------------------------------------
+
+
+# 코드 기본 세팅
+	---------------------------------------
+	client = carla.Client(args.host, args.port) # 해당 포트와 해당 host의 carla 서버 tcp 접속
+	client.set_timeout(10.0) 
+	world = client.get_world()  # 현재 서버에 로드된 맵 핸들 획득. 새로 로드 안 함
+
+	original_settings = world.get_settings()
+	settings = world.get_settings()
+	settings.synchronous_mode = True  # 동기 모드 on
+	settings.fixed_delta_seconds = args.dt  # sampling time
+	world.apply_settings(settings)  # settings를 실제 carla 환경 setting에 올림
+
+	blueprint = world.get_blueprint_library().filter("vehicle.tesla.model3")[0]  # 차량모델지정
+	spawn_point = world.get_map().get_spawn_points()[0]# 맵에 정의된 155개의 스폰 포인트 중 0번 지정
+	vehicle = world.spawn_actor(blueprint, spawn_point)  # 위 정보들 기반으로 서버에 차량 액터를 생성
+	---------------------------------------
+
+
+# 유용한 명령어 및 함수
+
+	-> world.tick() : 시뮬레이션 한 스텝 전진
+
+	-> carla.VehicleControl() : 이 함수로 선언한 객체가 실제 제어 입력을 받음.
+	------------------------------------------------
+	control = carla.VehicleControl()
+	control.throttle = 0
+	control.brake = 0
+	control.steer = 0
+	------------------------------------------------
+
+	-> vehicle.apply_control(control) : vehicle 객체에 control 객체를 적용
+
+	-> vehicle.get_velocity() : ego 속도 벡터 반환 (vx,vy,vz)
+
+	-> vehicle.set_target_velocity(x=...,y=...,z=...) : vehicle 객체의 속도를 강제 입력
+
+	-> wheelbase, max_steer_rad = get_vehicle_geometry(vehicle) : wheelbase와 최대 조향각 반환
+	------------------------------------------------------------------------------------------
+	def get_vehicle_geometry(vehicle):
+	    physics = vehicle.get_physics_control()
+	    wheels = physics.wheels  # order: [front_left, front_right, rear_left, rear_right]
+	    front_mid = carla.Vector3D(
+		(wheels[0].position.x + wheels[1].position.x) / 2.0,
+		(wheels[0].position.y + wheels[1].position.y) / 2.0,
+		(wheels[0].position.z + wheels[1].position.z) / 2.0,
+	    )
+	    rear_mid = carla.Vector3D(
+		(wheels[2].position.x + wheels[3].position.x) / 2.0,
+		(wheels[2].position.y + wheels[3].position.y) / 2.0,
+		(wheels[2].position.z + wheels[3].position.z) / 2.0,
+	    )
+	    # wheel positions are in cm
+	    wheelbase = front_mid.distance(rear_mid) / 100.0
+	    max_steer_deg = (wheels[0].max_steer_angle + wheels[1].max_steer_angle) / 2.0
+	    return wheelbase, math.radians(max_steer_deg)
+    	------------------------------------------------------------------------------------------
+
+	-> PID : 에러 값만 넣으면 게인에 맞게 PID 출력 반환
+	------------------------------------------------
+	class PID:
+	    def __init__(self, kp, ki, kd, dt, out_min=-1.0, out_max=1.0):
+		self.kp, self.ki, self.kd, self.dt = kp, ki, kd, dt
+		self.out_min, self.out_max = out_min, out_max
+		self._integral = 0.0
+		self._prev_error = 0.0
+
+	    def step(self, error):
+		self._integral += error * self.dt
+		derivative = (error - self._prev_error) / self.dt
+		self._prev_error = error
+		out = self.kp * error + self.ki * self._integral + self.kd * derivative
+		clamped = max(self.out_min, min(self.out_max, out))
+		if clamped != out:  # anti-windup: don't accumulate integral while saturated
+		    self._integral -= error * self.dt
+		return clamped
+
+	pid = PID(kp=0.35, ki=0.15, kd=0.05, dt=args.dt)
+	control_value = pid.step(error)
+	------------------------------------------------
+
+	-> follow_with_spectator : 설정을 안해주면 화면이 차량을 안 따라감. 아래 함수를 정의하여 world, 
+	vehicle 객체를 입력해주면 알아서 차량을 따라감.
+	------------------------------------------------
+	def follow_with_spectator(world, vehicle, back=8.0, up=4.0, pitch=-15.0):
+	    """Move the spectator to a 3rd-person chase view behind the vehicle."""
+	    transform = vehicle.get_transform()
+	    yaw = transform.rotation.yaw
+	    offset = carla.Location(
+		x=-back * math.cos(math.radians(yaw)),
+		y=-back * math.sin(math.radians(yaw)),
+		z=up,
+	    )
+	    spectator_transform = carla.Transform(
+		transform.location + offset,
+		carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0),
+	    )
+	    world.get_spectator().set_transform(spectator_transform)
+    	------------------------------------------------
+    	
+    	-> build_path : 현재 맵에 존재하는 spawn_point에서 시작 인덱스와 도착 인덱스를 고르면 
+    	GlobalRoutePlanner라는 함수가 A* 알고리즘으로 글로벌 경로를 계획해줌. 이때 sampling_resolution을
+    	이용하여 각 waypoint 간의 간격을 m단위로 설정할 수 있음. 경로의 x,y,yaw의 배열을 반환함.
+    	------------------------------------------------------------------------------
+    	def build_path(world, sampling_resolution=1, origin_index=0, dest_index=50):
+	    """Trace a route with GlobalRoutePlanner and flatten it into x/y/yaw arrays."""
+	    spawn_points = world.get_map().get_spawn_points()
+	    dest_index = min(dest_index, len(spawn_points) - 1)
+	    if dest_index == origin_index:
+		dest_index = (origin_index + 1) % len(spawn_points)
+
+	    origin_transform = spawn_points[origin_index]
+	    destination = spawn_points[dest_index].location
+
+	    grp = GlobalRoutePlanner(world.get_map(), sampling_resolution)
+	    route = grp.trace_route(origin_transform.location, destination)
+	    if len(route) < 2:
+		raise RuntimeError("Route too short; pick a farther --dest-index.")
+
+	    path_x = [wp.transform.location.x for wp, _ in route]
+	    path_y = [wp.transform.location.y for wp, _ in route]
+	    path_yaw = [math.radians(wp.transform.rotation.yaw) for wp, _ in route]
+	    return origin_transform, path_x, path_y, path_yaw
+    	------------------------------------------------------------------------------
+
