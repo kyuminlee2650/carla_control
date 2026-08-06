@@ -5,13 +5,17 @@ shared color scale so gears stay visually comparable. u is a diverging
 quantity (negative = brake, positive = throttle, zero = neither), so the
 color scale is diverging around zero rather than a plain sequential ramp.
 
+Paths default to this script's own directory, so it runs from anywhere.
+
 Usage:
-    python3 visualize_lut.py --npz longitudinal_lut.npz --out lut_surfaces.png
-    python3 visualize_lut.py --npz longitudinal_lut.npz --raw-csv longitudinal_lut.csv --show
+    cd ~/carla_control
+    .venv/bin/python longitudinal_lookup/visualize_lut.py
+    .venv/bin/python longitudinal_lookup/visualize_lut.py --raw-csv longitudinal_lookup/longitudinal_lut.csv --show
 """
 
 import argparse
 import math
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,6 +27,9 @@ INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
 INK_MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
+
+# defaults resolve next to this script, so it runs from any working directory
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # diverging: blue (brake) <-> gray (neither) <-> red (throttle)
 DIVERGING_CMAP = LinearSegmentedColormap.from_list(
@@ -43,9 +50,9 @@ def style_3d_axes(ax):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--npz", default="longitudinal_lut.npz")
+    parser.add_argument("--npz", default=os.path.join(HERE, "longitudinal_lut.npz"))
     parser.add_argument("--raw-csv", default=None, help="overlay raw sweep samples as scatter points")
-    parser.add_argument("--out", default="lut_surfaces.png")
+    parser.add_argument("--out", default=os.path.join(HERE, "plots", "lut_surfaces.png"))
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--elev", type=float, default=25.0)
     parser.add_argument("--azim", type=float, default=-60.0)
@@ -102,6 +109,7 @@ def main():
     cbar.ax.yaxis.label.set_color(INK_SECONDARY)
     cbar.ax.tick_params(colors=INK_MUTED)
 
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fig.savefig(args.out, dpi=150, facecolor=SURFACE)
     print(f"Saved {args.out}")
     if args.show:

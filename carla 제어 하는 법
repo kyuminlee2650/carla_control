@@ -16,7 +16,7 @@
 	└──────────────┴───────────────────────────┘
 
 # carla 실행   /home/ailab/carla/start_carla.sh       # 모니터에 3D 화면
-
+	       /home/ailab/2026intern/carla/CarlaUE4.sh
 # 제어 코드 실행 
 	cd ~/carla_control
 	python3 (코드 명).py --(입력 변수) (value) --(입력 변수) (value)
