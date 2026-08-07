@@ -6,7 +6,7 @@ between an origin and destination to produce one.
 
 Usage:
     cd ~/carla_control
-    python3 stanley_pathtracking_v2.py --times-run 1
+    .venv/bin/python stanley_pathtracking_v2.py --times-run 1
 """
 
 import argparse
@@ -16,14 +16,13 @@ import sys
 import time
 import matplotlib.pyplot as plt
 
-sys.path.append("/home/ailab/carla/CARLA_0.9.15/PythonAPI/carla")
+sys.path.append("/home/ailab/2026intern/carla/PythonAPI/carla")
 
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
-from viz_utils import follow_with_spectator, plot_results
+from viz_utils import BevView, follow_with_spectator, plot_results
 from mock_planner import MockPlanner, local_to_world
-from bev_view import BevView
 
 class PID:
     def __init__(self, kp, ki, kd, dt, out_min=-1.0, out_max=1.0):
@@ -33,12 +32,19 @@ class PID:
         self._prev_error = 0.0
 
     def step(self, error):
-        self._integral += error * self.dt
         derivative = (error - self._prev_error) / self.dt
         self._prev_error = error
-        out = self.kp * error + self.ki * self._integral + self.kd * derivative
 
-        return out
+        # Conditional integration: throttle saturates at 1.0 on every uphill/corner recovery, and
+        # integrating through that saturation is what made the speed overshoot after each dip.
+        # Only accumulate when the integrator isn't pushing further into a limit it already hit.
+        trial = self._integral + error * self.dt
+        raw = self.kp * error + self.ki * trial + self.kd * derivative
+        if not ((raw > self.out_max and error > 0) or (raw < self.out_min and error < 0)):
+            self._integral = trial
+
+        out = self.kp * error + self.ki * self._integral + self.kd * derivative
+        return max(self.out_min, min(out, self.out_max))
 
 
 class LowPassFilter:
@@ -84,6 +90,22 @@ def clipping(value,max_val,min_val):
 
 
 
+def heading_from_points(path_x, path_y, stencil=6):
+    """Path heading from a centred finite difference over the polyline.
+
+    Preferred over each waypoint's own rotation.yaw, which is noisy around junctions and lane
+    changes -- that jitter fed straight into e_theta and showed up as steering chatter.
+    """
+    n = len(path_x)
+    unwrapper = AngleUnwrapper()
+    headings = []
+    for i in range(n):
+        a = max(0, i - stencil)
+        b = min(n - 1, i + stencil)
+        headings.append(unwrapper.step(math.atan2(path_y[b] - path_y[a], path_x[b] - path_x[a])))
+    return headings
+
+
 def build_path(world, sampling_resolution=1, origin_index=0, dest_index=100):
     """Trace a route with GlobalRoutePlanner and flatten it into x/y/yaw arrays."""
     spawn_points = world.get_map().get_spawn_points()
@@ -101,13 +123,17 @@ def build_path(world, sampling_resolution=1, origin_index=0, dest_index=100):
 
     path_x = [wp.transform.location.x for wp, _ in route]
     path_y = [wp.transform.location.y for wp, _ in route]
-    yaw_unwrapper = AngleUnwrapper()
-    path_yaw = [yaw_unwrapper.step(math.radians(wp.transform.rotation.yaw)) for wp, _ in route]
+    path_yaw = heading_from_points(path_x, path_y)
     return origin_transform, path_x, path_y, path_yaw
 
 
-def get_vehicle_geometry(vehicle):
-    """Wheelbase (m) and max front-wheel steer angle (rad) from the spawned vehicle's physics."""
+def get_vehicle_geometry(vehicle, spawn_transform):
+    """Wheelbase (m), max front-wheel steer angle (rad), and front-axle offset (m).
+
+    spawn_transform must be the pose the vehicle was spawned at: in synchronous mode the server
+    has not populated the actor yet before the first world.tick(), so vehicle.get_transform()
+    still reads (0, 0, 0) here and cannot be used as the body-frame reference.
+    """
     physics = vehicle.get_physics_control()
     wheels = physics.wheels  # order: [front_left, front_right, rear_left, rear_right]
     front_mid = carla.Vector3D(
@@ -124,9 +150,24 @@ def get_vehicle_geometry(vehicle):
     wheelbase = front_mid.distance(rear_mid) / 100.0
     max_steer_deg = (wheels[0].max_steer_angle + wheels[1].max_steer_angle) / 2.0
 
-    print(front_mid/100,rear_mid/100)
-    print(f"wheelbase={wheelbase:.2f} m  max_steer={max_steer_deg:.1f} deg")
-    return wheelbase, math.radians(max_steer_deg)
+    # Stanley is defined at the front axle, but transform.location is the actor origin, which sits
+    # between the axles (and not at their midpoint). Measure how far ahead of the origin the front
+    # axle is, in the body frame, so the control loop can shift its reference point there.
+    yaw = math.radians(spawn_transform.rotation.yaw)
+    dx = front_mid.x / 100.0 - spawn_transform.location.x
+    dy = front_mid.y / 100.0 - spawn_transform.location.y
+    front_offset = dx * math.cos(yaw) + dy * math.sin(yaw)
+    if not 0.0 < front_offset < wheelbase:
+        # a bad reference pose silently turns into a huge phantom cross-track error, so fail loudly
+        raise RuntimeError(f"front_offset={front_offset:.2f} m is not inside the wheelbase "
+                           f"({wheelbase:.2f} m); spawn_transform does not match the vehicle pose.")
+
+    print(f"wheelbase={wheelbase:.2f} m  max_steer={max_steer_deg:.1f} deg  "
+          f"front_axle_offset={front_offset:.2f} m")
+    return wheelbase, math.radians(max_steer_deg), front_offset
+
+
+
 
 def lateral_error(x, y, yaw, path_x, path_y, last_idx, search_window=30):
     """Signed cross-track error of (x, y) against an arbitrary fixed path -- independent of whatever
@@ -154,20 +195,27 @@ def world_to_local(x, y, yaw, origin_x, origin_y, origin_yaw):
 
 
 
-def stanley_control(v_x, e_y, e_theta, k_theta=1,k=1.2):
-    delta = k_theta * e_theta + math.atan2(k * e_y, v_x)
-    return delta
+def stanley_control(v_x, e_y, e_theta, k_theta=1.0, k=1.2, k_soft=1.0):
+    """Stanley steering law (Hoffmann et al. 2007): delta = e_theta + atan(k * e_y / v).
+
+    k_theta is 1.0 because the canonical law applies no gain to the heading term at all.
+
+    k_soft is the paper's softening constant. Without it the atan2 denominator reaches zero at
+    standstill and the law returns exactly +-90 deg for any nonzero e_y -- a 0.5 m offset pins the
+    steering at the clip, which is what locks the wheel over after the vehicle stops.
+    """
+    return k_theta * e_theta + math.atan2(k * e_y, k_soft + abs(v_x))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
-    parser.add_argument("--target-speed", type=float, default=15*3.6, help="km/h")
+    parser.add_argument("--target-speed", type=float, default=5*3.6, help="km/h")
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
     parser.add_argument("--goal-tolerance", type=float, default=2.0, help="stop within this many meters of goal (m)")
     parser.add_argument("--times-run", type=float,default=2.0, help="how times for simulation running?")
-    parser.add_argument("--max-duration", type=float, default=30.0, help="safety cutoff (s)")
+    parser.add_argument("--max-duration", type=float, default=100.0, help="safety cutoff (s)")
     parser.add_argument("--plot-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots"),
                          help="directory to save the end-of-run result figure into")
     parser.add_argument("--no-plot", action="store_true", help="skip saving the result figure")
@@ -203,11 +251,11 @@ def main():
         z=0.0,
     ))
 
-    wheelbase, max_steer = get_vehicle_geometry(vehicle)
+    wheelbase, max_steer, front_offset = get_vehicle_geometry(vehicle, origin_transform)
 
     pid = PID(kp=0.35, ki=0.15, kd=0.05, dt=args.dt)
     speed_filter = LowPassFilter(tau=0.1, dt=args.dt, initial=0.0)
-    steer_filter = LowPassFilter(tau=0.1, dt=args.dt, initial=0)
+    steer_filter = LowPassFilter(tau=0.01, dt=args.dt, initial=0)
     yaw_unwrapper = AngleUnwrapper()
     rh_unwrapper = AngleUnwrapper()
     last_idx = 0
@@ -231,10 +279,17 @@ def main():
             vel_vec = vehicle.get_velocity()
             # body-frame longitudinal velocity (not vel_vec.x, which is world-frame)
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)
-            road_heading = rh_unwrapper.step(path_yaw[last_idx])
 
-            last_idx, e_y = lateral_error(ego_x, ego_y, yaw, path_x, path_y, last_idx)
-            e_theta = road_heading - yaw
+            # Stanley tracks the front axle, not the actor origin
+            front_x = ego_x + front_offset * math.cos(yaw)
+            front_y = ego_y + front_offset * math.sin(yaw)
+
+            # index first, then read the path off it -- reading before the update fed the controller
+            # the previous step's road heading, a free half-metre of lag at 15 m/s
+            last_idx, e_y = lateral_error(front_x, front_y, yaw, path_x, path_y, last_idx)
+            road_heading = rh_unwrapper.step(path_yaw[last_idx])
+            # both traces are unwrapped, so normalize_angle recovers the true error either way
+            e_theta = normalize_angle(path_yaw[last_idx] - yaw)
             e_vel = target_speed_ms - v_x
 
             delta = stanley_control(v_x, e_y, e_theta)
@@ -288,6 +343,8 @@ def main():
         vehicle.destroy()
         world.apply_settings(original_settings)
         print("Cleaned up: vehicle destroyed, world settings restored.")
+
+    print_error_summary(hist, target_speed_ms)
 
     if not args.no_plot and len(hist["t"]) > 1:
         try:

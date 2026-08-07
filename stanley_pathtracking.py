@@ -20,9 +20,8 @@ sys.path.append("/home/ailab/carla/CARLA_0.9.15/PythonAPI/carla")
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
-from viz_utils import follow_with_spectator, plot_results
+from viz_utils import BevView, follow_with_spectator, plot_results
 from mock_planner import MockPlanner, local_to_world
-from bev_view import BevView
 
 
 class PID:

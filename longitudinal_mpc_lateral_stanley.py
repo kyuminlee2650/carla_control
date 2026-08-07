@@ -50,9 +50,8 @@ sys.path.append(os.path.join(HERE, "longitudinal_lookup"))
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
-from viz_utils import follow_with_spectator, plot_results
+from viz_utils import BevView, VIEWS, VideoRecorder, follow_with_spectator, plot_results, run_name
 from mock_planner import MockPlanner, local_to_world
-from bev_view import BevView
 
 from longitudinal_lut import LongitudinalLUT
 from longitudinal_pi import LongitudinalAccelPI
@@ -180,17 +179,9 @@ def stanley_control(v_x, e_y, e_theta, k_theta=0.5,k=1):
 
 
 def speed_profile(t, args):
-    """Reference (v_des, a_des) at time t, with a_des = d v_des / dt.
 
-    The warm-up holds v0 with zero acceleration. CARLA's transmission starts in
-    first gear no matter what speed the vehicle is spawned at, so without it the
-    profile would begin during a violent downshift transient.
-    """
-    if t < args.warmup:
-        return args.v0, 0.0
-    tau = t - args.warmup
     w = 2.0 * math.pi / args.period
-    return args.v0 + args.amplitude * math.sin(w * tau), args.amplitude * w * math.cos(w * tau)
+    return args.v0 + args.amplitude * math.sin(w * t), args.amplitude * w * math.cos(w * t)
 
 
 def build_x_ref(mpc, t, args):
@@ -307,14 +298,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
-    parser.add_argument("--v0", type=float, default=15.0, help="profile centre speed (m/s)")
+    parser.add_argument("--v0", type=float, default=10.0, help="profile centre speed (m/s)")
     parser.add_argument("--amplitude", type=float, default=4.0, help="speed profile amplitude A (m/s)")
     parser.add_argument("--period", type=float, default=10.0, help="speed profile period T (s)")
-    parser.add_argument("--warmup", type=float, default=15.0,
-                        help="hold v0 this long before the profile starts, so the vehicle reaches it and settles (s)")
-    parser.add_argument("--start-speed", type=float, default=15,
-                        help="inject this speed at spawn; 0 starts from rest. CARLA's transmission always "
-                             "starts in first gear, so injecting cruise speed triggers a violent downshift")
     parser.add_argument("--gear", type=int, default=0, help="force this gear; 0 leaves shifting to CARLA")
     parser.add_argument("--map", default="", help="load this map first, e.g. Town06; default keeps the current one")
     parser.add_argument("--origin-index", type=int, default=0, help="route start spawn point")
@@ -328,6 +314,13 @@ def main():
     parser.add_argument("--no-plot", action="store_true", help="skip the result figure")
     parser.add_argument("--no-show", action="store_true", help="save the figure but do not open a window")
     parser.add_argument("--no-live-view", action="store_true", help="skip the live BEV plan/vehicle view")
+    parser.add_argument("--record", nargs="?", const="auto", default="",
+                        help="record the drive to an mp4; bare flag auto-names it under --video-dir")
+    parser.add_argument("--video-dir", default=os.path.join(HERE, "videos"),
+                        help="where auto-named recordings go")
+    parser.add_argument("--record-view", default="chase", choices=sorted(VIEWS),
+                        help="camera mount for the recording")
+    parser.add_argument("--record-res", default="1280x720", help="recording resolution, WxH")
     parser.add_argument("--lut", default=os.path.join(HERE, "longitudinal_lookup", "longitudinal_lut.npz"))
     parser.add_argument("--np", dest="n_p", type=int, default=20, help="MPC prediction horizon (steps)")
     parser.add_argument("--nc", dest="n_c", type=int, default=10, help="MPC control horizon (steps); input held after this")
@@ -358,17 +351,6 @@ def main():
 
     origin_transform, path_x, path_y, path_yaw = build_path(
         world, origin_index=args.origin_index, dest_index=args.dest_index)
-    # a curvy route makes Stanley work hard and pollutes the longitudinal measurement,
-    # so report how straight the usable part of it actually is
-    turn = [abs(math.degrees(path_yaw[i + 1] - path_yaw[i])) for i in range(len(path_yaw) - 1)]
-    straight_m = next((i for i, d in enumerate(turn) if d > 1.0), len(turn))
-    print(f"Route: {len(path_x)} points, start=({path_x[0]:.1f}, {path_y[0]:.1f}) "
-          f"goal=({path_x[-1]:.1f}, {path_y[-1]:.1f})")
-    print(f"  첫 곡선까지 {straight_m} m, 전체 방향전환 {sum(turn):.0f} deg")
-    reach = args.v0 * args.max_duration
-    if straight_m < reach * 0.5:
-        print(f"  경고: {args.max_duration:.0f}초 동안 최대 {reach:.0f}m 를 달리는데 직선은 {straight_m}m 입니다 "
-              f"— 곡선에서 이탈·충돌할 수 있습니다")
 
     for actor in world.get_actors().filter("vehicle.*"):
         if actor.get_location().distance(origin_transform.location) < 5.0:
@@ -378,10 +360,10 @@ def main():
     vehicle = world.spawn_actor(blueprint, origin_transform)
 
     initial_yaw = math.radians(origin_transform.rotation.yaw)
-    if args.start_speed > 0:
+    if args.v0 > 0:
         vehicle.set_target_velocity(carla.Vector3D(
-            x=args.start_speed * math.cos(initial_yaw),
-            y=args.start_speed * math.sin(initial_yaw),
+            x=args.v0 * math.cos(initial_yaw),
+            y=args.v0 * math.sin(initial_yaw),
             z=0.0,
         ))
 
@@ -394,16 +376,8 @@ def main():
     mpc.reset(0.0)
     u_prev = 0.0
     accel_ctrl = LongitudinalAccelPI(lut, kp=args.kp, ki=args.ki, tau=args.accel_tau)
-    w = 2.0 * math.pi / args.period
     print(f"MPC: Np={args.n_p} Nc={args.n_c} (지평 {args.n_p*args.dt:.1f}s), "
           f"w_v={args.w_v} w_a={args.w_a} w_j={args.w_j}, |jerk| <= {args.jerk_max}")
-    print(f"프로파일: v = {args.v0} + {args.amplitude}·sin(2πt/{args.period}), "
-          f"가속도 진폭 {args.amplitude*w:.2f} m/s^2, 저크 진폭 {args.amplitude*w*w:.2f} m/s^3")
-    if args.amplitude * w * w > args.jerk_max:
-        print(f"  경고: 프로파일이 요구하는 저크가 제약 {args.jerk_max}을 넘습니다 — "
-              f"참조 자체가 실현 불가능하므로 제약을 측정하게 됩니다")
-    print(f"기어: {'자동변속' if args.gear == 0 else f'{args.gear}단 고정'}, "
-          f"워밍업 {args.warmup}s 후 채점 시작")
 
     accel_filter = LowPassFilter(tau=args.accel_tau, dt=args.dt, initial=0.0)
     prev_v = None
@@ -413,6 +387,16 @@ def main():
     last_idx = 0
 
     bev = None if args.no_live_view else BevView(path_x, path_y)
+
+    recorder = None
+    if args.record:
+        # same <script>_<date>_<time> stem the figures get, so the mp4 sits next to its plots
+        video_path = (os.path.join(args.video_dir, run_name() + ".mp4")
+                      if args.record == "auto" else args.record)
+        rec_w, rec_h = (int(v) for v in args.record_res.lower().split("x"))
+        recorder = VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
+                                 width=rec_w, height=rec_h, view=args.record_view)
+
     collision = CollisionWatch(world, vehicle)
     collision.arm()
 
@@ -495,8 +479,7 @@ def main():
             hist["a_des"].append(a_des)
 
             if i % 10 == 0:
-                phase = "워밍업" if t < args.warmup else "      "
-                print(f"t={t:5.1f}s {phase} v={v_x:5.2f}/{v_des:5.2f}  e_v={v_x-v_des:+5.2f}  "
+                print(f"t={t:5.1f}s v={v_x:5.2f}/{v_des:5.2f}  e_v={v_x-v_des:+5.2f}  "
                       f"a={a_meas:+5.2f}/{a_des:+5.2f}  j={jerk:+5.2f}  u={control_value:+.2f}  "
                       f"gear={gear}  e_y={e_y:+.2f}")
 
@@ -521,6 +504,8 @@ def main():
         print("\nInterrupted.")
     finally:
         collision.destroy()
+        if recorder is not None:
+            recorder.close()  # before vehicle.destroy(): the camera is attached to it
         if bev is not None:
             bev.close()
             plt.ioff()  # BevView leaves interactive mode on; turn it off so plot_results()'s plt.show() blocks again

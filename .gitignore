@@ -8,7 +8,10 @@ venv/
 
 # 실행 결과물 (재생성 가능)
 plots/
+videos/
+runs/
 *.png
+*.mp4
 *.csv
 *.npz
 *.npy
