@@ -8,18 +8,25 @@ single law needs (e.g. Stanley's front-axle reference point, which it derives fr
 """
 
 import math
+import os
 import sys
 
-sys.path.append("/home/ailab/2026intern/carla/PythonAPI/carla")
+# CARLA's PyPI wheel (`pip install carla`) only ships the compiled client API; the
+# navigation helpers under PythonAPI/carla/agents (GlobalRoutePlanner) only exist in the
+# simulator's own source tree, so that tree still has to be added to sys.path by hand.
+# CARLA_ROOT overrides the per-machine default below (lab Ubuntu box vs. home Windows box).
+CARLA_ROOT = os.environ.get("CARLA_ROOT") or (
+    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/2026intern/carla"
+)
+sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 
 class PID:
-    def __init__(self, kp, ki, kd, dt, out_min=-1.0, out_max=1.0):
+    def __init__(self, kp, ki, kd, dt):
         self.kp, self.ki, self.kd, self.dt = kp, ki, kd, dt
-        self.out_min, self.out_max = out_min, out_max
         self._integral = 0.0
         self._prev_error = 0.0
 
@@ -27,16 +34,13 @@ class PID:
         derivative = (error - self._prev_error) / self.dt
         self._prev_error = error
 
-        # Conditional integration: throttle saturates at 1.0 on every uphill/corner recovery, and
-        # integrating through that saturation is what made the speed overshoot after each dip.
-        # Only accumulate when the integrator isn't pushing further into a limit it already hit.
         trial = self._integral + error * self.dt
         raw = self.kp * error + self.ki * trial + self.kd * derivative
-        if not ((raw > self.out_max and error > 0) or (raw < self.out_min and error < 0)):
+        if not ((raw > 1 and error > 0) or (raw < -1 and error < 0)):
             self._integral = trial
 
         out = self.kp * error + self.ki * self._integral + self.kd * derivative
-        return max(self.out_min, min(out, self.out_max))
+        return out
 
 
 class LowPassFilter:
@@ -120,20 +124,7 @@ def build_path(world, sampling_resolution=1, origin_index=0, dest_index=100):
 
 
 def get_vehicle_geometry(vehicle, spawn_transform):
-    """Bicycle-model parameters: (wheelbase, lf, lr, max_steer).
 
-    lf / lr are the distances from the centre of mass to the front and rear axle -- the split every
-    dynamic bicycle model, slip-angle estimate and lateral tyre-force term needs. max_steer is the
-    max front-wheel angle in rad; all distances are metres.
-
-    A controller that references some other point on the body (Stanley's front axle, a pure-pursuit
-    rear axle) derives that offset from lf/lr on its own -- it is not vehicle geometry, it is a
-    property of the law.
-
-    spawn_transform must be the pose the vehicle was spawned at: in synchronous mode the server has
-    not populated the actor yet before the first world.tick(), so vehicle.get_transform() still
-    reads (0, 0, 0) here and cannot be used as the body-frame reference.
-    """
     physics = vehicle.get_physics_control()
     wheels = physics.wheels  # order: [front_left, front_right, rear_left, rear_right]
     front_mid = carla.Vector3D(
@@ -150,10 +141,6 @@ def get_vehicle_geometry(vehicle, spawn_transform):
     wheelbase = front_mid.distance(rear_mid) / 100.0
     max_steer_deg = (wheels[0].max_steer_angle + wheels[1].max_steer_angle) / 2.0
 
-    # Both axles and the centre of mass are measured against the actor origin, which sits between
-    # the axles (and not at their midpoint): the wheels come back as world positions, so project
-    # them onto the heading to get the body-frame offset, while center_of_mass is already relative
-    # to the origin in the body frame.
     yaw = math.radians(spawn_transform.rotation.yaw)
 
     def offset_from_origin(wheel_mid):
@@ -177,6 +164,34 @@ def get_vehicle_geometry(vehicle, spawn_transform):
 
 
 
+class CollisionWatch:
+    """Latches the first collision reported for the vehicle.
+
+    A sweep that drives into scenery and keeps logging records the wall, not the powertrain (a
+    -863 m/s^2 spike, then a bounce and re-acceleration) -- a trial now stops on impact and the
+    caller discards the run-up to it too, since the vehicle is already disturbed before the
+    contact is reported.
+    """
+
+    def __init__(self, world, vehicle):
+        blueprint = world.get_blueprint_library().find("sensor.other.collision")
+        self.sensor = world.spawn_actor(blueprint, carla.Transform(), attach_to=vehicle)
+        self.sensor.listen(self._on_collision)
+        self.hit = False
+
+    def _on_collision(self, _event):
+        self.hit = True
+
+    def arm(self):
+        self.hit = False
+
+    def destroy(self):
+        self.sensor.stop()
+        self.sensor.destroy()
+
+
+
+
 def lateral_error(x, y, yaw, path_x, path_y, last_idx, search_window=30):
     """Signed cross-track error of (x, y) against an arbitrary fixed path -- independent of whatever
     trajectory a controller happens to be tracking. Used to score true deviation from the global
@@ -191,14 +206,5 @@ def lateral_error(x, y, yaw, path_x, path_y, last_idx, search_window=30):
     err = -math.sin(yaw) * dx + math.cos(yaw) * dy
     return idx, err
 
-
-def world_to_local(x, y, yaw, origin_x, origin_y, origin_yaw):
-    """Inverse of mock_planner.local_to_world for a single pose: world (x, y, yaw) into the
-    ego-relative frame defined by (origin_x, origin_y, origin_yaw)."""
-    dx, dy = x - origin_x, y - origin_y
-    cos_o, sin_o = math.cos(origin_yaw), math.sin(origin_yaw)
-    local_x = dx * cos_o + dy * sin_o
-    local_y = -dx * sin_o + dy * cos_o
-    return local_x, local_y, normalize_angle(yaw - origin_yaw)
 
 

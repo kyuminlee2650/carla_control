@@ -1,8 +1,8 @@
 """Runtime lookup for the (gear, v_x, a_x) -> u longitudinal control-input table.
 
-Loads the .npz produced by build_reverse_lut.py (which itself inverts the raw
-sweep data from build_longitudinal_lut.py) and serves fast bilinear lookups
-for a longitudinal MPC/controller.
+Loads the .npz produced by build_lut.py (which itself fits the raw sweep data
+from collect_lut_data.py) and serves fast bilinear lookups for a longitudinal
+MPC/controller.
 """
 
 import numpy as np

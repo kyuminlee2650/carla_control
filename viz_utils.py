@@ -17,8 +17,10 @@ Both VideoRecorder and BevView follow the same lifecycle: construct once after t
 spawned, call close() from the caller's finally block.
 
 plot_results() draws three figures:
-    fig 1  lateral tracking     -- cross-track error, heading error, yaw, yaw rate, v_y, steer
-    fig 2  longitudinal tracking-- speed error, speed, a_x, jerk, throttle, brake
+    fig 1  lateral tracking     -- cross-track error, heading error, yaw, yaw rate, yaw accel,
+                                   v_y, a_y, steer
+    fig 2  longitudinal tracking-- speed error, speed, a_x, jerk, total jerk magnitude,
+                                   throttle + brake (combined)
     fig 3  trajectory           -- desired path vs. ego trajectory (equal aspect, so its own figure)
 
 Panels whose series a given stack does not record are drawn as an explicit "not recorded" note
@@ -39,6 +41,8 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 -- registers the 3D projection
 import numpy as np
 
 
@@ -80,6 +84,10 @@ COLOR_ORANGE = "#eb6834"    # ego trajectory
 COLOR_AQUA = "#1baf7a"      # throttle
 COLOR_RED = "#e34948"       # brake / error
 COLOR_PURPLE = "#8b5cf6"    # jerk / derived series
+
+# cycled across runs when a plot function is handed {label: hist} instead of one hist -- index 0
+# is COLOR_BLUE, so a single-run call still gets the same look it always had
+COMPARE_COLORS = [COLOR_BLUE, COLOR_ORANGE, COLOR_AQUA, COLOR_RED, COLOR_PURPLE]
 
 
 def _style_axes(ax):
@@ -401,6 +409,20 @@ def error_stats(values):
     return rmse, max(abs(v) for v in values), sum(values) / n
 
 
+def magnitude_stats(values):
+    """(mean|v|, peak|v|) of a series. Returns None for an empty series.
+
+    For signals that oscillate around zero by design (acceleration, jerk, yaw rate) a signed
+    mean/RMSE against a zero reference isn't the interesting number -- how big the swings
+    typically are, and how big they get, is. error_stats() stays the right tool for anything
+    that is itself a tracking error (e_y, e_theta, speed error).
+    """
+    values = [abs(v) for v in values if v is not None and not math.isnan(v)]
+    if not values:
+        return None
+    return sum(values) / len(values), max(values)
+
+
 def speed_error_series(hist, target_speed_ms):
     """Reference-minus-measured speed, using a logged per-step reference when there is one.
 
@@ -414,19 +436,44 @@ def speed_error_series(hist, target_speed_ms):
 
 
 def print_error_summary(hist, target_speed_ms):
-    """RMSE / max / mean of each tracked error over the whole run."""
+    """RMSE / max / mean of each tracked error, plus mean/peak magnitude of the raw longitudinal
+    and lateral dynamics signals, over the whole run.
+
+    The dynamics rows are printed as sections that appear only when this stack actually recorded
+    them -- a steer=0 run (e.g. longitudinal_PID.py) has no yaw_rate/yaw_acc/a_y, and the section
+    is skipped rather than printed empty.
+    """
     if not hist["t"]:
         return
 
     print(f"\n=== error summary: {len(hist['t'])} steps, {hist['t'][-1]:.1f} s ===")
-    for name, unit, series in (("cross-track", "m", hist["e_y"]),
-                               ("heading    ", "deg", hist["e_theta"]),
+    for name, unit, series in (("cross-track", "m", hist.get("e_y", [])),
+                               ("heading    ", "deg", hist.get("e_theta", [])),
                                ("speed      ", "m/s", speed_error_series(hist, target_speed_ms))):
         stats = error_stats(series)
         if stats is None:
             continue
         rmse, peak, bias = stats
         print(f"  {name}  RMSE={rmse:7.3f} {unit:<3}  max|e|={peak:7.3f} {unit:<3}  mean={bias:+7.3f} {unit}")
+
+    long_rows = (("accel a_x   ", "m/s^2", hist.get("a_x", [])),
+                ("jerk        ", "m/s^3", hist.get("jerk", [])),
+                ("|jerk| total", "m/s^3", hist.get("jerk_total", [])))
+    lat_rows = (("yaw rate ", "deg/s  ", hist.get("yaw_rate", [])),
+               ("yaw accel", "rad/s^2", hist.get("yaw_acc", [])),
+               ("accel a_y", "m/s^2  ", hist.get("a_y", [])))
+
+    for section, rows in (("longitudinal dynamics", long_rows), ("lateral dynamics", lat_rows)):
+        printed_header = False
+        for name, unit, series in rows:
+            stats = magnitude_stats(series)
+            if stats is None:
+                continue
+            if not printed_header:
+                print(f"  -- {section} --")
+                printed_header = True
+            mean_abs, peak = stats
+            print(f"  {name}  mean|.|={mean_abs:7.3f} {unit:<7}  peak|.|={peak:7.3f} {unit}")
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +502,13 @@ def _get(hist, key):
     return arr
 
 
+def _runs(data):
+    """Normalize a single hist dict, or {label: hist} for a multi-controller comparison, into the
+    latter. A lone hist has a top-level "t" key; a label dict does not (no controller is named
+    "t"), so that's what tells the two apart."""
+    return {"": data} if "t" in data else data
+
+
 def _not_recorded(ax, key):
     ax.text(0.5, 0.5, f'"{key}" not recorded by this run', transform=ax.transAxes,
             ha="center", va="center", color=COLOR_MUTED, fontsize=10)
@@ -470,12 +524,62 @@ def _rmse_badge(ax, e, unit):
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor=COLOR_AXIS, alpha=0.85))
 
 
-def _error_panel(ax, t, e, ylabel, color, unit):
+def _error_multi(ax, runs, colors, multi, ylabel, panel_title, unit, series_fn):
+    """One error-vs-time panel, for a single run or several overlaid.
+
+    series_fn(hist) -> the error array for that run (or None if this stack never recorded it).
+    Single run keeps the filled-band/corner-badge look; multiple runs switch to plain colored
+    lines with each RMSE folded into the legend, since stacked badges stop being readable.
+    """
     ax.axhline(0.0, color=COLOR_AXIS, linewidth=1, linestyle="--")
-    ax.plot(t, e, color=color, linewidth=1.6, solid_capstyle="round")
-    ax.fill_between(t, e, 0, color=color, alpha=0.15)
+    found = False
+    for label, hist in runs.items():
+        e = series_fn(hist)
+        if e is None:
+            continue
+        found = True
+        t = np.asarray(hist["t"], dtype=float)
+        color = colors[label]
+        if not multi:
+            ax.plot(t, e, color=color, linewidth=1.6, solid_capstyle="round")
+            ax.fill_between(t, e, 0, color=color, alpha=0.15)
+            _rmse_badge(ax, e, unit)
+        else:
+            stats = error_stats(e)
+            tag = f"{label} (RMSE={stats[0]:.2f})" if stats else label
+            ax.plot(t, e, color=color, linewidth=1.4, label=tag)
+    if not found:
+        _not_recorded(ax, "e")
+    elif multi:
+        _legend(ax)
     ax.set_ylabel(ylabel)
-    _rmse_badge(ax, e, unit)
+    ax.set_title(panel_title)
+
+
+def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_color=None):
+    """One plain time-series panel (acceleration, jerk, yaw rate, ...), for a single run or
+    several overlaid. Single run gets an optional fill; multiple runs get one colored line each
+    plus a legend. "not recorded" if no run in `runs` logged `key` at all."""
+    found = False
+    for label, hist in runs.items():
+        series = _get(hist, key)
+        if series is None:
+            continue
+        found = True
+        t = np.asarray(hist["t"], dtype=float)
+        color = colors[label]
+        ax.plot(t, series, color=color, linewidth=1.3 if multi else 1.5,
+               solid_capstyle="round", label=label if multi else None)
+        if not multi and fill_color:
+            ax.fill_between(t, series, 0, color=fill_color, alpha=0.15)
+    if not found:
+        _not_recorded(ax, key)
+    else:
+        ax.axhline(0.0, color=COLOR_AXIS, linewidth=1)
+        if multi:
+            _legend(ax)
+    ax.set_ylabel(ylabel)
+    ax.set_title(panel_title)
 
 
 def _save(fig, out_dir, stem):
@@ -488,139 +592,168 @@ def _save(fig, out_dir, stem):
 # 8. result figures
 # ---------------------------------------------------------------------------
 
-def plot_lateral(hist, title="Lateral tracking performance"):
-    """fig 1: cross-track error, heading error, yaw pair, yaw rate, lateral velocity, steer."""
-    t = np.asarray(hist["t"], dtype=float)
-    fig, (ax_ey, ax_eth, ax_yaw, ax_r, ax_vy, ax_steer) = _panels(title)
+def plot_lateral(data, title="Lateral tracking performance"):
+    """fig 1: cross-track error, heading error, yaw pair, yaw rate, yaw acceleration, lateral
+    velocity, lateral acceleration, steer -- for one controller, or several overlaid.
 
-    _error_panel(ax_ey, t, _get(hist, "e_y"), "cross-track error (m)", COLOR_ORANGE, "m")
-    ax_ey.set_title("Cross-track error vs. global path (front axle)")
+    data: a single hist dict, or {label: hist} to compare controllers on one figure (see
+    plot_longitudinal, which this mirrors panel-for-panel via the same _error_multi/
+    _dynamics_panel helpers). A lone hist keeps the original look; multiple runs switch each
+    panel to plain colored lines -- one color per run from COMPARE_COLORS -- with RMSE folded
+    into the legend for the two error panels.
+    """
+    runs = _runs(data)
+    multi = len(runs) > 1
+    fig, (ax_ey, ax_eth, ax_yaw, ax_r, ax_racc, ax_vy, ax_ay, ax_steer) = _panels(
+        title, n_rows=4, figsize=(15, 13))
+    colors = dict(zip(runs, COMPARE_COLORS))
 
-    _error_panel(ax_eth, t, _get(hist, "e_theta"), "heading error (deg)", COLOR_RED, "deg")
-    ax_eth.set_title("Heading error (path - vehicle)")
+    _error_multi(ax_ey, runs, colors, multi, "lateral error (m)", "Lateral error", "m",
+                lambda hist: _get(hist, "e_y"))
+    _error_multi(ax_eth, runs, colors, multi, "heading error (deg)", "Heading error", "deg",
+                lambda hist: _get(hist, "e_theta"))
 
-    ax_yaw.plot(t, hist["path_yaw"], color=COLOR_MUTED, linewidth=2, linestyle="--", label="path yaw")
-    ax_yaw.plot(t, hist["yaw"], color=COLOR_BLUE, linewidth=1.8, solid_capstyle="round", label="ego yaw")
+    first_hist = next(iter(runs.values()))
+    ax_yaw.plot(first_hist["t"], first_hist["path_yaw"], color=COLOR_MUTED, linewidth=2,
+               linestyle="--", label="path yaw")
+    for label, hist in runs.items():
+        ax_yaw.plot(hist["t"], hist["yaw"], color=colors[label], linewidth=1.8,
+                   solid_capstyle="round", label=(label or "ego yaw"))
     ax_yaw.set_ylabel("heading (deg)")
     ax_yaw.set_title("Vehicle heading vs. road heading")
-    _legend(ax_yaw, ncol=2)
+    _legend(ax_yaw, ncol=min(len(runs) + 1, 4))
 
-    yaw_rate = _get(hist, "yaw_rate")
-    if yaw_rate is None:
-        _not_recorded(ax_r, "yaw_rate")
-    else:
-        ax_r.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-        ax_r.plot(t, yaw_rate, color=COLOR_PURPLE, linewidth=1.5, solid_capstyle="round")
-    ax_r.set_ylabel("yaw rate (deg/s)")
-    ax_r.set_title("Yaw rate")
+    _dynamics_panel(ax_r, runs, colors, multi, "yaw_rate", "yaw rate (deg/s)", "Yaw rate")
+    _dynamics_panel(ax_racc, runs, colors, multi, "yaw_acc", "yaw accel (rad/s$^2$)", "Yaw acceleration")
+    _dynamics_panel(ax_vy, runs, colors, multi, "v_y", "$v_y$ (m/s)", "Lateral velocity (body frame)")
+    _dynamics_panel(ax_ay, runs, colors, multi, "a_y", "$a_y$ (m/s$^2$)", "Lateral acceleration (body frame)")
+    ax_ay.set_xlabel("t (s)")
 
-    v_y = _get(hist, "v_y")
-    if v_y is None:
-        _not_recorded(ax_vy, "v_y")
-    else:
-        ax_vy.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-        ax_vy.plot(t, v_y, color=COLOR_AQUA, linewidth=1.5, solid_capstyle="round")
-    ax_vy.set_ylabel("$v_y$ (m/s)")
-    ax_vy.set_title("Lateral velocity (body frame)")
-    ax_vy.set_xlabel("t (s)")
-
-    ax_steer.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-    ax_steer.plot(t, hist["steer_deg"], color=COLOR_BLUE, linewidth=1.5, solid_capstyle="round")
-    ax_steer.set_ylabel("steer (deg)")
-    ax_steer.set_title("Steering angle (front wheel)")
+    _dynamics_panel(ax_steer, runs, colors, multi, "steer_deg", "steer (deg)", "Steering angle (front wheel)")
     ax_steer.set_xlabel("t (s)")
 
     return fig
 
 
-def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking performance"):
-    """fig 2: speed error, speed pair, longitudinal acceleration, jerk, throttle, brake."""
-    t = np.asarray(hist["t"], dtype=float)
-    fig, (ax_ev, ax_v, ax_a, ax_j, ax_thr, ax_brk) = _panels(title)
+def plot_longitudinal(data, target_speed_ms, title="Longitudinal tracking performance"):
+    """fig 2: speed error, speed pair, longitudinal acceleration, longitudinal jerk, total jerk
+    magnitude, control input u -- for one controller, or several overlaid.
 
-    e_vel = np.asarray(speed_error_series(hist, target_speed_ms), dtype=float)
-    _error_panel(ax_ev, t, e_vel, "speed error (m/s)", COLOR_RED, "m/s")
-    ax_ev.set_title("Speed error (reference - measured)")
+    The last panel plots u = throttle - brake, a single signed series in [-1, 1] (throttle and
+    brake are mutually exclusive in every hist this repo logs, so the subtraction reconstructs the
+    actual command exactly) rather than the two separate [0, 1] series, since that's the pedal
+    signal a controller actually computed before it got split into carla.VehicleControl's two
+    fields.
 
-    v_des = _get(hist, "v_des")
+    data: a single hist dict, or {label: hist} to compare controllers on one figure (e.g.
+    longitudinal_mpc.py's --controller both). A lone hist keeps the original look (filled error
+    band, corner RMSE badge, aqua-above/red-below u fill); multiple runs switch each panel to
+    plain colored lines -- one color per run from COMPARE_COLORS -- with RMSE folded into the
+    legend instead of a badge, since several badges stacked in one corner stop being readable.
+    """
+    runs = _runs(data)
+    multi = len(runs) > 1
+    fig, (ax_ev, ax_v, ax_a, ax_j, ax_jtot, ax_cmd) = _panels(title)
+    colors = dict(zip(runs, COMPARE_COLORS))
+
+    _error_multi(ax_ev, runs, colors, multi, "speed error (m/s)", "Speed error (reference - measured)",
+                "m/s", lambda hist: np.asarray(speed_error_series(hist, target_speed_ms), dtype=float))
+
+    first_hist = next(iter(runs.values()))
+    v_des = _get(first_hist, "v_des")
     if v_des is None:
         ax_v.axhline(target_speed_ms, color=COLOR_MUTED, linewidth=2, linestyle="--", label="desired vel")
     else:
-        ax_v.plot(t, v_des, color=COLOR_MUTED, linewidth=2, linestyle="--", label="desired vel")
-    ax_v.plot(t, hist["v_x"], color=COLOR_BLUE, linewidth=1.8, solid_capstyle="round", label="ego vel")
+        ax_v.plot(first_hist["t"], v_des, color=COLOR_MUTED, linewidth=2, linestyle="--", label="desired vel")
+    for label, hist in runs.items():
+        ax_v.plot(hist["t"], hist["v_x"], color=colors[label], linewidth=1.8, solid_capstyle="round",
+                  label=(label or "ego vel"))
     ax_v.set_ylabel("speed (m/s)")
     ax_v.set_title("Speed")
-    _legend(ax_v, ncol=2)
+    _legend(ax_v, ncol=min(len(runs) + 1, 4))
 
-    a_x = _get(hist, "a_x")
-    if a_x is None:
-        _not_recorded(ax_a, "a_x")
+    _dynamics_panel(ax_a, runs, colors, multi, "a_x", "$a_x$ (m/s$^2$)", "Longitudinal acceleration")
+    _dynamics_panel(ax_j, runs, colors, multi, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk (ride comfort)")
+    _dynamics_panel(ax_jtot, runs, colors, multi, "jerk_total", "|jerk| (m/s$^3$)",
+                    "Total jerk magnitude (long. + lat.)", fill_color=COLOR_PURPLE)
+    ax_jtot.set_xlabel("t (s)")
+
+    ax_cmd.axhline(0.0, color=COLOR_AXIS, linewidth=1)
+    if not multi:
+        hist = first_hist
+        t = np.asarray(hist["t"], dtype=float)
+        u = np.asarray(hist["throttle"], dtype=float) - np.asarray(hist["brake"], dtype=float)
+        ax_cmd.plot(t, u, color=COLOR_BLUE, linewidth=1.6, solid_capstyle="round")
+        ax_cmd.fill_between(t, u, 0, where=(u >= 0), color=COLOR_AQUA, alpha=0.15, interpolate=True)
+        ax_cmd.fill_between(t, u, 0, where=(u <= 0), color=COLOR_RED, alpha=0.15, interpolate=True)
     else:
-        ax_a.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-        ax_a.plot(t, a_x, color=COLOR_BLUE, linewidth=1.5, solid_capstyle="round")
-    ax_a.set_ylabel("$a_x$ (m/s$^2$)")
-    ax_a.set_title("Longitudinal acceleration")
-
-    jerk = _get(hist, "jerk")
-    if jerk is None:
-        _not_recorded(ax_j, "jerk")
-    else:
-        ax_j.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-        ax_j.plot(t, jerk, color=COLOR_PURPLE, linewidth=1.3, solid_capstyle="round")
-    ax_j.set_ylabel("jerk (m/s$^3$)")
-    ax_j.set_title("Longitudinal jerk (ride comfort)")
-
-    ax_thr.plot(t, hist["throttle"], color=COLOR_AQUA, linewidth=1.6, solid_capstyle="round")
-    ax_thr.fill_between(t, hist["throttle"], 0, color=COLOR_AQUA, alpha=0.15)
-    ax_thr.set_ylim(-0.05, 1.05)
-    ax_thr.set_ylabel("throttle")
-    ax_thr.set_title("Throttle")
-    ax_thr.set_xlabel("t (s)")
-
-    ax_brk.plot(t, hist["brake"], color=COLOR_RED, linewidth=1.6, solid_capstyle="round")
-    ax_brk.fill_between(t, hist["brake"], 0, color=COLOR_RED, alpha=0.15)
-    ax_brk.set_ylim(-0.05, 1.05)
-    ax_brk.set_ylabel("brake")
-    ax_brk.set_title("Brake")
-    ax_brk.set_xlabel("t (s)")
+        for label, hist in runs.items():
+            t = np.asarray(hist["t"], dtype=float)
+            u = np.asarray(hist["throttle"], dtype=float) - np.asarray(hist["brake"], dtype=float)
+            ax_cmd.plot(t, u, color=colors[label], linewidth=1.4, label=label)
+        _legend(ax_cmd, ncol=len(runs))
+    ax_cmd.set_ylim(-1.05, 1.05)
+    ax_cmd.set_ylabel("$u$")
+    ax_cmd.set_title("Longitudinal control input $u$  (u > 0: throttle, u < 0: brake)")
+    ax_cmd.set_xlabel("t (s)")
 
     return fig
 
 
-def plot_trajectory(path_x, path_y, hist, title="Desired path vs. ego trajectory"):
-    """fig 3: the xy view. Its own figure because equal aspect fights a shared time-series grid."""
+def plot_trajectory(path_x, path_y, data, title="Desired path vs. ego trajectory"):
+    """fig 3: the xy view, for one run or several overlaid. Its own figure because equal aspect
+    fights a shared time-series grid.
+
+    data: a single hist dict, or {label: hist} to compare controllers' driven lines against the
+    same desired path (see plot_longitudinal). A lone hist keeps the original orange trajectory
+    line; multiple runs get one color per run from COMPARE_COLORS instead.
+    """
+    runs = _runs(data)
+    multi = len(runs) > 1
     fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
     fig.patch.set_facecolor(COLOR_BG)
     _style_axes(ax)
+    colors = dict(zip(runs, COMPARE_COLORS))
 
     ax.plot(path_x, path_y, color=COLOR_MUTED, linewidth=2, linestyle="--", label="desired path")
-    ax.plot(hist["x"], hist["y"], color=COLOR_ORANGE, linewidth=2, solid_capstyle="round", label="ego trajectory")
+    for label, hist in runs.items():
+        color = colors[label] if multi else COLOR_ORANGE
+        ax.plot(hist["x"], hist["y"], color=color, linewidth=2, solid_capstyle="round",
+               label=(label or "ego trajectory"))
     ax.scatter([path_x[0]], [path_y[0]], color=COLOR_BLUE, zorder=5, label="start")
     ax.scatter([path_x[-1]], [path_y[-1]], color=COLOR_RED, marker="*", s=140, zorder=5, label="goal")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_title(title, color=COLOR_INK)
     ax.set_aspect("equal", adjustable="datalim")
-    _legend(ax)
+    _legend(ax, ncol=min(len(runs) + 2, 4))
     return fig
 
 
-def plot_results(path_x, path_y, hist, target_speed_ms, out_dir,
+def plot_results(path_x, path_y, data, target_speed_ms, out_dir,
                  show=True, summary=True, label="", name=None):
     """Save + show the three result figures and print the error summary.
+
+    data: a single hist dict, or {label: hist} to compare controllers across all three figures
+    at once (see plot_longitudinal/plot_lateral/plot_trajectory) -- e.g. stanley_mpc.py running
+    more than one --controller. Each run gets its own error-summary block when there's more than
+    one.
 
     Files are named <script>_<date>_<time>_<kind>.png; pass name to override the script part.
     Returns the list of saved paths (lateral, longitudinal, trajectory).
     """
     if summary:
-        print_error_summary(hist, target_speed_ms)
+        for run_label, hist in _runs(data).items():
+            if run_label:
+                print(f"\n### {run_label} ###")
+            print_error_summary(hist, target_speed_ms)
 
     suffix = f" — {label}" if label else ""
     figures = [
-        ("lateral", plot_lateral(hist, f"Lateral tracking performance{suffix}")),
-        ("longitudinal", plot_longitudinal(hist, target_speed_ms,
+        ("lateral", plot_lateral(data, f"Lateral tracking performance{suffix}")),
+        ("longitudinal", plot_longitudinal(data, target_speed_ms,
                                            f"Longitudinal tracking performance{suffix}")),
-        ("trajectory", plot_trajectory(path_x, path_y, hist)),
+        ("trajectory", plot_trajectory(path_x, path_y, data)),
     ]
 
     os.makedirs(out_dir, exist_ok=True)
@@ -633,3 +766,227 @@ def plot_results(path_x, path_y, hist, target_speed_ms, out_dir,
     for _, fig in figures:
         plt.close(fig)
     return out_paths
+
+
+def plot_longitudinal_result(data, target_speed_ms, out_dir, show=True, summary=True, label="", name=None):
+    """Like plot_results(), but only the longitudinal figure.
+
+    For stacks with no lateral control at all (e.g. longitudinal_PID.py, steer pinned at 0) --
+    there's no path or steering to put in the other two figures.
+
+    data: a single hist dict, or {label: hist} to overlay several controllers on one figure (see
+    plot_longitudinal) -- e.g. longitudinal_mpc.py's --controller both. Each run gets its own
+    error-summary block when there's more than one.
+    """
+    if summary:
+        for run_label, hist in _runs(data).items():
+            if run_label:
+                print(f"\n### {run_label} ###")
+            print_error_summary(hist, target_speed_ms)
+
+    suffix = f" — {label}" if label else ""
+    fig = plot_longitudinal(data, target_speed_ms, f"Longitudinal tracking performance{suffix}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = _save(fig, out_dir, run_name("longitudinal", name))
+    print(f"Figure saved: {out_path}")
+
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 8. LUT results
+# ---------------------------------------------------------------------------
+
+def plot_lut_validation(hist_ff, hist_pid, mode, args, out_dir, hist_pidonly=None, show=True, name=None):
+    """Overlay LUT feedforward-only vs. feedforward+PID vs. (optionally) plain-PID-only tracking,
+    for validate_lut.py.
+
+    mode == "accel": reference/response is commanded longitudinal acceleration (a_cmd vs a_x).
+    mode == "speed":  reference/response is vehicle speed (v_des vs v_x) -- a_cmd there is the
+                      analytic derivative of v_des fed to the LUT as its feedforward target, not
+                      scored directly.
+
+    hist_pidonly is optional (validate_lut.py's speed mode doesn't run that trial) so old callers
+    and 2-trial modes keep working without passing it.
+    """
+    if mode == "accel":
+        ref_key, resp_key, unit, ylabel = "a_cmd", "a_x", "m/s$^2$", "acceleration (m/s$^2$)"
+    else:
+        ref_key, resp_key, unit, ylabel = "v_des", "v_x", "m/s", "speed (m/s)"
+
+    series = [("feedforward only", hist_ff, COLOR_AQUA), ("feedforward + PID", hist_pid, COLOR_BLUE)]
+    if hist_pidonly is not None:
+        series.append(("PID only", hist_pidonly, COLOR_ORANGE))
+    ts = {label: np.asarray(hist["t"], dtype=float) for label, hist, _ in series}
+
+    title = "LUT feedforward vs. feedforward+PID" + (" vs. PID only" if hist_pidonly is not None else "")
+    fig, (ax_main, ax_err, ax_u) = _panels(
+        f"{title} -- {mode} tracking, {args.profile} profile",
+        n_rows=3, n_cols=1, figsize=(14, 10))
+
+    ax_main.plot(ts["feedforward only"], hist_ff[ref_key], color=COLOR_MUTED, linewidth=2.2,
+                linestyle="--", label="reference")
+    for label, hist, color in series:
+        ax_main.plot(ts[label], hist[resp_key], color=color, linewidth=1.6, label=label)
+    ax_main.set_ylabel(ylabel)
+    ax_main.set_title("Tracking")
+    _legend(ax_main, ncol=len(series) + 1)
+
+    ax_err.axhline(0.0, color=COLOR_AXIS, linewidth=1, linestyle="--")
+    for label, hist, color in series:
+        err = np.asarray(hist[ref_key], dtype=float) - np.asarray(hist[resp_key], dtype=float)
+        ax_err.plot(ts[label], err, color=color, linewidth=1.4, label=label)
+    ax_err.set_ylabel(f"error ({unit})")
+    ax_err.set_title("Tracking error (reference - measured)")
+    _legend(ax_err, ncol=len(series))
+
+    ax_u.axhline(0.0, color=COLOR_AXIS, linewidth=1)
+    for label, hist, color in series:
+        ax_u.plot(ts[label], hist["u"], color=color, linewidth=1.3, label=label)
+    ax_u.set_ylim(-1.15, 1.15)
+    ax_u.set_ylabel("pedal $u$")
+    ax_u.set_xlabel("t (s)")
+    ax_u.set_title("Control input")
+    _legend(ax_u, ncol=len(series))
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = _save(fig, out_dir, run_name(mode, name))
+    print(f"Figure saved: {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+# blue (brake) <-> neutral <-> red (throttle), built from the house palette so it matches
+# everything else rather than introducing its own hex codes
+_UA_CMAP = LinearSegmentedColormap.from_list("brake_throttle", [COLOR_BLUE, "#f0efec", COLOR_RED])
+
+
+def plot_lut_raw_distribution(raw, out_dir, trusted_ranges=None, show=True, name=None):
+    """Per-gear (v_x, a_x) scatter of collect_lut_data.py's raw sweep CSV, colored by control
+    input u -- for eyeballing coverage and density right after a sweep.
+
+    raw: structured array from np.genfromtxt(..., names=True) with gear/u/v_x/a_x columns.
+    trusted_ranges: optional {gear: (v_lo, v_hi) or None}, from build_lut.py's
+    trusted_speed_range() -- when given, shades the speed window each gear's fit actually trusted
+    (None for a gear means it had no trustworthy window at all).
+
+    gear 0 (CARLA's mid-shift/clutch-disengaged sentinel, not a real gear) is left out -- the
+    runtime controller never queries it (see LookupController.feedforward()), and its samples
+    are sparse and noisy enough that trusted_speed_range() rejects them anyway.
+    """
+    trusted_ranges = trusted_ranges or {}
+    gears = sorted(g for g in {int(x) for x in raw["gear"]} if g != 0)
+    ncols = min(3, len(gears))
+    nrows = math.ceil(len(gears) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.0 * ncols, 4.2 * nrows), squeeze=False,
+                             constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    subtitle = ("\nshaded band = speed range build_lut.py trusted" if trusted_ranges else "")
+    fig.suptitle(f"Raw sweep data -- per-gear (v_x, a_x), colored by control input u{subtitle}",
+                fontsize=12, color=COLOR_INK)
+
+    norm = TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
+    flat_axes = axes.ravel()
+    mappable = None
+    for ax, gear in zip(flat_axes, gears):
+        _style_axes(ax)
+        mask = raw["gear"] == gear
+        v, a, u = raw["v_x"][mask], raw["a_x"][mask], raw["u"][mask]
+        mappable = ax.scatter(v, a, c=u, cmap=_UA_CMAP, norm=norm, s=6, alpha=0.35, linewidths=0)
+        v_range = trusted_ranges.get(gear)
+        if v_range is not None:
+            ax.axvspan(v_range[0], v_range[1], color=COLOR_AQUA, alpha=0.10, zorder=0)
+        title = f"gear {gear}"
+        if trusted_ranges and v_range is None:
+            title += "  [excluded]"
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("v_x (m/s)")
+        ax.set_ylabel("a_x (m/s$^2$)")
+    for ax in flat_axes[len(gears):]:
+        ax.axis("off")
+
+    if mappable is not None:
+        cbar = fig.colorbar(mappable, ax=fig.get_axes(), shrink=0.6, pad=0.02,
+                            label="u  (brake <- 0 -> throttle)")
+        cbar.ax.yaxis.label.set_color(COLOR_MUTED)
+        cbar.ax.tick_params(colors=COLOR_MUTED)
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = _save(fig, out_dir, run_name("lut_raw_distribution", name))
+    print(f"Figure saved: {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+def _style_3d_axes(ax):
+    ax.set_facecolor(COLOR_BG)
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.set_facecolor(COLOR_BG)
+        pane.set_edgecolor(COLOR_GRID)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis._axinfo["grid"]["color"] = COLOR_GRID
+        axis.label.set_color(COLOR_MUTED)
+    ax.tick_params(colors=COLOR_MUTED, labelsize=8)
+
+
+def plot_lut_surfaces(gear_tables, out_dir, raw=None, show=True, elev=25.0, azim=-60.0, name=None):
+    """One (v_x, a_x) -> u 3D surface per gear, small multiples on a shared diverging color scale
+    (u: brake -1 -> throttle +1) so gears stay visually comparable -- for build_lut.py to sanity
+    check a fit right after producing it.
+
+    gear_tables: {gear: (v_grid, a_grid, u_table)}, u_table shaped (len(v_grid), len(a_grid)) --
+    exactly what build_lut.py's build_gear_table() returns per gear.
+    raw: optional structured array (gear/u/v_x/a_x columns) overlaid as raw sweep samples -- pass
+    everything build_lut.py read in (not just what a gear's trust cut kept) to see the surface
+    against what got excluded too, not only what it was fit from.
+    """
+    gears = sorted(gear_tables)
+    ncols = min(3, len(gears))
+    nrows = math.ceil(len(gears) / ncols)
+    fig = plt.figure(figsize=(5.2 * ncols, 4.6 * nrows), facecolor=COLOR_BG)
+    fig.suptitle("Longitudinal control-input lookup table  (u: brake -1 -> throttle +1)",
+                color=COLOR_INK, fontsize=13)
+
+    norm = TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
+    mappable = None
+    for i, gear in enumerate(gears):
+        v_grid, a_grid, u_table = gear_tables[gear]
+        vv, aa = np.meshgrid(v_grid, a_grid, indexing="ij")
+
+        ax = fig.add_subplot(nrows, ncols, i + 1, projection="3d")
+        mappable = ax.plot_surface(vv, aa, u_table, cmap=_UA_CMAP, norm=norm,
+                                   linewidth=0, antialiased=True, alpha=0.92)
+
+        if raw is not None:
+            mask = raw["gear"] == gear
+            ax.scatter(raw["v_x"][mask], raw["a_x"][mask], raw["u"][mask],
+                      s=4, color=COLOR_MUTED, alpha=0.12, depthshade=False)
+
+        ax.set_title(f"Gear {gear}", color=COLOR_INK, fontsize=11)
+        ax.set_xlabel("v_x (m/s)")
+        ax.set_ylabel("a_x (m/s$^2$)")
+        ax.set_zlabel("u")
+        ax.set_zlim(-1, 1)
+        ax.view_init(elev=elev, azim=azim)
+        _style_3d_axes(ax)
+
+    cbar = fig.colorbar(mappable, ax=fig.get_axes(), shrink=0.6, pad=0.02,
+                        label="u  (brake <- 0 -> throttle)")
+    cbar.ax.yaxis.label.set_color(COLOR_MUTED)
+    cbar.ax.tick_params(colors=COLOR_MUTED)
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = _save(fig, out_dir, run_name("lut_surfaces", name))
+    print(f"Figure saved: {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
