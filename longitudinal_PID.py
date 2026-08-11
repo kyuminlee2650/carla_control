@@ -38,7 +38,7 @@ sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 
 import carla
 
-from functions import PID, LowPassFilter, clipping
+from functions import PID, ImuAcceleration, LowPassFilter, clipping
 from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_longitudinal_result,
                        print_error_summary, run_name)
 
@@ -122,12 +122,7 @@ def main():
     # a_x/a_y off the IMU -- see stanley_PID.py for why (true body-frame values straight from the
     # sensor, nothing to derive by hand). a_y only exists here to feed jerk_total; nothing plots it
     # on its own since there's no lateral figure in a steer=0 run.
-    accel_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    accel_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_a_x = None
-    prev_a_y = None
+    accel = ImuAcceleration(dt=args.dt)
 
     recorder = None
     if args.record:
@@ -173,14 +168,10 @@ def main():
             vel_vec = vehicle.get_velocity()
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)  # body-frame forward speed
 
-            a_x = accel_filter.step(imu_data.accelerometer.x)
-            a_y = accel_y_filter.step(imu_data.accelerometer.y)
+            accel.step(imu_data)
+            a_x, a_y = accel.a_x, accel.a_y
 
-            jerk = jerk_filter.step(0.0 if prev_a_x is None else (a_x - prev_a_x) / args.dt)
-            prev_a_x = a_x
-            jerk_y = jerk_y_filter.step(0.0 if prev_a_y is None else (a_y - prev_a_y) / args.dt)
-            prev_a_y = a_y
-            jerk_total = math.hypot(jerk, jerk_y)
+            jerk, jerk_total = accel.jerk, accel.jerk_total
 
             v_ref = args.initial_speed if not warmed_up else speed_reference(args, (i - log_start_i) * args.dt)
             e_vel = v_ref - v_x

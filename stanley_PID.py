@@ -33,8 +33,8 @@ sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 
 import carla
 
-from functions import (PID, AngleUnwrapper, LowPassFilter, build_path, clipping,
-                       get_vehicle_geometry, lateral_error, normalize_angle)
+from functions import (PID, AngleUnwrapper, ImuAcceleration, LowPassFilter, build_path,
+                       clipping, get_vehicle_geometry, lateral_error, normalize_angle)
 from viz_utils import (BevView, VIEWS, VideoRecorder, follow_with_spectator, plot_results,
                        print_error_summary, run_name)
 
@@ -130,13 +130,8 @@ def main():
     last_idx = 0
 
 
-    accel_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    accel_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
+    accel = ImuAcceleration(dt=args.dt)
     yaw_acc_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_a_x = None
-    prev_a_y = None
     prev_yaw_rate_rad = None
 
     bev = None if args.no_live_view else BevView(path_x, path_y)
@@ -192,17 +187,12 @@ def main():
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)
             v_y = -vel_vec.x * math.sin(yaw) + vel_vec.y * math.cos(yaw)
 
-            a_x = accel_filter.step(imu_data.accelerometer.x)
-            a_y = accel_y_filter.step(imu_data.accelerometer.y)
+            accel.step(imu_data)
+            a_x, a_y = accel.a_x, accel.a_y
             yaw_rate_rad = imu_data.gyroscope.z
             yaw_rate = math.degrees(yaw_rate_rad)  
 
-            jerk = jerk_filter.step(0.0 if prev_a_x is None else (a_x - prev_a_x) / args.dt)
-            prev_a_x = a_x
-
-            jerk_y = jerk_y_filter.step(0.0 if prev_a_y is None else (a_y - prev_a_y) / args.dt)
-            prev_a_y = a_y
-            jerk_total = math.hypot(jerk, jerk_y)
+            jerk, jerk_total = accel.jerk, accel.jerk_total
 
             yaw_acc = yaw_acc_filter.step(
                 0.0 if prev_yaw_rate_rad is None else (yaw_rate_rad - prev_yaw_rate_rad) / args.dt)

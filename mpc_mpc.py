@@ -89,8 +89,8 @@ sys.path.append(os.path.join(HERE, "longitudinal_lookup"))
 
 import carla
 
-from functions import (AngleUnwrapper, LowPassFilter, build_path, clipping, get_vehicle_geometry,
-                       lateral_error, normalize_angle)
+from functions import (AngleUnwrapper, ImuAcceleration, LowPassFilter, build_path, clipping,
+                       get_vehicle_geometry, lateral_error, normalize_angle)
 from viz_utils import (BevView, VIEWS, VideoRecorder, follow_with_spectator, plot_results,
                        print_error_summary, run_name)
 
@@ -100,7 +100,6 @@ from stanley_mpc import MpcLongitudinal, PidLongitudinal, front_axle_offset, sta
 # origin/dest spawn indices) is a property of this specific map.
 MAP_NAME = "Town10HD_Opt"
 
-MAX_PLAUSIBLE_ACCEL = 8.0  # m/s^2 -- see longitudinal_mpc.py/validate_lut.py
 
 WARM_START_SPEED_TOL = 0.3   # m/s
 WARM_START_ACCEL_TOL = 0.5   # m/s^2
@@ -491,13 +490,8 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, path_s, path_ka
     rh_unwrapper = AngleUnwrapper()
     last_idx = 0
 
-    accel_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    accel_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
+    accel = ImuAcceleration(dt=args.dt)
     yaw_acc_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_a_x = None
-    prev_a_y = None
     prev_yaw_rate_rad = None
 
     bev = None if args.no_live_view else BevView(path_x, path_y)
@@ -536,18 +530,12 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, path_s, path_ka
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)
             v_y = -vel_vec.x * math.sin(yaw) + vel_vec.y * math.cos(yaw)
 
-            a_x_raw = clipping(imu_data.accelerometer.x, MAX_PLAUSIBLE_ACCEL, -MAX_PLAUSIBLE_ACCEL)
-            a_x = accel_filter.step(a_x_raw)
-            a_y = accel_y_filter.step(imu_data.accelerometer.y)
+            accel.step(imu_data)
+            a_x, a_y, a_x_raw = accel.a_x, accel.a_y, accel.a_x_raw
             yaw_rate_rad = imu_data.gyroscope.z
             yaw_rate = math.degrees(yaw_rate_rad)
 
-            jerk = jerk_filter.step(0.0 if prev_a_x is None else (a_x - prev_a_x) / args.dt)
-            prev_a_x = a_x
-
-            jerk_y = jerk_y_filter.step(0.0 if prev_a_y is None else (a_y - prev_a_y) / args.dt)
-            prev_a_y = a_y
-            jerk_total = math.hypot(jerk, jerk_y)
+            jerk, jerk_total = accel.jerk, accel.jerk_total
 
             yaw_acc = yaw_acc_filter.step(
                 0.0 if prev_yaw_rate_rad is None else (yaw_rate_rad - prev_yaw_rate_rad) / args.dt)

@@ -1,50 +1,45 @@
-r"""Steady-state front/rear cornering stiffness (Cf, Cr) estimation.
+r"""Flat test pad for constant-radius cornering experiments.
 
-Drives Town03's central roundabout (a closed loop, so there's no "running out of road" the way a
-straight-line sweep would) across a sweep of target speeds, using a light Stanley controller to
-hold the car on the roundabout's own lane rather than an open-loop constant steer -- an open-loop
-angle that doesn't *exactly* match the road's curvature drifts the car sideways over the seconds
-it takes to reach steady state, and on a 2-lane road with a central island that ends in a curb
-strike (confirmed live: a fixed steer collided at ~4s in). Stanley just keeps the car following
-the known road geometry instead; whatever steer angle it ends up commanding each tick is measured
-and used directly, so the physics below doesn't care that the angle isn't open-loop.
+Right now this only builds the world. The identification code that used to live here has been
+removed so it can be written from scratch against a clean surface.
 
-At each speed, once the car settles into steady circular motion (r_dot ~ 0, v_x converged), the
-2-DOF bicycle model's steady-state force/moment balance no longer involves the yaw inertia at all
--- Iz only shows up once r_dot is nonzero -- so Cf/Cr can be solved for here without knowing Iz.
-estimate_yaw_inertia.py (a separate, later script) loads this script's output and uses it to solve
-for Iz from a transient step-steer instead; see that file's docstring for why the two are split.
+The pad is generated at runtime from a hand-written OpenDRIVE string -- one straight road with a
+lot of wide lanes -- via client.generate_opendrive_world(). No Unreal Editor, no map files, no
+RoadRunner. CARLA turns the road network into a procedural mesh and hands back a world.
 
-Model (standard 2-DOF bicycle, CG-relative slip angles):
+Why bother, when Town03 and Town06 both have tarmac big enough to drive a circle on:
 
-    beta   = v_y / v_x                              (sideslip; CARLA gives v_y directly -- a real
-                                                       car can't measure this without extra sensors,
-                                                       but this is a sim, so it's free)
-    alpha_f = delta - beta - lf * r / v_x            (front slip angle)
-    alpha_r =       - beta + lr * r / v_x            (rear slip angle)
+  - Radius is continuous. The two real sites only offered R = 8-11.5 m and 18.5-24.5 m with a gap
+    between them, because those are the widths the maps happen to have. The pad covers roughly
+    5-28 m without a break, which is what a sweep separating lateral load from speed needs.
+  - No road defects. Town06's circle crosses something at ~236 deg that recurs every lap, throws
+    the body into a 4.5 deg roll transient, and is invisible in the map's own elevation data --
+    it was only found by driving the circle and watching. A procedural mesh has nothing on it.
+  - No kerbs. Town03's inner edge is the roundabout's central island, so a circle that comes out
+    tighter than requested mounts it. Here there is nothing to hit, and wall_height=0 keeps CARLA
+    from generating barriers at the road edge either.
+  - One map. No reloading between sites partway through a sweep.
 
-At steady state (r_dot = 0), summing forces/moments about the CG gives the tire forces directly
-from the motion, with no tire model needed yet:
-
-    Fyf = (lr / L) * m * v_x * r
-    Fyr = (lf / L) * m * v_x * r
-
-so Cf = Fyf / alpha_f and Cr = Fyr / alpha_r at each swept speed; averaging (least squares) over
-several speeds is just noise reduction, not a requirement for identifiability -- each operating
-point already determines Cf and Cr independently.
+Measured, not assumed: elevation range over the whole pad is 0.0000 m, and an identical
+constant-steer circle driven here and on Town06 returned the same radius, a_y, slip angles and
+stiffnesses to four decimal places (Cf 108,691 vs 108,700). The surfaces are physically
+indistinguishable, so results from the pad are directly comparable with anything measured on the
+stock maps. That is expected rather than lucky: with tire_friction 3.5 the operating range sits
+far below saturation, and in a tire's linear region the lateral force is set by lat_stiff_value
+and vertical load, with surface friction only fixing the ceiling.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python lateral_parameter/estimate_cornering_stiffness.py --save-plot
+    .venv/bin/python lateral_parameter/estimate_cornering_stiffness.py
+    .venv/bin/python lateral_parameter/estimate_cornering_stiffness.py --lanes 16 --length 200
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
     .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py
-    .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py --speeds 3,4,5,6,7 --save-plot
+    .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py --lanes 16 --length 200
 """
 
 import argparse
-import json
 import math
 import os
 import queue
@@ -54,349 +49,327 @@ import time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# functions.py, viz_utils.py live one level up, alongside the other controllers
 sys.path.append(os.path.dirname(HERE))
 
-CARLA_ROOT = os.environ.get("CARLA_ROOT") or (
-    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/2026intern/carla"
-)
-sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
+# functions.py resolves CARLA_ROOT and puts the simulator's PythonAPI on sys.path
+from functions import get_vehicle_geometry, PID, LowPassFilter, clipping, control_input
 
 import carla
 
-from functions import PID, CollisionWatch, LowPassFilter, clipping, get_vehicle_geometry, lateral_error, normalize_angle
+from viz_utils import follow_with_spectator
 
-MAP_NAME = "Town03"
-
-# Town03's central roundabout: a closed ring across road_id 9-14, found by scanning the map's
-# waypoints for a long sustained-curvature arc (see the design discussion -- this isn't documented
-# anywhere in CARLA itself). Lane -4 is the inner lane, radius ~21 m; -5 is the outer, ~25 m.
-RING_ROAD_ID = 9
-RING_LANE_ID = -4
+from bicycle import zero_phase_derivative
 
 
-def stanley_control(v_x, e_y, e_theta, k_theta=1.0, k=1.2, k_soft=1.0):
-    return k_theta * e_theta + math.atan2(k * e_y, k_soft + abs(v_x))
+LANE_WIDTH = 3.5
 
 
-def build_ring_path(carla_map, step=2.0, n_points=90):
-    """Walk forward from the roundabout's inner lane, ~n_points*step meters -- comfortably more
-    than one full lap (circumference ~130 m) -- so lateral_error() always has road ahead of the
-    car during a several-second trial. Loop position wrapping doesn't matter here since only the
-    array's forward order (not real-world uniqueness) is used."""
-    wp = None
-    for w in carla_map.generate_waypoints(2.0):
-        if w.road_id == RING_ROAD_ID and w.lane_id == RING_LANE_ID:
-            wp = w
-            break
-    if wp is None:
-        raise RuntimeError(f"no waypoint found on road_id={RING_ROAD_ID} lane_id={RING_LANE_ID} -- "
-                           f"has the roundabout's road layout changed?")
+def build_xodr(lanes_each_side=12, length=130.0, lane_width=LANE_WIDTH):
+    """OpenDRIVE for a single straight road, `lanes_each_side` lanes wide on each side.
 
-    path_x, path_y, path_yaw = [], [], []
-    for _ in range(n_points):
-        path_x.append(wp.transform.location.x)
-        path_y.append(wp.transform.location.y)
-        path_yaw.append(math.radians(wp.transform.rotation.yaw))
-        nxt = wp.next(step)
-        if not nxt:
-            break
-        wp = nxt[0]
-    return path_x, path_y, path_yaw
+    A pad rather than a circle: with the whole rectangle drivable, any radius up to about the
+    half-width can be driven anywhere on it, so the geometry does not have to be decided here.
 
-
-def run_trial(world, path_x, path_y, path_yaw, blueprint, imu_bp, max_steer, target_speed, args):
-    """Spawn at rest at the start of the ring path, hold the car on it with Stanley while a PID
-    brings v_x up to and holds `target_speed`, wait for steady circular motion, then collect a
-    short window of (v_x, v_y, r, delta).
-
-    Returns the window dict {"v_x": [...], "v_y": [...], "r": [...], "delta": [...]}, one entry
-    per tick, NOT pre-averaged -- alpha_f/alpha_r/Fyf/Fyr are nonlinear (products/ratios) in these,
-    so averaging v_x and r separately and then multiplying is not the same as multiplying per tick
-    and then averaging, and Stanley's own steer-correction oscillation (r swings ~+-30% around its
-    mean within a window) is large enough that this order-of-operations bias turned out to matter.
-    None if the car never settled (timeout) or hit something.
+    `level="true"` on every lane and a flat <elevationProfile> are what keep it dead level -- no
+    superelevation, no crown, no camber for gravity to leak into an accelerometer through.
     """
-    spawn_transform = carla.Transform(
-        carla.Location(path_x[0], path_y[0], 0.3),
-        carla.Rotation(yaw=math.degrees(path_yaw[0])),
+    def lane(i):
+        return (f'          <lane id="{i}" type="driving" level="true">\n'
+                f'            <width sOffset="0" a="{lane_width}" b="0" c="0" d="0"/>\n'
+                f'          </lane>\n')
+
+    left = "".join(lane(i) for i in range(lanes_each_side, 0, -1))
+    right = "".join(lane(-i) for i in range(1, lanes_each_side + 1))
+    return f'''<?xml version="1.0" standalone="yes"?>
+<OpenDRIVE>
+  <header revMajor="1" revMinor="4" name="flatpad" version="1" date=""
+          north="0" south="0" east="0" west="0"/>
+  <road name="pad" length="{length}" id="1" junction="-1">
+    <planView>
+      <geometry s="0" x="0" y="0" hdg="0" length="{length}"><line/></geometry>
+    </planView>
+    <elevationProfile>
+      <elevation s="0" a="0" b="0" c="0" d="0"/>
+    </elevationProfile>
+    <lateralProfile/>
+    <lanes>
+      <laneSection s="0">
+        <left>
+{left}        </left>
+        <center><lane id="0" type="none" level="true"/></center>
+        <right>
+{right}        </right>
+      </laneSection>
+    </lanes>
+  </road>
+</OpenDRIVE>
+'''
+
+
+def load_pad(client, lanes_each_side=12, length=130.0, dt=0.05):
+    """Generate the pad world and put it in synchronous mode. Returns (world, centre, max_radius).
+
+    wall_height=0 matters: CARLA's default is 1.0 m, which fences the road edge with an invisible
+    barrier -- fine for a route, not for a circle that may drift wide.
+    """
+    params = carla.OpendriveGenerationParameters(
+        vertex_distance=2.0,
+        max_road_length=500.0,      # one piece, not chopped into segments
+        wall_height=0.0,
+        additional_width=0.0,
+        smooth_junctions=True,
+        enable_mesh_visibility=True,
     )
-    vehicle = world.spawn_actor(blueprint, spawn_transform)
+    world = client.generate_opendrive_world(build_xodr(lanes_each_side, length), params)
+
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = dt
+    world.apply_settings(settings)
+
+    centre = (length / 2.0, 0.0)
+    max_radius = lanes_each_side * LANE_WIDTH
+    return world, centre, max_radius
+
+
+
+
+def spawn_vehicle(world, centre, blueprint_filter="vehicle.lincoln.mkz_2020", ride_height=0.3):
+
+    transform = carla.Transform(carla.Location(x=centre[0], y=centre[1], z=ride_height),
+                                carla.Rotation(yaw=0.0))
+    blueprint = world.get_blueprint_library().filter(blueprint_filter)[0]
+    vehicle = world.spawn_actor(blueprint, transform)
+    stop(vehicle)
+
+    wheelbase, lf, lr, max_steer = get_vehicle_geometry(vehicle, transform)
+    physics = vehicle.get_physics_control()
+    return vehicle, (wheelbase, lf, lr, max_steer, physics.mass, physics.center_of_mass)
+
+
+def stop(vehicle):
+    """Zero the velocities a freshly spawned or teleported actor is left holding."""
     vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
     vehicle.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-    collision = CollisionWatch(world, vehicle)
-    collision.arm()
-
-    speed_pid = PID(kp=0.5, ki=0.2, kd=0.0, dt=args.dt)
-    r_dot_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)   # raw gyro diff is too noisy to gate on directly
-    # The commanded steer is what's sent to the vehicle every tick (must react fast to hold the
-    # lane); this filtered copy is a separate estimate of the *actual* front wheel angle for the
-    # alpha_f calc only, on the theory that a real steering actuator can't track a fast-toggling
-    # command instantaneously -- using the raw command as if it were the true wheel angle would
-    # itself be a modeling error whenever delta is moving quickly, which is exactly when Stanley
-    # is fighting to hold the lane.
-    delta_filter = LowPassFilter(tau=args.delta_tau, dt=args.dt, initial=0.0)
-    prev_r = None
-    last_idx = 0
-
-    settle_ticks = int(args.settle_time / args.dt)
-    window_ticks = int(args.window / args.dt)
-    converged_ticks = 0
-    window = {"v_x": [], "v_y": [], "r": [], "delta": []}
-
-    imu = None
-    try:
-        world.tick()
-        imu_queue = queue.Queue()
-        imu = world.spawn_actor(imu_bp, carla.Transform(), attach_to=vehicle)
-        imu.listen(imu_queue.put)
-
-        steps = int(args.max_duration / args.dt)
-        for i in range(steps):
-            step_start = time.time()
-            world.tick()
-            imu_data = imu_queue.get(timeout=2.0)
-
-            transform = vehicle.get_transform()
-            yaw = math.radians(transform.rotation.yaw)
-            ego_x, ego_y = transform.location.x, transform.location.y
-            vel = vehicle.get_velocity()
-            v_x = vel.x * math.cos(yaw) + vel.y * math.sin(yaw)
-            v_y = -vel.x * math.sin(yaw) + vel.y * math.cos(yaw)
-            r = imu_data.gyroscope.z   # rad/s, body-frame yaw rate straight off the sensor
-
-            last_idx, e_y = lateral_error(ego_x, ego_y, yaw, path_x, path_y, last_idx)
-            e_theta = normalize_angle(path_yaw[last_idx] - yaw)
-            delta = stanley_control(v_x, e_y, e_theta, k_theta=args.k_theta, k=args.k_stanley)
-            steer_cmd = clipping(delta / max_steer, 1.0, -1.0)
-            # run every tick (not just once logging starts) so the filter's lag is already
-            # warmed up by the time we start using its output
-            delta_true = delta_filter.step(steer_cmd * max_steer)
-
-            u = clipping(speed_pid.step(target_speed - v_x), 1.0, -1.0)
-            control = carla.VehicleControl()
-            control.throttle, control.brake = (u, 0.0) if u >= 0 else (0.0, -u)
-            control.steer = steer_cmd
-            vehicle.apply_control(control)
-
-            if collision.hit:
-                print(f"    collision at t={i*args.dt:.1f}s -- aborting this trial")
-                return None
-
-            r_dot = r_dot_filter.step(0.0 if prev_r is None else (r - prev_r) / args.dt)
-            prev_r = r
-
-            if not window["v_x"]:  # still waiting to settle
-                # Only gate on v_x here -- r_dot never stays inside a tight tolerance because
-                # Stanley's own e_y corrections keep nudging the steer angle (confirmed live: r
-                # oscillates roughly +-30% around its true mean, e.g. -9 to -18 deg/s for a mean
-                # near -14 deg/s, which matches v_x/R for this roundabout). A longer averaging
-                # window below cancels that oscillation instead of waiting for it to vanish.
-                settled = abs(v_x - target_speed) < args.speed_tol
-                converged_ticks = converged_ticks + 1 if settled else 0
-                if i % 20 == 0:
-                    print(f"    t={i*args.dt:5.1f}s  v_x={v_x:5.2f}/{target_speed:.1f} m/s  "
-                          f"r={math.degrees(r):+6.2f} deg/s  r_dot={r_dot:+.3f} rad/s^2  "
-                          f"e_y={e_y:+.2f} m  settled_ticks={converged_ticks}/{settle_ticks}")
-                if converged_ticks >= settle_ticks:
-                    window["v_x"].append(v_x)
-                    window["v_y"].append(v_y)
-                    window["r"].append(r)
-                    window["delta"].append(delta_true)
-            else:
-                window["v_x"].append(v_x)
-                window["v_y"].append(v_y)
-                window["r"].append(r)
-                window["delta"].append(delta_true)
-                if len(window["v_x"]) >= window_ticks:
-                    print(f"    window std: v_x={np.std(window['v_x']):.3f} m/s  "
-                          f"v_y={np.std(window['v_y']):.3f} m/s  r={math.degrees(np.std(window['r'])):.2f} deg/s  "
-                          f"delta={math.degrees(np.std(window['delta'])):.2f} deg")
-                    return window   # full per-tick window, not pre-averaged -- see main()'s docstring note
-
-            elapsed = time.time() - step_start
-            if elapsed < args.dt / args.times_run:
-                time.sleep(args.dt / args.times_run - elapsed)
-    finally:
-        collision.destroy()
-        if imu is not None and imu.is_alive:
-            imu.stop()
-            imu.destroy()
-        vehicle.destroy()
-
-    return None   # never settled within max_duration
 
 
-def fit_stiffness(alpha, Fy):
-    """Least-squares Cf or Cr through the origin: min_C sum((C*alpha - Fy)^2)."""
-    alpha = np.asarray(alpha)
-    Fy = np.asarray(Fy)
-    return float(np.sum(alpha * Fy) / np.sum(alpha * alpha))
+def attach_imu(world, vehicle, centre_of_mass):
+    """Mount an IMU at the centre of mass and return (sensor, queue).
+
+    At the CoM, not the actor origin. An accelerometer a distance d from the CG also reads
+    psi_ddot*d, which at this rig's numbers -- d = 0.3 m, psi_ddot around 0.3 rad/s^2 -- is
+    0.09 m/s^2, over 10% of a_y at the low end of the sweep. Mounting it in the right place is
+    cheaper than correcting for it afterwards.
+    """
+    blueprint = world.get_blueprint_library().find("sensor.other.imu")
+    imu = world.spawn_actor(
+        blueprint,
+        carla.Transform(carla.Location(centre_of_mass.x, centre_of_mass.y, centre_of_mass.z)),
+        attach_to=vehicle,
+    )
+    queue_ = queue.Queue()
+    imu.listen(queue_.put)
+    return imu, queue_
+
+
+def add_derivatives(log, dt, window_s=0.4):
+    """Differentiate the logged signals after the run, zero-phase.
+
+    After, not during, and zero-phase rather than a causal filter, for the same reason in both
+    cases: a causal filter delays its output, and every use of these derivatives is a comparison
+    against something measured at the same instant. Gating on |v_y_dot|, or checking a_y_imu
+    against v_x*psi_dot, both become meaningless if one side is shifted in time by the filter that
+    was supposed to clean it up. Offline there is no reason to accept that -- the whole trace is
+    already in hand, so the derivative can look both ways.
+
+    The window is wide (0.4 s) on purpose. These are used to answer "has this settled", which is a
+    low-frequency question; a narrow window would just pass per-tick noise through.
+    """
+    log["v_x_dot"] = zero_phase_derivative(log["v_x"], dt, window_s=window_s).tolist()
+    log["v_y_dot"] = zero_phase_derivative(log["v_y"], dt, window_s=window_s).tolist()
+    log["psi_ddot"] = zero_phase_derivative(log["r"], dt, window_s=window_s).tolist()
+    return log
+
+
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
+
+    # ---- map ---- #
+    parser.add_argument("--lanes", type=int, default=12,
+                        help="driving lanes each side of the centre line; the pad's half-width is "
+                             "lanes * 3.5 m, which is also the largest circle it can hold")
+    parser.add_argument("--length", type=float, default=1000.0, help="pad length (m)")
+
+    # ---- simulation ---- #
+    parser.add_argument("--times-run", type=float, default=5.0,
+                        help="simulation speed relative to real time: 1 = real time, 2 = twice as "
+                             "fast, and so on. The simulator has no clock of its own in "
+                             "synchronous mode, so this is purely how long the client waits "
+                             "between ticks")
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
-    parser.add_argument("--times-run", type=float, default=2.0, help="how times for simulation running?")
-
-    parser.add_argument("--speeds", default="4,5,6,7,8,9",
-                        help="comma-separated target speeds to sweep (m/s) -- off the low end "
-                             "where slip angles get small enough that noise in v_y/r dominates "
-                             "(both alpha_f/alpha_r and beta divide by v_x, so low speed is where "
-                             "estimation noise is worst, not best), pushing the high end past the "
-                             "usual ~0.3g linear-tire ceiling on purpose to see where Cf/Cr stop "
-                             "holding steady -- check the per-point fit, not just the pooled one")
-    parser.add_argument("--k-theta", type=float, default=1.0,
-                        help="Stanley heading-error gain (stanley_PID.py's own default). Softening "
-                             "this was tried as a fix for r oscillating within a settled window "
-                             "(+-30%% or more around its mean) -- it made tracking worse (e_y grew "
-                             "to 2.7-3.3 m, nearly off the lane) without reducing the oscillation, "
-                             "so the oscillation isn't from over-correction; it's something shorter"
-                             "-timescale (waypoint spacing discretization, or genuinely not reaching "
-                             "steady state in a few seconds). Left at the safe default; fit_stiffness() "
-                             "already fits over every raw tick rather than a pre-averaged window, "
-                             "which is the correct way to average out this kind of noise")
-    parser.add_argument("--k-stanley", type=float, default=1.2, help="Stanley cross-track gain (stanley_PID.py's own default)")
-    parser.add_argument("--delta-tau", type=float, default=0.15,
-                        help="low-pass time constant (s) modeling steering-actuator lag between "
-                             "the commanded steer and the true front wheel angle used in alpha_f -- "
-                             "only affects the alpha_f calc, never what's actually sent to the "
-                             "vehicle (that stays the raw, fast-reacting command)")
-    parser.add_argument("--speed-tol", type=float, default=0.2, help="settled once |v_x - target| is under this (m/s)")
-    parser.add_argument("--settle-time", type=float, default=2.0, help="how long v_x must hold within tolerance before logging starts (s)")
-    parser.add_argument("--window", type=float, default=2.5,
-                        help="duration of the averaged steady-state window (s) -- long enough to "
-                             "average out Stanley's own steer-correction oscillation in r")
-    parser.add_argument("--max-duration", type=float, default=20.0, help="per-speed safety cutoff (s)")
-
-    parser.add_argument("--out", default=os.path.join(HERE, "cornering_stiffness.json"))
-
-    # ---- plot ---- #
-    parser.add_argument("--plot-dir", default=os.path.join(HERE, "plots"))
-    parser.add_argument("--save-plot", action="store_true", help="draw and save an alpha-vs-Fy fit figure")
+    parser.add_argument("--target-speed", type=float, default=5)
+    parser.add_argument("--steer-deg", type=float, default=16.0,
+                        help="front wheel angle to hold, in degrees of actual wheel angle -- not "
+                             "a fraction of max_steer and not a radius. Positive and negative "
+                             "just pick which way round the circle goes")
+    parser.add_argument("--settle-ticks", type=int, default=20,
+                        help="ticks to let the car drop onto the surface before reporting")
+    parser.add_argument("--duration", type=float, default=50)
     args = parser.parse_args()
 
-    speeds = [float(v) for v in args.speeds.split(",")]
-
     client = carla.Client(args.host, args.port)
-    client.set_timeout(60.0)
-    world = client.get_world()
-    current_map = world.get_map().name.split("/")[-1]
-    if current_map != MAP_NAME:
-        print(f"Loading {MAP_NAME} (current map: {current_map})...")
-        world = client.load_world(MAP_NAME)
+    client.set_timeout(180.0)
 
-    original_settings = world.get_settings()
-    settings = world.get_settings()
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = args.dt
-    world.apply_settings(settings)
+    print(f"generating a {args.length:.0f} x {2*args.lanes*LANE_WIDTH:.0f} m flat pad "
+          f"({args.lanes} lanes each side)...")
+    world, centre, max_radius = load_pad(client, args.lanes, args.length, args.dt)
+    print(f"  map={world.get_map().name}  centre=({centre[0]:.1f}, {centre[1]:.1f})  "
+          f"pad holds a circle up to R={max_radius:.1f} m, or ~{max_radius/2:.1f} m "
+          f"starting from the centre")
 
-    path_x, path_y, path_yaw = build_ring_path(world.get_map())
-    print(f"Ring path: {len(path_x)} points, road_id={RING_ROAD_ID} lane_id={RING_LANE_ID}, "
-          f"start=({path_x[0]:.1f}, {path_y[0]:.1f})")
+    pid = PID(kp=0.7, ki=0.15, kd=0.05, dt=args.dt)
+    speed_filter = LowPassFilter(tau=0.2, dt=args.dt, initial=0.0)
 
-    spawn_location = carla.Location(path_x[0], path_y[0], 0.0)
-    for actor in world.get_actors().filter("vehicle.*"):
-        if actor.get_location().distance(spawn_location) < 10.0:
-            actor.destroy()
-
-    blueprint = world.get_blueprint_library().filter("vehicle.lincoln.mkz_2020")[0]
-    imu_bp = world.get_blueprint_library().find("sensor.other.imu")
-
-    probe_transform = carla.Transform(carla.Location(path_x[0], path_y[0], 0.3),
-                                      carla.Rotation(yaw=math.degrees(path_yaw[0])))
-    probe = world.spawn_actor(blueprint, probe_transform)
-    wheelbase, lf, lr, max_steer = get_vehicle_geometry(probe, probe_transform)
-    mass = probe.get_physics_control().mass
-    probe.destroy()
-    print(f"mass={mass:.1f} kg  wheelbase={wheelbase:.2f} m  lf={lf:.2f} m  lr={lr:.2f} m")
-
-    L = lf + lr
-
-    def alpha_Fy(v_x, v_y, r, delta):
-        beta = v_y / v_x
-        a_f = delta - beta - lf * r / v_x
-        a_r = -beta + lr * r / v_x
-        return a_f, a_r, (lr / L) * mass * v_x * r, (lf / L) * mass * v_x * r
-
-    alpha_f, alpha_r, Fyf, Fyr = [], [], [], []   # every tick of every window -- see run_trial()'s
-                                                   # docstring for why this isn't averaged first
-    per_speed = []
+    vehicle = imu = None
     try:
-        for target_speed in speeds:
-            print(f"\n=== target speed {target_speed:.1f} m/s ===")
-            window = run_trial(world, path_x, path_y, path_yaw, blueprint, imu_bp, max_steer,
-                              target_speed, args)
-            if window is None:
-                print(f"  did not settle within {args.max_duration:.0f}s -- skipped")
-                continue
+        vehicle, geometry = spawn_vehicle(world, centre, "vehicle.lincoln.mkz_2020")
+        wheelbase, lf, lr, max_steer, mass, com = geometry
+        physics = vehicle.get_physics_control()
 
-            tick_Cf, tick_Cr = [], []
-            for v_x, v_y, r, delta in zip(window["v_x"], window["v_y"], window["r"], window["delta"]):
-                a_f, a_r, fyf, fyr = alpha_Fy(v_x, v_y, r, delta)
-                alpha_f.append(a_f); alpha_r.append(a_r); Fyf.append(fyf); Fyr.append(fyr)
-                tick_Cf.append(fyf / a_f); tick_Cr.append(fyr / a_r)
+        delta = math.radians(args.steer_deg)
+        if abs(delta) > max_steer:
+            raise SystemExit(f"--steer-deg {args.steer_deg} exceeds this vehicle's "
+                             f"{math.degrees(max_steer):.1f} deg of steering")
+        print(f"\nholding a {args.steer_deg:+.2f} deg wheel angle "
+              f"(kinematic radius L/tan(delta) = {wheelbase/math.tan(abs(delta)):.2f} m "
+              f"before any tire slip)")
 
-            v_x_mean = float(np.mean(window["v_x"]))
-            r_mean = float(np.mean(window["r"]))
-            print(f"  settled: v_x={v_x_mean:.2f} m/s  r={math.degrees(r_mean):+.2f} deg/s  "
-                  f"(within-window spread: Cf {np.std(tick_Cf):,.0f}, Cr {np.std(tick_Cr):,.0f} N/rad)")
-            per_speed.append({"v_x": v_x_mean, "r": r_mean, "n_ticks": len(window["v_x"]),
-                             "Cf_mean": float(np.mean(tick_Cf)), "Cf_std": float(np.std(tick_Cf)),
-                             "Cr_mean": float(np.mean(tick_Cr)), "Cr_std": float(np.std(tick_Cr))})
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
+        imu, imu_queue = attach_imu(world, vehicle, com)
+
+        # The settle ticks double as the IMU's warm-up. CARLA derives the accelerometer from
+        # velocity differences and reports garbage for the first tick or two after spawn -- around
+        # -378,000 m/s^2 was measured -- so those samples get consumed here rather than logged.
+        for _ in range(args.settle_ticks):
+            world.tick()
+            imu_queue.get(timeout=2.0)
+            follow_with_spectator(world, vehicle)
+
+        log = {k: [] for k in ("t", "x", "y", "yaw", "v_x", "v_y", "r",
+                               "a_x_imu", "a_y_imu", "delta", "steer_cmd", "throttle", "brake")}
+
+        # Wall-clock budget per step. The simulator advances by args.dt of *simulated* time on
+        # every tick regardless of how long that took to compute, so pacing is entirely up to the
+        # client: sleeping until dt/times_run has passed makes one second of simulation take
+        # 1/times_run seconds of real time. times_run = 1 is therefore real time, 2 is twice as
+        # fast, and anything the machine cannot keep up with simply runs slower than asked.
+        budget = args.dt / args.times_run
+        started, behind = time.time(), 0
+
+        for i in range(int(args.duration / args.dt)):
+            step_start = time.time()
+            world.tick()
+            imu_data = imu_queue.get(timeout=2.0)
+
+            transform = vehicle.get_transform()
+            yaw = math.radians(transform.rotation.yaw)
+            location = transform.location
+            velocity = vehicle.get_velocity()
+            # Body frame: v_x is what the steering curve is indexed on and what the bicycle model
+            # divides by. |v| would be close but not equal -- they differ by cos(beta), and beta
+            # reaches several degrees in a tight circle.
+            v_x = velocity.x * math.cos(yaw) + velocity.y * math.sin(yaw)
+            v_y = -velocity.x * math.sin(yaw) + velocity.y * math.cos(yaw)
+
+            e_vel = args.target_speed - v_x
+            control_value = clipping(speed_filter.step(pid.step(e_vel)), 1, -1)
+
+            # Takes effect on the next tick, not this one -- the state just read is the result of
+            # the previous command.
+            control = control_input(control_value, delta, v_x, vehicle, physics)
+            follow_with_spectator(world, vehicle)
+
+            r = imu_data.gyroscope.z
+
+            log["t"].append(i * args.dt)
+            log["x"].append(location.x); log["y"].append(location.y); log["yaw"].append(yaw)
+            log["v_x"].append(v_x); log["v_y"].append(v_y); log["r"].append(r)
+            log["a_x_imu"].append(imu_data.accelerometer.x)
+            log["a_y_imu"].append(imu_data.accelerometer.y)
+            log["delta"].append(delta); log["steer_cmd"].append(control.steer)
+            log["throttle"].append(control.throttle); log["brake"].append(control.brake)
+
+            if i % int(1.0 / args.dt) == 0:
+                print(f"t={i*args.dt:6.2f}s  v_x={v_x:6.3f}/{args.target_speed:.1f}  "
+                      f"v_y={v_y:+6.3f}  psi_dot={math.degrees(r):+7.2f} deg/s  "
+                      f"R={v_x/r if abs(r) > 1e-4 else float('nan'):7.2f} m  "
+                      f"cmd={control.steer:+.4f}  delta={math.degrees(delta):+6.2f} deg "
+                      f"(naive {math.degrees(control.steer*max_steer):+6.2f})")
+
+            elapsed = time.time() - step_start
+            if elapsed < budget:
+                time.sleep(budget - elapsed)
+            else:
+                behind += 1
+
+        wall = time.time() - started
+        sim = args.duration
+        print(f"\n{sim:.1f}s of simulation in {wall:.1f}s of real time "
+              f"({sim/wall:.2f}x, asked for {args.times_run:.2f}x)")
+        if behind:
+            print(f"  {behind} of {int(sim/args.dt)} steps missed the {budget*1000:.0f} ms budget "
+                  f"-- the simulator could not keep up, so it ran slower than requested")
+
+        add_derivatives(log, args.dt)
+        summarise(log, args)
     finally:
-        world.apply_settings(original_settings)
-        print("\nCleaned up: world settings restored.")
+        if imu is not None:
+            imu.stop()
+            imu.destroy()
+        if vehicle is not None:
+            vehicle.destroy()
+        print("actors destroyed")
 
-    if len(per_speed) < 2:
-        raise SystemExit(f"only {len(per_speed)} speed(s) settled -- need at least 2 to fit Cf/Cr")
 
-    print(f"\n{'v_x':>6} {'Cf_mean':>10} {'Cf_std':>9} {'Cr_mean':>10} {'Cr_std':>9}")
-    for p in per_speed:
-        print(f"{p['v_x']:6.2f} {p['Cf_mean']:10,.0f} {p['Cf_std']:9,.0f} "
-              f"{p['Cr_mean']:10,.0f} {p['Cr_std']:9,.0f}")
+def summarise(log, args, tail_s=3.0):
+    """Report the settled tail: is it steady, and do the two routes to a_y agree?"""
+    t = np.array(log["t"])
+    tail = t >= t[-1] - tail_s
+    if tail.sum() < 5:
+        return
 
-    Cf = fit_stiffness(alpha_f, Fyf)
-    Cr = fit_stiffness(alpha_r, Fyr)
-    print(f"\nCf = {Cf:,.0f} N/rad   Cr = {Cr:,.0f} N/rad  (least squares over {len(alpha_f)} ticks total)")
+    def stat(key, scale=1.0):
+        v = np.array(log[key])[tail] * scale
+        return v.mean(), v.std()
 
-    out = {"Cf": Cf, "Cr": Cr, "mass": mass, "wheelbase": wheelbase, "lf": lf, "lr": lr,
-          "per_speed": per_speed}
-    with open(args.out, "w") as f:
-        json.dump(out, f, indent=2)
-    print(f"Saved: {args.out}")
+    print(f"\n--- last {tail_s:.1f} s ---")
+    for label, key, unit, scale in (
+            ("v_x", "v_x", "m/s", 1.0),
+            ("v_y", "v_y", "m/s", 1.0),
+            ("psi_dot", "r", "deg/s", 180.0 / math.pi),
+            ("delta", "delta", "deg", 180.0 / math.pi),
+            ("v_x_dot", "v_x_dot", "m/s^2", 1.0),
+            ("v_y_dot", "v_y_dot", "m/s^2", 1.0),
+            ("psi_ddot", "psi_ddot", "deg/s^2", 180.0 / math.pi),
+            ("a_y IMU", "a_y_imu", "m/s^2", 1.0)):
+        mean, std = stat(key, scale)
+        print(f"  {label:>9}: {mean:+9.4f} +/- {std:7.4f} {unit}")
 
-    if args.save_plot:
-        from viz_utils import COLOR_AXIS, COLOR_BLUE, COLOR_ORANGE, _legend, _save, _style_axes, COLOR_BG
-        import matplotlib.pyplot as plt
-
-        fig, (ax_f, ax_r) = plt.subplots(1, 2, figsize=(11, 5), constrained_layout=True)
-        fig.patch.set_facecolor(COLOR_BG)
-        for ax, alpha, Fy, C, name, color in (
-            (ax_f, alpha_f, Fyf, Cf, "front", COLOR_BLUE),
-            (ax_r, alpha_r, Fyr, Cr, "rear", COLOR_ORANGE),
-        ):
-            _style_axes(ax)
-            ax.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-            ax.axvline(0.0, color=COLOR_AXIS, linewidth=1)
-            ax.scatter(alpha, Fy, color=color, zorder=3, label="measured")
-            xs = np.linspace(min(alpha + [0]), max(alpha + [0]), 20)
-            ax.plot(xs, C * xs, color=color, linestyle="--", label=f"C={C:,.0f} N/rad")
-            ax.set_xlabel("slip angle (rad)")
-            ax.set_ylabel("tire lateral force (N)")
-            ax.set_title(f"{name} axle")
-            _legend(ax)
-
-        os.makedirs(args.plot_dir, exist_ok=True)
-        out_path = _save(fig, args.plot_dir, "cornering_stiffness_fit")
-        print(f"Figure saved: {out_path}")
-        plt.show()
-        plt.close(fig)
+    v_x = np.array(log["v_x"])[tail]
+    r = np.array(log["r"])[tail]
+    a_y_kin = v_x * r
+    a_y_imu = np.array(log["a_y_imu"])[tail]
+    print(f"\n  a_y from v_x*psi_dot : {a_y_kin.mean():+.4f} +/- {a_y_kin.std():.4f}")
+    print(f"  a_y from the IMU     : {a_y_imu.mean():+.4f} +/- {a_y_imu.std():.4f}")
+    print(f"  gap                  : {a_y_imu.mean() - a_y_kin.mean():+.4f} m/s^2")
+    print("  In steady state the two must agree -- their difference is v_y_dot. A gap that "
+          "persists\n  while v_y_dot is ~0 is the accelerometer reading something else: it "
+          "measures specific\n  force in the BODY frame, so body roll tilts g into its y axis.")
+    print(f"  IMU noise is {a_y_imu.std()/max(a_y_kin.std(), 1e-9):.0f}x the kinematic route's, "
+          f"and scales like 1/dt (dt={args.dt})")
 
 
 if __name__ == "__main__":

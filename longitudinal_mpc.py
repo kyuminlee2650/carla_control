@@ -37,7 +37,7 @@ Control stack (two layers, cascaded) for mpc+ff+pid / mpc+pid:
        than reimplementing a bare PID. This script does not reimplement that layer either way; it
        is imported as-is so every run here is testing the exact stack validate_lut.py validated.
 
-a_meas for the pedal layer comes raw off the IMU (clamped to MAX_PLAUSIBLE_ACCEL), not low-pass
+a_meas for the pedal layer comes raw off the IMU (functions.ImuAcceleration.a_x_raw), not low-pass
 filtered -- same reasoning as validate_lut.py: the LUT was calibrated against the raw signal, and
 filtering only on this side would compare the controller's a_meas against a lagged version of what
 it was fit on. A separately filtered a_x (tau=0.15, matching longitudinal_PID.py) is kept purely
@@ -86,7 +86,7 @@ sys.path.append(os.path.join(HERE, "longitudinal_lookup"))
 
 import carla
 
-from functions import PID, LowPassFilter, clipping
+from functions import PID, ImuAcceleration, LowPassFilter, clipping
 from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_longitudinal_result,
                        print_error_summary, run_name)
 
@@ -97,9 +97,6 @@ from lookup_controller import LookupController
 MAP_NAME = "Town06"
 ORIGIN_INDEX = 86
 
-MAX_PLAUSIBLE_ACCEL = 8.0  # m/s^2 -- see validate_lut.py: clamps single-tick IMU spikes (spawn
-                           # settling, a gear-shift completing) that would otherwise wind up the
-                           # pedal layer's PID for no reason tied to actual tracking error
 
 WARM_START_SPEED_TOL = 0.3   # m/s
 WARM_START_ACCEL_TOL = 0.5   # m/s^2
@@ -309,11 +306,7 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
     # a_x/a_y off the IMU -- see stanley_PID.py for why (true body-frame values straight from the
     # sensor, nothing to derive by hand). a_y only exists here to feed jerk_total; nothing plots it
     # on its own since there's no lateral figure in a steer=0 run.
-    accel_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    accel_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    jerk_y_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_a_x = prev_a_y = None
+    accel = ImuAcceleration(dt=args.dt)
 
     hist = {"t": [], "v_x": [], "v_des": [], "a_x": [], "jerk": [], "jerk_total": [],
             "throttle": [], "brake": []}
@@ -345,15 +338,10 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             vel_vec = vehicle.get_velocity()
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)  # body-frame forward speed
 
-            a_x_raw = clipping(imu_data.accelerometer.x, MAX_PLAUSIBLE_ACCEL, -MAX_PLAUSIBLE_ACCEL)
-            a_x = accel_filter.step(a_x_raw)
-            a_y = accel_y_filter.step(imu_data.accelerometer.y)
+            accel.step(imu_data)
+            a_x, a_y, a_x_raw = accel.a_x, accel.a_y, accel.a_x_raw
 
-            jerk = jerk_filter.step(0.0 if prev_a_x is None else (a_x - prev_a_x) / args.dt)
-            prev_a_x = a_x
-            jerk_y = jerk_y_filter.step(0.0 if prev_a_y is None else (a_y - prev_a_y) / args.dt)
-            prev_a_y = a_y
-            jerk_total = math.hypot(jerk, jerk_y)
+            jerk, jerk_total = accel.jerk, accel.jerk_total
 
             t = (i - log_start_i) * args.dt
             v_ref = args.initial_speed if not warmed_up else speed_reference(args, t)

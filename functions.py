@@ -11,13 +11,42 @@ import math
 import os
 import sys
 
-# CARLA's PyPI wheel (`pip install carla`) only ships the compiled client API; the
-# navigation helpers under PythonAPI/carla/agents (GlobalRoutePlanner) only exist in the
-# simulator's own source tree, so that tree still has to be added to sys.path by hand.
-# CARLA_ROOT overrides the per-machine default below (lab Ubuntu box vs. home Windows box).
-CARLA_ROOT = os.environ.get("CARLA_ROOT") or (
-    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/2026intern/carla"
+# CARLA's PyPI wheel (`pip install carla`) only ships the compiled client API; the navigation
+# helpers under PythonAPI/carla/agents (GlobalRoutePlanner) only exist in the simulator's own
+# source tree, so that tree still has to be added to sys.path by hand.
+
+# Per-machine defaults: home Windows box first on Windows, lab Ubuntu box first on Linux.
+CARLA_ROOT_CANDIDATES = (
+    (r"C:\CARLA_0.9.15\WindowsNoEditor", r"C:\CARLA_0.9.15")
+    if os.name == "nt" else
+    ("/home/ailab/2026intern/carla", "/opt/carla-simulator")
 )
+
+
+def resolve_carla_root():
+    """First CARLA source tree that actually contains PythonAPI/carla/agents.
+
+    $CARLA_ROOT is tried first but is *verified*, not trusted. On the lab machine .bashrc exports
+    CARLA_ROOT=/home/ailab/carla_bench2drive for a different project, and that directory has no
+    PythonAPI at all -- taking it on faith made every script here die on `No module named 'agents'`
+    in any login shell. Since the variable belongs to that other project, this resolves around it
+    rather than asking anyone to change their environment.
+    """
+    tried = []
+    env_root = os.environ.get("CARLA_ROOT")
+    for candidate in ([env_root] if env_root else []) + list(CARLA_ROOT_CANDIDATES):
+        if os.path.isdir(os.path.join(candidate, "PythonAPI", "carla", "agents")):
+            return candidate
+        tried.append(candidate)
+
+    raise RuntimeError(
+        "no CARLA source tree found -- none of these contain PythonAPI/carla/agents:\n  "
+        + "\n  ".join(tried)
+        + "\nSet CARLA_ROOT to the simulator's install directory (the one holding PythonAPI/), "
+          "or add it to CARLA_ROOT_CANDIDATES in functions.py.")
+
+
+CARLA_ROOT = resolve_carla_root()
 sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 
 import carla
@@ -52,6 +81,167 @@ class LowPassFilter:
         self.state += self.alpha * (x - self.state)
         return self.state
         
+
+# Front-wheel steering limit of vehicle.lincoln.mkz_2020, the only car this repo drives. Read off
+# VehiclePhysicsControl.wheels[0].max_steer_angle; named rather than inlined so a different
+# blueprint is one grep away from working.
+MAX_STEER_ANGLE = math.radians(70.0)
+
+
+def steering_curve_scale(physics, speed_ms):
+    """The factor CARLA applies to a steer command at this speed.
+
+    VehiclePhysicsControl.steering_curve is a lookup whose x axis is km/h, not m/s: on the stock
+    vehicles 0 -> 1.0, 20 -> 0.9, 60 -> 0.8, 120 -> 0.7. So the same command is a smaller wheel
+    angle the faster you go -- measured on the mkz_2020, 0.93 at 4 m/s down to 0.87 at 9 m/s.
+    """
+    xs = [point.x for point in physics.steering_curve]
+    ys = [point.y for point in physics.steering_curve]
+    lo, hi = xs[0], xs[-1]
+    x = min(max(speed_ms * 3.6, lo), hi)
+    for i in range(1, len(xs)):
+        if x <= xs[i]:
+            span = xs[i] - xs[i - 1]
+            t = 0.0 if span == 0 else (x - xs[i - 1]) / span
+            return ys[i - 1] + t * (ys[i] - ys[i - 1])
+    return ys[-1]
+
+
+def track_over_wheelbase(physics):
+    """track / wheelbase, the only vehicle geometry the Ackermann conversion needs.
+
+    Wheel positions come back in centimetres of world coordinates, but both distances here are
+    between wheels, so the vehicle's orientation drops out.
+    """
+    wheels = physics.wheels
+    track = math.hypot(wheels[0].position.x - wheels[1].position.x,
+                       wheels[0].position.y - wheels[1].position.y)
+    front_x = 0.5 * (wheels[0].position.x + wheels[1].position.x)
+    front_y = 0.5 * (wheels[0].position.y + wheels[1].position.y)
+    rear_x = 0.5 * (wheels[2].position.x + wheels[3].position.x)
+    rear_y = 0.5 * (wheels[2].position.y + wheels[3].position.y)
+    wheelbase = math.hypot(front_x - rear_x, front_y - rear_y)
+    return track / wheelbase
+
+
+def control_input(u, steer, v_x, vehicle, physics):
+    """Apply one tick of control: a signed pedal command and a bicycle-model steer angle.
+
+    u:      throttle-minus-brake in [-1, 1]. Positive is throttle, negative is brake; they are
+            mutually exclusive, which is what every stack in this repo already assumes.
+    steer:  the wheel angle you want, in RADIANS, in the sense the *bicycle model* means it -- the
+            single virtual wheel on the centre line. That is what every control law in this repo
+            computes, so it is what this takes.
+    v_x:    current forward speed (m/s), body frame. Not the target speed: see below.
+
+    Two conversions stand between that angle and the number CARLA wants, and both were measured
+    on this build rather than assumed:
+
+      Ackermann. CARLA drives the INNER wheel to `command * max_steer * curve` and derives the
+      outer one from the geometry -- confirmed by reversing the turn and watching which wheel
+      tracked the command. The inner wheel is always the larger angle, so handing it the bicycle
+      angle realises something smaller than asked: commanding 16 deg produced an equivalent angle
+      of 14.87 deg, 7% short. Inverting the geometry fixes it, and the geometry is exact:
+
+          cot(inner) = cot(bicycle) - track / (2 * wheelbase)
+
+      Steering curve. CARLA multiplies the command by steering_curve(speed) before it reaches the
+      wheels, so a fixed command is a shrinking angle as the car speeds up. Dividing by the curve
+      cancels it -- but it must be the curve at the speed the car has *now*, not the one it is
+      heading for. Freezing it at a target speed leaves the angle ~10% too large through the whole
+      spin-up, because the curve is near 1.0 while the car is slow; on a constant-radius test that
+      is a 10% error in radius, enough to put a car inside a roundabout's kerb.
+
+    Between them the naive `angle / max_steer` is out by about 15%.
+
+    Returns the VehicleControl that was applied, so callers can log throttle/brake/steer without
+    rebuilding it.
+    """
+    control = carla.VehicleControl()
+    if u >= 0:
+        control.throttle, control.brake = float(u), 0.0
+    else:
+        control.throttle, control.brake = 0.0, float(-u)
+
+    if abs(steer) < 1e-6:
+        inner = 0.0
+    else:
+        cot_inner = 1.0 / math.tan(abs(steer)) - 0.5 * track_over_wheelbase(physics)
+        # cot <= 0 would mean an inner wheel past 90 deg; the steering limit binds long before
+        # that, so clamp rather than let the arithmetic wrap.
+        inner = MAX_STEER_ANGLE if cot_inner <= 0.0 else math.atan(1.0 / cot_inner)
+        inner = math.copysign(inner, steer)
+
+    scale = steering_curve_scale(physics, max(v_x, 0.0))
+    control.steer = clipping(inner / (MAX_STEER_ANGLE * scale), 1.0, -1.0)
+
+    vehicle.apply_control(control)
+    return control
+
+
+class ImuAcceleration:
+    """Shared post-processing for the IMU's accelerometer: settle, low-pass, differentiate.
+
+    Every controller in this repo needs the same three things off `imu_data.accelerometer` --
+    longitudinal and lateral acceleration, and the jerk derived from them -- and each used to
+    build its own four filters and repeat the arithmetic inline. They had drifted apart: the two
+    MPC stacks clamped a_x to +/-8 m/s^2 and the two PID stacks clamped nothing, and no stack ever
+    clamped a_y.
+
+    Why there is no clamp here at all now. The spikes it existed for are real but they are a
+    *spawn* artefact, not a magnitude problem: measured on this build, the accelerometer reports
+    around -378,000 m/s^2 on the first tick after spawn and is clean from roughly the third
+    onward. A magnitude clamp is a poor tool for that -- 8 m/s^2 is inside the range a real hard
+    stop reaches, so the clamp silently flattens genuine braking while only partially taming a
+    1e5 spike. Skipping the known-bad opening ticks removes the artefact without touching any
+    real sample.
+
+    That matters because the spike is otherwise not local. A single -378,000 sample entering a
+    causal low-pass with tau = 0.15 s leaves roughly -94,000 in the filter state, which then needs
+    about two seconds to decay back under 1 m/s^2 -- so one bad tick contaminates a second or two
+    of output, and in the MPC stacks feeds that straight to the pedal layer.
+
+    The filtering itself is causal, and deliberately so: this output drives controllers, where a
+    little lag is harmless and looking into the future is not an option. Do not reuse this for
+    parameter identification -- there the lag is a bias, and offline zero-phase filtering (or no
+    filtering at all, since the noise is zero-mean and averages out) is the right choice.
+    """
+
+    def __init__(self, dt, tau=0.15, jerk_tau=0.15, settle_ticks=3):
+        self.dt = dt
+        self.settle_ticks = settle_ticks
+        self._ticks = 0
+        self._accel_x = LowPassFilter(tau=tau, dt=dt, initial=0.0)
+        self._accel_y = LowPassFilter(tau=tau, dt=dt, initial=0.0)
+        self._jerk_x = LowPassFilter(tau=jerk_tau, dt=dt, initial=0.0)
+        self._jerk_y = LowPassFilter(tau=jerk_tau, dt=dt, initial=0.0)
+        self._prev_a_x = None
+        self._prev_a_y = None
+        self.a_x_raw = self.a_y_raw = 0.0
+        self.a_x = self.a_y = 0.0
+        self.jerk = self.jerk_y = self.jerk_total = 0.0
+
+    def step(self, imu_data):
+        """Feed one IMU measurement. Returns self, so attributes can be read straight after."""
+        self._ticks += 1
+        if self._ticks <= self.settle_ticks:
+            # Hold everything at zero and, critically, do not let these samples into the filter
+            # state -- that is the whole point of skipping them.
+            return self
+
+        self.a_x_raw = imu_data.accelerometer.x
+        self.a_y_raw = imu_data.accelerometer.y
+        self.a_x = self._accel_x.step(self.a_x_raw)
+        self.a_y = self._accel_y.step(self.a_y_raw)
+
+        self.jerk = self._jerk_x.step(
+            0.0 if self._prev_a_x is None else (self.a_x - self._prev_a_x) / self.dt)
+        self.jerk_y = self._jerk_y.step(
+            0.0 if self._prev_a_y is None else (self.a_y - self._prev_a_y) / self.dt)
+        self._prev_a_x, self._prev_a_y = self.a_x, self.a_y
+        self.jerk_total = math.hypot(self.jerk, self.jerk_y)
+        return self
+
 
 def normalize_angle(angle):
     """Wrap angle to [-pi, pi]."""
@@ -178,9 +368,14 @@ class CollisionWatch:
         self.sensor = world.spawn_actor(blueprint, carla.Transform(), attach_to=vehicle)
         self.sensor.listen(self._on_collision)
         self.hit = False
+        self.hit_with = None
 
-    def _on_collision(self, _event):
+    def _on_collision(self, event):
         self.hit = True
+        # Knowing what was struck is the difference between "the kerb, so the radius is wrong"
+        # and "a prop nobody knew was there" -- worth one attribute.
+        other = getattr(event, "other_actor", None)
+        self.hit_with = getattr(other, "type_id", None) or "unknown"
 
     def arm(self):
         self.hit = False
