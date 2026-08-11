@@ -23,8 +23,8 @@ bicycle.CIRCLE_SITES.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python lateral_parameter/probe_circle.py --site town06 --radius 10 --speed 5
-    .venv/bin/python lateral_parameter/probe_circle.py --site town03 --radius 20 --speed 5
+    python3 lateral_parameter/probe_circle.py --site town06 --radius 10 --speed 5
+    python3 lateral_parameter/probe_circle.py --site town03 --radius 20 --speed 5
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control

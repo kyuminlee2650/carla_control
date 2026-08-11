@@ -55,8 +55,8 @@ since those are exact CARLA physics properties, not something that needed estima
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python mpc_mpc.py --times-run 1 --target-speed 10
-    .venv/bin/python mpc_mpc.py --controller mpc+mpc stanley+mpc --times-run 20 --save-plot --target-speed 10
+    python3 mpc_mpc.py --times-run 1 --target-speed 10
+    python3 mpc_mpc.py --controller mpc+mpc stanley+mpc --times-run 20 --save-plot --target-speed 10
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
@@ -82,7 +82,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # see functions.py for why this path is needed alongside the pip-installed carla package
 CARLA_ROOT = os.environ.get("CARLA_ROOT") or (
-    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/2026intern/carla"
+    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/carla/CARLA_0.9.15"
 )
 sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 sys.path.append(os.path.join(HERE, "longitudinal_lookup"))

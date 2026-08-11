@@ -19,7 +19,7 @@ import sys
 CARLA_ROOT_CANDIDATES = (
     (r"C:\CARLA_0.9.15\WindowsNoEditor", r"C:\CARLA_0.9.15")
     if os.name == "nt" else
-    ("/home/ailab/2026intern/carla", "/opt/carla-simulator")
+    ("/home/ailab/carla/CARLA_0.9.15", "/home/ailab/2026intern/carla", "/opt/carla-simulator")
 )
 
 

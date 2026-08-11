@@ -6,8 +6,8 @@ between an origin and destination to produce one.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python stanley_PID.py --times-run 1 --target-speed 15
-    .venv/bin/python stanley_PID.py --times-run 20 --save-plot --record --target-speed 15
+    python3 stanley_PID.py --times-run 1 --target-speed 15
+    python3 stanley_PID.py --times-run 20 --save-plot --record --target-speed 15
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
@@ -27,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # see functions.py for why this path is needed alongside the pip-installed carla package
 CARLA_ROOT = os.environ.get("CARLA_ROOT") or (
-    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/2026intern/carla"
+    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/carla/CARLA_0.9.15"
 )
 sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 

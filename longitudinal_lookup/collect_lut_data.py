@@ -38,7 +38,7 @@ of the whole sweep.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python longitudinal_lookup/collect_lut_data.py
+    python3 longitudinal_lookup/collect_lut_data.py
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control

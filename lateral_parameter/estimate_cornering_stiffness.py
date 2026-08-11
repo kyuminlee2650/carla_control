@@ -30,8 +30,8 @@ and vertical load, with surface friction only fixing the ceiling.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python lateral_parameter/estimate_cornering_stiffness.py
-    .venv/bin/python lateral_parameter/estimate_cornering_stiffness.py --lanes 16 --length 200
+    python3 lateral_parameter/estimate_cornering_stiffness.py
+    python3 lateral_parameter/estimate_cornering_stiffness.py --lanes 16 --length 200
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control

@@ -8,9 +8,9 @@ measure a wall hit instead of the powertrain.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python longitudinal_PID.py --profile constant --initial-speed 15
-    .venv/bin/python longitudinal_PID.py --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 10 --save-plot
-    .venv/bin/python longitudinal_PID.py --profile step --initial-speed 15 --step-size 5 --step-time 10 --save-plot
+    python3 longitudinal_PID.py --profile constant --initial-speed 15
+    python3 longitudinal_PID.py --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 10 --save-plot
+    python3 longitudinal_PID.py --profile step --initial-speed 15 --step-size 5 --step-time 10 --save-plot
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # see functions.py for why this path is needed alongside the pip-installed carla package
 CARLA_ROOT = os.environ.get("CARLA_ROOT") or (
-    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/2026intern/carla"
+    r"C:\CARLA_0.9.15\WindowsNoEditor" if os.name == "nt" else "/home/ailab/carla/CARLA_0.9.15"
 )
 sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 

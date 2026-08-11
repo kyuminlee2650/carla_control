@@ -56,9 +56,9 @@ pure z rotation). Sweeping several impulse magnitudes is the linearity check.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python lateral_parameter/estimate_yaw_inertia.py --method impulse --save-plot
-    .venv/bin/python lateral_parameter/estimate_yaw_inertia.py --save-plot
-    .venv/bin/python lateral_parameter/estimate_yaw_inertia.py --report-only
+    python3 lateral_parameter/estimate_yaw_inertia.py --method impulse --save-plot
+    python3 lateral_parameter/estimate_yaw_inertia.py --save-plot
+    python3 lateral_parameter/estimate_yaw_inertia.py --report-only
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control

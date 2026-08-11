@@ -21,7 +21,7 @@ excluded) scattered on top, is saved alongside the table when --save-plot is pas
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python longitudinal_lookup/build_lut.py --save-plot
+    python3 longitudinal_lookup/build_lut.py --save-plot
 
 Usage (Windows):
     cd C:\\Users\\mumu2\\carla_control

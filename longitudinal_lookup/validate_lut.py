@@ -37,8 +37,8 @@ own kind of unrealistic.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    .venv/bin/python longitudinal_lookup/validate_lut.py --profile constant
-    .venv/bin/python longitudinal_lookup/validate_lut.py --profile sine --save-plot
+    python3 longitudinal_lookup/validate_lut.py --profile constant
+    python3 longitudinal_lookup/validate_lut.py --profile sine --save-plot
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
