@@ -89,23 +89,39 @@ COLOR_PURPLE = "#8b5cf6"    # jerk / derived series
 # is COLOR_BLUE, so a single-run call still gets the same look it always had
 COMPARE_COLORS = [COLOR_BLUE, COLOR_ORANGE, COLOR_AQUA, COLOR_RED, COLOR_PURPLE]
 
+# Shared stroke/type weights -- every plot function in this module should read these rather than
+# hardcode its own numbers, so retuning one constant retunes every figure at once. Values match
+# what was already hardcoded throughout this file before this was pulled out, so introducing the
+# knob does not itself change how anything currently looks.
+LINEWIDTH = 1.5          # primary data series
+LINEWIDTH_THIN = 1.0     # reference lines: axhline/axvline, zero lines, gridlines
+MARKERSIZE = 28          # scatter marker area (matplotlib's `s=`)
+FONTSIZE_TITLE = 14      # figure suptitle
+FONTSIZE_SUBTITLE = 11   # per-axes title
+FONTSIZE_LABEL = 10      # axis labels
+FONTSIZE_TICK = 9        # tick labels
+FONTSIZE_LEGEND = 9      # legend text
+
 
 def _style_axes(ax):
     ax.set_facecolor(COLOR_BG)
-    ax.grid(True, color=COLOR_GRID, linewidth=0.8)
+    ax.grid(True, color=COLOR_GRID, linewidth=LINEWIDTH_THIN * 0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
         ax.spines[side].set_color(COLOR_AXIS)
-    ax.tick_params(colors=COLOR_MUTED, labelsize=9)
+    ax.tick_params(colors=COLOR_MUTED, labelsize=FONTSIZE_TICK)
     ax.title.set_color(COLOR_INK)
+    ax.title.set_fontsize(FONTSIZE_SUBTITLE)
     ax.xaxis.label.set_color(COLOR_MUTED)
     ax.yaxis.label.set_color(COLOR_MUTED)
+    ax.xaxis.label.set_fontsize(FONTSIZE_LABEL)
+    ax.yaxis.label.set_fontsize(FONTSIZE_LABEL)
 
 
 def _legend(ax, **kwargs):
-    ax.legend(frameon=False, labelcolor=COLOR_INK, fontsize=9, **kwargs)
+    ax.legend(frameon=False, labelcolor=COLOR_INK, fontsize=FONTSIZE_LEGEND, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +500,7 @@ def _panels(title, n_rows=3, n_cols=2, figsize=(15, 10)):
     """A styled grid sharing the time axis, flattened in row-major order."""
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True, constrained_layout=True)
     fig.patch.set_facecolor(COLOR_BG)
-    fig.suptitle(title, fontsize=14, color=COLOR_INK)
+    fig.suptitle(title, fontsize=FONTSIZE_TITLE, color=COLOR_INK)
     axes = np.atleast_1d(axes).ravel()
     for ax in axes:
         _style_axes(ax)
@@ -986,6 +1002,157 @@ def plot_lut_surfaces(gear_tables, out_dir, raw=None, show=True, elev=25.0, azim
     os.makedirs(out_dir, exist_ok=True)
     out_path = _save(fig, out_dir, run_name("lut_surfaces", name))
     print(f"Figure saved: {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 9. lateral parameter identification figures
+# ---------------------------------------------------------------------------
+
+def plot_cornering_stiffness_fit(log, window, fit, out_dir=None, show=True, name=None):
+    """For estimate_cornering_stiffness.py: run overview (steady window shaded) plus the two
+    per-axle Fy-vs-alpha fits.
+
+    The scatter in the two fit panels is usually a tight cloud, not a spread-out line -- one run
+    holds one speed and one steer angle, so it is a single operating point measured many times,
+    not a sweep. A real Cf/Cr campaign runs the script at several speeds/steer angles and pools
+    the (alpha, Fy) pairs before fitting; this figure is per-run.
+
+    Markers are drawn last (highest zorder) with a background-colored edge so they read as
+    distinct dots even where they sit almost exactly on the fit line -- a plain small marker at
+    low alpha gets visually absorbed by the line and the shaded bracket band under it.
+    """
+    import matplotlib.pyplot as plt
+
+    start, end = window
+    t = np.asarray(log["t"], dtype=float)
+
+    fig, (ax_t, ax_f, ax_r) = plt.subplots(1, 3, figsize=(17, 5), constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    for ax in (ax_t, ax_f, ax_r):
+        _style_axes(ax)
+
+    ax_t.plot(t, log["v_x"], color=COLOR_BLUE, linewidth=LINEWIDTH, label="v_x (m/s)")
+    ax_t.plot(t, np.degrees(log["r"]), color=COLOR_ORANGE, linewidth=LINEWIDTH,
+             label="psi_dot (deg/s)")
+    ax_t.plot(t, log["a_y_imu"], color=COLOR_AQUA, linewidth=LINEWIDTH, label="a_y IMU (m/s^2)")
+    ax_t.axvspan(t[start], t[end - 1], color=COLOR_BLUE, alpha=0.12, label="steady window")
+    ax_t.set_xlabel("t (s)")
+    ax_t.set_title("Run overview")
+    _legend(ax_t)
+
+    for ax, alpha, Fy, C, C_lo, C_hi, color, axle in (
+            (ax_f, fit["alpha_f"], fit["Fyf"], fit["Cf"], fit["Cf_forward"], fit["Cf_reverse"],
+             COLOR_BLUE, "front"),
+            (ax_r, fit["alpha_r"], fit["Fyr"], fit["Cr"], fit["Cr_forward"], fit["Cr_reverse"],
+             COLOR_ORANGE, "rear")):
+        alpha_deg = np.degrees(np.asarray(alpha, dtype=float))
+        Fy = np.asarray(Fy, dtype=float)
+        ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
+        ax.axvline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
+
+        lo, hi = min(0.0, alpha_deg.min()), max(0.0, alpha_deg.max())
+        xs = np.linspace(lo, hi, 20)
+        ax.fill_between(xs, C_lo * np.radians(xs), C_hi * np.radians(xs), color=color, alpha=0.12,
+                        zorder=1, label=f"bracket [{C_lo:,.0f}, {C_hi:,.0f}]")
+        ax.plot(xs, C * np.radians(xs), color=color, linewidth=LINEWIDTH, linestyle="--",
+               zorder=2, label=f"C={C:,.0f} N/rad")
+        ax.scatter(alpha_deg, Fy, s=MARKERSIZE, facecolor=color, edgecolor=COLOR_BG,
+                  linewidth=0.6, alpha=0.85, zorder=3, label="measured")
+
+        ax.set_xlabel(f"alpha_{axle[0]} (deg)")
+        ax.set_ylabel(f"Fy{axle[0]} (N)")
+        ax.set_title(f"{axle.capitalize()} axle: Fy = C * alpha")
+        _legend(ax)
+
+    out_path = None
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = _save(fig, out_dir, run_name("cornering_stiffness", name))
+        print(f"Figure saved: {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+def plot_cornering_stiffness_sweep(trials, pooled, out_dir=None, show=True, name=None):
+    """For estimate_cornering_stiffness.py's --sweep: the two per-axle Fy-vs-alpha fits pooled
+    across every settled trial, plus a third panel scoring the sweep itself -- does each trial's
+    own Cf/Cr agree with the pooled number, or does it drift with a_y (the standard tell that a
+    trial left the tire's linear region -- see ISO 4138's steady-state circular test, which is
+    what this sweep effectively runs).
+
+    trials: list of per-trial dicts with "target_speed", "a_y_est" and "window" set by
+    run_sweep(), plus a "fit" dict (from fit_cornering_stiffness) for every trial pool_trials()
+    was able to fit. Trials with window is None or no "fit" are skipped here.
+    """
+    import matplotlib.pyplot as plt
+
+    done = [tr for tr in trials if tr.get("fit") is not None]
+
+    fig, (ax_f, ax_r, ax_c) = plt.subplots(1, 3, figsize=(18, 5.5), constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    for ax in (ax_f, ax_r, ax_c):
+        _style_axes(ax)
+
+    a_y_vals = [tr["a_y_est"] for tr in done]
+    cmap = plt.get_cmap("viridis")
+    norm = (plt.Normalize(min(a_y_vals), max(a_y_vals)) if len(set(a_y_vals)) > 1 else None)
+
+    for ax, key_alpha, key_Fy, C, C_lo, C_hi, axle in (
+            (ax_f, "alpha_f", "Fyf", pooled["Cf"], pooled["Cf_forward"], pooled["Cf_reverse"],
+             "front"),
+            (ax_r, "alpha_r", "Fyr", pooled["Cr"], pooled["Cr_forward"], pooled["Cr_reverse"],
+             "rear")):
+        color = COLOR_BLUE if axle == "front" else COLOR_ORANGE
+        ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
+        ax.axvline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
+
+        all_alpha_deg = np.degrees(pooled[key_alpha])
+        lo, hi = min(0.0, all_alpha_deg.min()), max(0.0, all_alpha_deg.max())
+        xs = np.linspace(lo, hi, 20)
+        ax.fill_between(xs, C_lo * np.radians(xs), C_hi * np.radians(xs), color=color, alpha=0.12,
+                        zorder=1, label=f"bracket [{C_lo:,.0f}, {C_hi:,.0f}]")
+        ax.plot(xs, C * np.radians(xs), color=color, linewidth=LINEWIDTH, linestyle="--",
+               zorder=2, label=f"pooled C={C:,.0f} N/rad")
+
+        for tr in done:
+            alpha_deg = np.degrees(tr["fit"][key_alpha])
+            Fy = tr["fit"][key_Fy]
+            c = cmap(norm(tr["a_y_est"])) if norm else color
+            ax.scatter(alpha_deg, Fy, s=MARKERSIZE, facecolor=c, edgecolor=COLOR_BG,
+                      linewidth=0.6, alpha=0.9, zorder=3)
+
+        ax.set_xlabel(f"alpha_{axle[0]} (deg)")
+        ax.set_ylabel(f"Fy{axle[0]} (N)")
+        ax.set_title(f"{axle.capitalize()} axle: {len(done)} trials pooled (color = a_y)")
+        _legend(ax)
+
+    ays = [tr["a_y_est"] for tr in done]
+    Cfs = [tr["fit"]["Cf"] for tr in done]
+    Crs = [tr["fit"]["Cr"] for tr in done]
+    ax_c.axhline(pooled["Cf"], color=COLOR_BLUE, linewidth=LINEWIDTH_THIN, linestyle="--",
+                label=f"pooled Cf={pooled['Cf']:,.0f}")
+    ax_c.axhline(pooled["Cr"], color=COLOR_ORANGE, linewidth=LINEWIDTH_THIN, linestyle="--",
+                label=f"pooled Cr={pooled['Cr']:,.0f}")
+    ax_c.scatter(ays, Cfs, s=MARKERSIZE, facecolor=COLOR_BLUE, edgecolor=COLOR_BG, linewidth=0.6,
+                zorder=3, label="Cf per trial")
+    ax_c.scatter(ays, Crs, s=MARKERSIZE, facecolor=COLOR_ORANGE, edgecolor=COLOR_BG,
+                linewidth=0.6, zorder=3, label="Cr per trial")
+    ax_c.set_xlabel("a_y (m/s^2, kinematic estimate)")
+    ax_c.set_ylabel("C (N/rad)")
+    ax_c.set_title("Constancy check: C should not drift with a_y")
+    _legend(ax_c)
+
+    out_path = None
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = _save(fig, out_dir, run_name("cornering_stiffness_sweep", name))
+        print(f"Figure saved: {out_path}")
     if show:
         plt.show()
     plt.close(fig)

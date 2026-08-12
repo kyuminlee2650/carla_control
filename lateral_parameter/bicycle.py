@@ -210,6 +210,38 @@ def static_axle_loads(mass, lf, lr):
     return mass * G * lr / L, mass * G * lf / L
 
 
+def slip_angles(delta, v_x, v_y, r, lf, lr):
+    """Front/rear slip angles (rad), CG-relative, small-angle linear-tire model.
+
+    alpha_f = delta - v_y/v_x - lf*r/v_x
+    alpha_r =       - v_y/v_x + lr*r/v_x
+
+    `delta` should be the measured wheel angle (front_steer_angle), not the commanded one -- see
+    that function's docstring for why the two differ.
+    """
+    beta = v_y / v_x
+    alpha_f = delta - beta - lf * r / v_x
+    alpha_r = -beta + lr * r / v_x
+    return alpha_f, alpha_r
+
+
+def steady_axle_forces(a_y, mass, lf, lr):
+    """Front/rear lateral tire force (N) at steady state, from the yaw moment balance alone.
+
+    At steady state r_dot = 0, which kills Iz out of Iz*r_dot = lf*Fyf - lr*Fyr, leaving
+    lf*Fyf = lr*Fyr. Paired with the force balance Fyf + Fyr = m*a_y (v_y_dot ~ 0 too, by
+    definition of "steady"), that is two equations in two unknowns:
+
+        Fyf = m*a_y*lr/L      Fyr = m*a_y*lf/L
+
+    Same shape as static_axle_loads(): steady cornering splits the required lateral force across
+    the axles exactly like gravity splits weight, with a_y standing in for g. This is also why
+    Cf/Cr are identifiable from steady cornering without knowing Iz at all.
+    """
+    L = lf + lr
+    return mass * a_y * lr / L, mass * a_y * lf / L
+
+
 def understeer_gradient(Cf, Cr, mass, lf, lr):
     """K = (m/L)*(lr/Cf - lf/Cr), rad per m/s^2. Steady-state steer is delta = L/R + K*a_y."""
     L = lf + lr
