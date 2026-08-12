@@ -11,6 +11,8 @@ import math
 import os
 import sys
 
+import numpy as np
+
 # CARLA's PyPI wheel (`pip install carla`) only ships the compiled client API; the navigation
 # helpers under PythonAPI/carla/agents (GlobalRoutePlanner) only exist in the simulator's own
 # source tree, so that tree still has to be added to sys.path by hand.
@@ -400,6 +402,32 @@ def lateral_error(x, y, yaw, path_x, path_y, last_idx, search_window=30):
     dy = path_y[idx] - y
     err = -math.sin(yaw) * dx + math.cos(yaw) * dy
     return idx, err
+
+
+def speed_reference(args, t):
+    """v_des(t) under args.profile -- shared by every controller script's speed reference, so a
+    profile change (e.g. adding one) only has to happen in one place.
+
+    "sine": args.initial_speed + args.sine_amplitude * sin(2*pi*t/args.sine_period)
+    "step": args.initial_speed, then + args.step_size once t >= args.step_time
+    anything else: flat args.initial_speed
+    """
+    if args.profile == "sine":
+        return args.initial_speed + args.sine_amplitude * math.sin(2.0 * math.pi * t / args.sine_period)
+    if args.profile == "step":
+        return args.initial_speed + (args.step_size if t >= args.step_time else 0.0)
+    return args.initial_speed
+
+
+def reference_preview(args, t0, n_p, dt, warmed_up):
+    """Length-Np array of v_des at t0, t0+dt, ..., t0+(Np-1)*dt -- the MPC's look-ahead.
+
+    Before warm-up completes the profile hasn't started yet (t is undefined relative to it), so
+    preview a flat initial_speed instead, same as the t=0 value every profile shares.
+    """
+    if not warmed_up:
+        return np.full(n_p, args.initial_speed)
+    return np.array([speed_reference(args, t0 + k * dt) for k in range(n_p)])
 
 
 

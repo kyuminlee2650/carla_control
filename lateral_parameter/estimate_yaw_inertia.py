@@ -576,7 +576,7 @@ def main():
                         help="fixed sim step (s) -- finer than the 0.05 the other scripts use, "
                              "because the yaw transient lasts only ~0.2-0.3 s. Trials are a few "
                              "seconds each, so the extra ticks are cheap")
-    parser.add_argument("--times-run", type=float, default=2.0, help="how times for simulation running?")
+    parser.add_argument("--times-run", type=float, default=25.0, help="how times for simulation running?")
 
     # ---- method = step ---- #
     parser.add_argument("--cf-cr-file", default=os.path.join(HERE, "cornering_stiffness.json"))
@@ -714,7 +714,7 @@ def save_plots(results, plot_data, args):
 
         r0s = [t["r0"] for t in results["trials"]]
         js = [t["J"] for t in results["trials"]]
-        Iz_rad = results["Iz_if_rad"]
+        Iz_rad = results["Iz_raw_rad"]
         ax_b.scatter(r0s, js, color=COLOR_BLUE, zorder=3, label="measured")
         xs = np.linspace(0, max(r0s) * 1.05, 20)
         ax_b.plot(xs, Iz_rad * xs, color=COLOR_BLUE, linestyle="--", label=f"Iz={Iz_rad:,.0f}")

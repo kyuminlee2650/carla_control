@@ -86,7 +86,7 @@ sys.path.append(os.path.join(HERE, "longitudinal_lookup"))
 
 import carla
 
-from functions import PID, ImuAcceleration, LowPassFilter, clipping
+from functions import PID, ImuAcceleration, LowPassFilter, clipping, reference_preview, speed_reference
 from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_longitudinal_result,
                        print_error_summary, run_name)
 
@@ -213,25 +213,6 @@ class SpeedMPC:
             self.last_solution = u.copy()
 
         return float(np.clip(u[0], self.a_min, self.a_max))
-
-
-def speed_reference(args, t):
-    if args.profile == "sine":
-        return args.initial_speed + args.sine_amplitude * math.sin(2.0 * math.pi * t / args.sine_period)
-    if args.profile == "step":
-        return args.initial_speed + (args.step_size if t >= args.step_time else 0.0)
-    return args.initial_speed
-
-
-def reference_preview(args, t0, n_p, dt, warmed_up):
-    """Length-Np array of v_des at t0, t0+dt, ..., t0+(Np-1)*dt -- the MPC's look-ahead.
-
-    Before warm-up completes the profile hasn't started yet (t is undefined relative to it), so
-    preview a flat initial_speed instead, same as the t=0 value every profile shares.
-    """
-    if not warmed_up:
-        return np.full(n_p, args.initial_speed)
-    return np.array([speed_reference(args, t0 + k * dt) for k in range(n_p)])
 
 
 # ----------------------------------------------------------------------------- controllers
