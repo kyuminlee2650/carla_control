@@ -111,37 +111,58 @@ class SpeedMPC:
     Substituting the forward solution gives the condensed prediction X = A_bar x0 + B_bar U, and
     the tracking cost
 
-        J = (X - Xref)' W1 (X - Xref) + U' W2 U + (Phi U)' W3 (Phi U)
+        J = (X - Xref)' W1 (X - Xref) + U' W2 U + (Phi U - Uprev)' W3 (Phi U - Uprev)
 
-    becomes a box-constrained QP in U alone:
+    where Phi is now Nc x Nc (row 0 = [1,0,...,0], row l>=1 = -1 at col l-1 / +1 at col l) and
+    Uprev = [a_cmd_prev, 0, ..., 0]', a_cmd_prev the acceleration actually applied last tick
+    (self.last_solution[0] going into this solve()) -- so Phi U - Uprev is the true jerk sequence
+    [a_0-a_prev, a_1-a_0, ...], anchored to what the vehicle is actually doing right now rather than
+    only differencing within this one solve's own planned U (a Phi that only did that never limited
+    the *applied* a_cmd's tick-to-tick jump at all, since receding-horizon control only ever
+    executes U[0] and resolves fresh next tick -- same gap the lateral MPC's rate constraint had
+    before it got the same Uprev treatment). This becomes a box/rate-constrained QP in U alone:
 
-        min 1/2 U' H U + f' U   s.t.   a_min <= U <= a_max
-        H = 2 (B_bar' W1 B_bar + W2 + Phi' W3 Phi)   (constant -- built once)
-        f = 2 B_bar' W1 (A_bar x0 - Xref)            (rebuilt every cycle)
+        min 1/2 U' H U + f' U   s.t.  a_min <= U <= a_max,
+                                       Uprev - jerk_max*T <= Phi U <= Uprev + jerk_max*T
+        H = 2 (B_bar' W1 B_bar + W2 + Phi' W3 Phi)         (constant -- built once)
+        f = 2 B_bar' W1 (A_bar x0 - Xref) - 2 Phi' W3 Uprev   (rebuilt every cycle: Uprev changes)
+
+    (the -2 Phi' W3 Uprev term comes from expanding (Phi U - Uprev)' W3 (Phi U - Uprev) = U' Phi' W3
+    Phi U - 2 Uprev' W3 Phi U + Uprev' W3 Uprev -- the cross term is linear in U and has to land in
+    f, not just the U' Phi' W3 Phi piece in H, or the jerk cost silently stops penalizing relative
+    to a_cmd_prev at all.)
+
+    The hard jerk_max constraint reuses the same Phi/Uprev the soft w_j cost above does, stacked as
+    extra rows onto the box constraint (A = [I; Phi]) rather than folded into a bound on U itself --
+    OSQP's own A need not be the identity, so there's no need to invert Phi to get there.
 
     W1 = w_v I_Np weights every predicted speed error the same way; W2 = w_a I_Nc penalizes the
-    commanded acceleration's own magnitude (comfort/effort); Phi is the first-difference operator,
-    (Phi U)_l = a_{x,l+1} - a_{x,l}, and W3 = w_j I_(Nc-1) penalizes that difference -- a jerk-rate
-    cost on the commanded acceleration even though jerk itself is not a decision variable here.
-    W2 alone already makes H positive definite (B_bar' W1 B_bar is only positive semidefinite), so
-    the QP has a unique solution even with w_j = 0.
+    commanded acceleration's own magnitude (comfort/effort); W3 = w_j I_Nc penalizes the jerk
+    sequence above -- a jerk-rate cost on the commanded acceleration even though jerk itself is not
+    a decision variable here. W2 alone already makes H positive definite (B_bar' W1 B_bar is only
+    positive semidefinite), so the QP has a unique solution even with w_j = 0.
 
     Only the first element of U* is applied each cycle (receding horizon). Because U* already
     lives in acceleration units, that element *is* a_cmd -- no separate integration/anchoring step
-    is needed the way a jerk-input MPC would need one.
+    is needed the way a jerk-input MPC would need one. H and A are both constant (neither depends on
+    Uprev), so (unlike the lateral MPC, which rebuilds its whole QP every cycle) this one is
+    still built once in __init__ -- only q and the rate half of l/u move each solve(), via Uprev.
     """
 
-    def __init__(self, dt, n_p, n_c, w_v, w_a, w_j, a_min=-4.05, a_max=2.4):
+    def __init__(self, dt, n_p, n_c, w_v, w_a, w_j, a_min=-4.05, a_max=2.4, jerk_max=4.13):
         if not (0 < n_c <= n_p):
             raise ValueError(f"need 0 < n_c <= n_p, got n_c={n_c}, n_p={n_p}")
         if not (a_min < a_max):
             raise ValueError(f"need a_min < a_max, got a_min={a_min}, a_max={a_max}")
+        if not (jerk_max > 0):
+            raise ValueError(f"need jerk_max > 0, got jerk_max={jerk_max}")
 
         self.T = dt
         self.n_p = n_p
         self.n_c = n_c
         self.a_min = a_min
         self.a_max = a_max
+        self.jerk_max = jerk_max
 
         self.A = 1.0   # fixed by the problem: x_{k+1} = A x_k + B a_{x,k}
         self.B = dt
@@ -152,19 +173,30 @@ class SpeedMPC:
 
         W1 = w_v * np.eye(n_p)
         W2 = w_a * np.eye(n_c)
-        W3 = w_j * np.eye(max(n_c - 1, 0))
+        W3 = w_j * np.eye(n_c)   # Phi is now n_c x n_c (see _build_phi), not n_c-1
 
         self.H = 2.0 * (self.B_bar.T @ W1 @ self.B_bar + W2 + self.Phi.T @ W3 @ self.Phi)
         self.H = 0.5 * (self.H + self.H.T)      # symmetrize against round-off
-        self._B_W1 = 2.0 * self.B_bar.T @ W1    # reused every cycle to form f
+        self._B_W1 = 2.0 * self.B_bar.T @ W1        # reused every cycle to form f
+        self._2PhiT_W3 = 2.0 * self.Phi.T @ W3      # reused every cycle for f's Uprev cross term
+
+        # box (a_min<=U<=a_max) stacked with rate (Uprev-jerk_max*dt <= Phi U <= Uprev+jerk_max*dt)
+        # -- no need to invert Phi to fold the rate bound into a bound on U itself, OSQP's own A
+        # need not be the identity; stacking Phi in as extra rows and giving it its own l/u block
+        # is the direct way. Only the box half is static -- the rate half's l/u shift with Uprev
+        # every solve() (see there), so those rows are filled with placeholders here and replaced
+        # each cycle via update(l=..., u=...).
+        self._A_ineq = sparse.csc_matrix(np.vstack([np.eye(n_c), self.Phi]))
+        self._a_l = a_min * np.ones(n_c)
+        self._a_u = a_max * np.ones(n_c)
 
         self._solver = osqp.OSQP()
         self._solver.setup(
             P=sparse.csc_matrix(self.H),
             q=np.zeros(n_c),
-            A=sparse.csc_matrix(np.eye(n_c)),   # native box constraint on U itself
-            l=a_min * np.ones(n_c),
-            u=a_max * np.ones(n_c),
+            A=self._A_ineq,
+            l=np.concatenate([self._a_l, -jerk_max * dt * np.ones(n_c)]),
+            u=np.concatenate([self._a_u, jerk_max * dt * np.ones(n_c)]),
             verbose=False,
             polish=False,   # polishing logs to stdout even when verbose is off
         )
@@ -185,12 +217,13 @@ class SpeedMPC:
         return B_bar
 
     def _build_phi(self):
-        """(Nc-1) x Nc first-difference operator: (Phi U)_l = a_{x,l+1} - a_{x,l}."""
-        rows = max(self.n_c - 1, 0)
-        Phi = np.zeros((rows, self.n_c))
-        for l in range(rows):
-            Phi[l, l] = -1.0
-            Phi[l, l + 1] = 1.0
+        """Nc x Nc first-difference operator: (Phi U)_0 = a_0, (Phi U)_l = a_l - a_{l-1} for l >= 1.
+        Row 0 is deliberately just [1,0,...,0] -- solve() subtracts Uprev (a_cmd_prev in slot 0)
+        from Phi@U to turn that first row into a_0 - a_cmd_prev, anchoring the jerk cost to the
+        acceleration actually applied last tick instead of leaving step 0 unanchored."""
+        Phi = np.eye(self.n_c)
+        for l in range(1, self.n_c):
+            Phi[l, l - 1] = -1.0
         return Phi
 
     def solve(self, v_x, v_ref_preview):
@@ -199,9 +232,23 @@ class SpeedMPC:
         over a shorter horizon would just repeat its last value to fill the rest). Returns a_cmd,
         the acceleration to hand the pedal layer, clipped to [a_min, a_max]."""
         x_ref = np.asarray(v_ref_preview, dtype=float).reshape(-1, 1)
-        f = self._B_W1 @ (self.A_bar * v_x - x_ref)
+        # acceleration actually applied last tick (this solve's own U[0] once computed becomes NEXT
+        # tick's a_cmd_prev) -- anchors the jerk cost to reality instead of just to this one solve's
+        # own internal plan, see the class docstring.
+        u_prev = np.zeros((self.n_c, 1))
+        u_prev[0, 0] = self.last_solution[0]
 
-        self._solver.update(q=f.ravel())
+        f = self._B_W1 @ (self.A_bar * v_x - x_ref) - self._2PhiT_W3 @ u_prev
+
+        # hard jerk constraint's rate rows shift with Uprev every cycle, same reason its rows
+        # in f do -- box (a_min/a_max) rows are static, only concatenated fresh here since OSQP
+        # wants one full l/u vector per update(), not a way to patch a sub-block in place.
+        rate_l = -self.jerk_max * self.T + u_prev.ravel()
+        rate_u = self.jerk_max * self.T + u_prev.ravel()
+        l_full = np.concatenate([self._a_l, rate_l])
+        u_full = np.concatenate([self._a_u, rate_u])
+
+        self._solver.update(q=f.ravel(), l=l_full, u=u_full)
         result = self._solver.solve()
         self.last_status = result.info.status
 

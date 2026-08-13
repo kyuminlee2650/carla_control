@@ -34,7 +34,8 @@ sys.path.append(os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
 import carla
 
 from functions import (PID, AngleUnwrapper, ImuAcceleration, LowPassFilter, build_path,
-                       clipping, get_vehicle_geometry, lateral_error, normalize_angle)
+                       build_path_spline, clipping, get_vehicle_geometry, lateral_error,
+                       normalize_angle)
 from viz_utils import (BevView, VIEWS, VideoRecorder, follow_with_spectator, plot_results,
                        print_error_summary, run_name)
 
@@ -104,8 +105,9 @@ def main():
     settings.fixed_delta_seconds = args.dt
     world.apply_settings(settings)
 
-    origin_transform, path_x, path_y, path_yaw = build_path(world)
-    print(f"Route: {len(path_x)} points, "
+    origin_transform, path_x, path_y = build_path(world)
+    path = build_path_spline(path_x, path_y)
+    print(f"Route: {len(path_x)} points, {path.s_max:.1f} m, "
           f"start=({path_x[0]:.1f}, {path_y[0]:.1f}) goal=({path_x[-1]:.1f}, {path_y[-1]:.1f})")
 
     for actor in world.get_actors().filter("vehicle.*"):
@@ -127,7 +129,7 @@ def main():
     steer_filter = LowPassFilter(tau=0.1, dt=args.dt, initial=0)
     yaw_unwrapper = AngleUnwrapper()
     rh_unwrapper = AngleUnwrapper()
-    last_idx = 0
+    last_s = 0.0
 
 
     accel = ImuAcceleration(dt=args.dt)
@@ -145,7 +147,7 @@ def main():
                                  width=rec_w, height=rec_h, view=args.record_view)
 
     hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], "jerk": [],
-            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "last_idx": [],
+            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "s": [],
             "steer_deg": [], "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [],
             "e_theta": []}
 
@@ -203,14 +205,18 @@ def main():
             front_x = ego_x + front_offset * math.cos(yaw)
             front_y = ego_y + front_offset * math.sin(yaw)
 
-            last_idx, e_y = lateral_error(front_x, front_y, yaw, path_x, path_y, last_idx)
-            road_heading = rh_unwrapper.step(path_yaw[last_idx])
+            last_s, e_y = lateral_error(front_x, front_y, path, last_s)
+            yaw_s = float(path.yaw(last_s))
+            road_heading = rh_unwrapper.step(yaw_s)
 
-            e_theta = normalize_angle(path_yaw[last_idx] - yaw)
+            e_theta = normalize_angle(yaw_s - yaw)
             v_ref = args.target_speed if not warmed_up else speed_reference(args, (i - log_start_i) * args.dt)
             e_vel = v_ref - v_x
 
-            delta = stanley_control(v_x, e_y, e_theta)
+            # lateral_error() returns the Frenet-standard e_y (vehicle-minus-path, projected on
+            # path heading); stanley_control()'s atan2(k*e_y, ...) expects the opposite
+            # (path-minus-vehicle) sign to steer the right way, hence the flip here.
+            delta = stanley_control(v_x, -e_y, e_theta)
             steer = clipping(delta / max_steer, 3 / 7, -3 / 7)
             steer_deg = steer * math.degrees(max_steer)
 
@@ -254,7 +260,7 @@ def main():
             hist["yaw_rate"].append(yaw_rate)
             hist["yaw_acc"].append(yaw_acc)
             hist["jerk_total"].append(jerk_total)
-            hist["last_idx"].append(last_idx)
+            hist["s"].append(last_s)
             hist["steer_deg"].append(steer_deg)
             hist["throttle"].append(control.throttle)
             hist["brake"].append(control.brake)
@@ -264,11 +270,10 @@ def main():
             hist["e_theta"].append(math.degrees(e_theta))
 
             if i % 5 == 0:
-                print(f"t={t:5.1f}s   global_idx={last_idx}/{len(path_x) - 1}   v_x={v_x:5.1f} m/s   steer={steer_deg:+.2f} deg   e_y={e_y:+.2f} m")
+                print(f"t={t:5.1f}s   s={last_s:6.1f}/{path.s_max:.1f} m   v_x={v_x:5.1f} m/s   steer={steer_deg:+.2f} deg   e_y={e_y:+.2f} m")
 
-
-            if last_idx >= len(path_x) - 1:
-                print(f"Reached end of path (global_idx {last_idx}/{len(path_x) - 1}).")
+            if last_s >= path.s_max - 0.1:
+                print(f"Reached end of path (s={last_s:.1f}/{path.s_max:.1f} m).")
                 break
 
             elapsed = time.time() - step_start

@@ -64,9 +64,10 @@ sys.path.append(os.path.join(HERE, "longitudinal_lookup"))
 import carla
 
 from functions import (PID, AngleUnwrapper, ImuAcceleration, LowPassFilter, build_path,
-                       clipping, get_vehicle_geometry, lateral_error, normalize_angle)
-from viz_utils import (BevView, VIEWS, VideoRecorder, follow_with_spectator, plot_results,
-                       print_error_summary, run_name)
+                       build_path_spline, clipping, get_vehicle_geometry, lateral_error,
+                       normalize_angle, reference_preview, refine_speed_preview)
+from viz_utils import (BevView, VIEWS, VideoRecorder, follow_with_spectator, plot_comparison,
+                       plot_results, print_error_summary, run_name)
 
 from longitudinal_lut import LongitudinalLUT
 from lookup_controller import LookupController
@@ -92,6 +93,10 @@ def stanley_control(v_x, e_y, e_theta, k_theta=1.0, k=1.2, k_soft=1.0):
 
 
 def speed_reference(args, t):
+    """This script's own profile (adds "estop" -- an emergency stop partway through the run -- and
+    uses args.target_speed rather than functions.speed_reference()'s args.initial_speed), so it
+    stays local; functions.reference_preview() takes it as its speed_fn to reuse the shared
+    walking/warm-up logic without needing a second copy of that."""
     if args.profile == "sine":
         return args.target_speed + args.sine_amplitude * math.sin(2.0 * math.pi * t / args.sine_period)
     if args.profile == "estop":
@@ -99,17 +104,6 @@ def speed_reference(args, t):
             return 0.0
         return args.target_speed
     return args.target_speed
-
-
-def reference_preview(args, t0, n_p, dt, warmed_up):
-    """Length-Np array of v_des at t0, t0+dt, ..., t0+(Np-1)*dt -- the MPC's look-ahead.
-
-    Before warm-up completes the profile hasn't started yet (t is undefined relative to it), so
-    preview a flat target_speed instead, same as the t=0 value every profile shares.
-    """
-    if not warmed_up:
-        return np.full(n_p, args.target_speed)
-    return np.array([speed_reference(args, t0 + k * dt) for k in range(n_p)])
 
 
 # ----------------------------------------------------------------------------- longitudinal controllers
@@ -153,10 +147,16 @@ class MpcLongitudinal:
         self.u_filter = LowPassFilter(tau=self.args.u_tau, dt=self.args.dt, initial=u)
 
     def step(self, ctx):
-        preview = reference_preview(self.args, ctx.t, self.args.n_p, self.args.dt, ctx.warmed_up)
+        preview = reference_preview(self.args, ctx.t, self.args.n_p, self.args.dt, ctx.warmed_up,
+                                    speed_fn=speed_reference)
+        # curvature-aware speed cap: reduces the reference itself ahead of a curve, instead of
+        # relying on Stanley to out-steer whatever speed the profile blindly asked for.
+        preview = refine_speed_preview(preview, ctx.path, ctx.last_s, self.args.dt,
+                                       a_y_max=self.args.ay_max)
+        ctx.v_ref_curve = float(preview[0])   # curvature-clipped target, stashed for hist["v_des"]
         ctx.a_cmd = self.mpc.solve(ctx.v_x, preview)   # stashed for the console print line
         # SpeedMPC's own condensed prediction X = A_bar x0 + B_bar U*, re-derived here (not
-        # returned by solve()) so mpc_mpc.py's LPV lateral controller can schedule A(v_x) against
+        # returned by solve()) so mpc_mpc.py's lateral MPC controller can schedule A(v_x) against
         # the same v_x trajectory this loop is actually planning to drive, instead of assuming
         # constant speed over its horizon. Unused by stanley_mpc.py itself.
         ctx.v_x_preview = (self.mpc.A_bar.ravel() * ctx.v_x + self.mpc.B_bar @ self.mpc.last_solution)
@@ -169,7 +169,7 @@ LONGITUDINAL = {"stanley+pid": PidLongitudinal, "stanley+mpc": MpcLongitudinal}
 
 # ----------------------------------------------------------------------------- one trial
 
-def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_bp, controller,
+def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, controller,
               args, recorder_factory):
     """Spawn one vehicle, drive the whole path under Stanley (lateral) + `controller`
     (longitudinal), tear it down. Returns the run's hist dict.
@@ -190,7 +190,7 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_
     steer_filter = LowPassFilter(tau=0.1, dt=args.dt, initial=0)
     yaw_unwrapper = AngleUnwrapper()
     rh_unwrapper = AngleUnwrapper()
-    last_idx = 0
+    last_s = 0.0
 
     accel = ImuAcceleration(dt=args.dt)
     yaw_acc_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
@@ -199,9 +199,9 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_
     bev = None if args.no_live_view else BevView(path_x, path_y)
 
     hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], "jerk": [],
-            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "last_idx": [],
+            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "s": [],
             "steer_deg": [], "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [],
-            "e_theta": []}
+            "e_theta": [], "a_cmd": []}
 
     warmed_up = False
     log_start_i = 0
@@ -247,12 +247,16 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_
             front_x = ego_x + front_offset * math.cos(yaw)
             front_y = ego_y + front_offset * math.sin(yaw)
 
-            last_idx, e_y = lateral_error(front_x, front_y, yaw, path_x, path_y, last_idx)
-            road_heading = rh_unwrapper.step(path_yaw[last_idx])
+            last_s, e_y = lateral_error(front_x, front_y, path, last_s)
+            yaw_s = float(path.yaw(last_s))
+            road_heading = rh_unwrapper.step(yaw_s)
 
-            e_theta = normalize_angle(path_yaw[last_idx] - yaw)
+            e_theta = normalize_angle(yaw_s - yaw)
 
-            delta = stanley_control(v_x, e_y, e_theta)
+            # lateral_error() returns the Frenet-standard e_y (vehicle-minus-path, projected on
+            # path heading); stanley_control()'s atan2(k*e_y, ...) expects the opposite
+            # (path-minus-vehicle) sign to steer the right way, hence the flip here.
+            delta = stanley_control(v_x, -e_y, e_theta)
             steer = clipping(delta / max_steer, 3 / 7, -3 / 7)
             steer_deg = steer * math.degrees(max_steer)
 
@@ -260,7 +264,8 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_
             t_probe = (i - log_start_i) * args.dt
             v_ref = args.target_speed if not warmed_up else speed_reference(args, t_probe)
             ctx = SimpleNamespace(t=t_probe, v_x=v_x, v_ref=v_ref, a_x=a_x, a_x_raw=a_x_raw,
-                                  gear=vehicle.get_control().gear, warmed_up=warmed_up)
+                                  gear=vehicle.get_control().gear, warmed_up=warmed_up,
+                                  path=path, last_s=last_s)
             control_value = controller.step(ctx)
 
             control = carla.VehicleControl()
@@ -299,14 +304,14 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_
             hist["y"].append(ego_y)
             hist["v_x"].append(v_x)
             hist["v_y"].append(v_y)
-            hist["v_des"].append(v_ref)
+            hist["v_des"].append(ctx.v_ref_curve if hasattr(ctx, "v_ref_curve") else v_ref)
             hist["a_x"].append(a_x)
             hist["jerk"].append(jerk)
             hist["a_y"].append(a_y)
             hist["yaw_rate"].append(yaw_rate)
             hist["yaw_acc"].append(yaw_acc)
             hist["jerk_total"].append(jerk_total)
-            hist["last_idx"].append(last_idx)
+            hist["s"].append(last_s)
             hist["steer_deg"].append(steer_deg)
             hist["throttle"].append(control.throttle)
             hist["brake"].append(control.brake)
@@ -314,14 +319,15 @@ def run_trial(world, origin_transform, path_x, path_y, path_yaw, blueprint, imu_
             hist["yaw"].append(math.degrees(yaw))
             hist["path_yaw"].append(math.degrees(road_heading))
             hist["e_theta"].append(math.degrees(e_theta))
+            hist["a_cmd"].append(ctx.a_cmd if hasattr(ctx, "a_cmd") else float("nan"))
 
             if i % 5 == 0:
                 extra = f"   a_cmd={ctx.a_cmd:+.2f} m/s^2" if hasattr(ctx, "a_cmd") else ""
-                print(f"[{controller.label}] t={t:5.1f}s   global_idx={last_idx}/{len(path_x) - 1}   "
+                print(f"[{controller.label}] t={t:5.1f}s   s={last_s:6.1f}/{path.s_max:.1f} m   "
                       f"v_x={v_x:5.1f} m/s{extra}   steer={steer_deg:+.2f} deg   e_y={e_y:+.2f} m")
 
-            if last_idx >= len(path_x) - 1:
-                print(f"[{controller.label}] Reached end of path (global_idx {last_idx}/{len(path_x) - 1}).")
+            if last_s >= path.s_max - 0.1:
+                print(f"[{controller.label}] Reached end of path (s={last_s:.1f}/{path.s_max:.1f} m).")
                 break
 
             elapsed = time.time() - step_start
@@ -373,6 +379,10 @@ def main():
     mpc.add_argument("--w-j", type=float, default=10, help="commanded-acceleration rate (jerk) weight")
     mpc.add_argument("--a-min", type=float, default=-4.05, help="hard lower bound on a_cmd (m/s^2)")
     mpc.add_argument("--a-max", type=float, default=2.4, help="hard upper bound on a_cmd (m/s^2)")
+    mpc.add_argument("--ay-max", type=float, default=4.9,
+                     help="comfortable/grip lateral-accel budget (m/s^2) a curve of a given radius "
+                          "is allowed to demand -- caps the speed preview itself via v <= "
+                          "sqrt(ay_max/kappa) ahead of the curve, per functions.refine_speed_preview")
     mpc.add_argument("--lut", default=os.path.join(HERE, "longitudinal_lookup", "longitudinal_lut.npz"))
     mpc.add_argument("--kp", type=float, default=0.15, help="accel-tracking PID proportional gain")
     mpc.add_argument("--ki", type=float, default=0.6, help="accel-tracking PID integral gain")
@@ -411,8 +421,9 @@ def main():
     settings.fixed_delta_seconds = args.dt
     world.apply_settings(settings)
 
-    origin_transform, path_x, path_y, path_yaw = build_path(world)
-    print(f"Route: {len(path_x)} points, "
+    origin_transform, path_x, path_y = build_path(world)
+    path = build_path_spline(path_x, path_y)
+    print(f"Route: {len(path_x)} points, {path.s_max:.1f} m, "
           f"start=({path_x[0]:.1f}, {path_y[0]:.1f}) goal=({path_x[-1]:.1f}, {path_y[-1]:.1f})")
 
     for actor in world.get_actors().filter("vehicle.*"):
@@ -444,7 +455,7 @@ def main():
         for key in keys:
             controller = LONGITUDINAL[key](args)
             print(f"\n=== running {controller.label} ===")
-            results[controller.label] = run_trial(world, origin_transform, path_x, path_y, path_yaw,
+            results[controller.label] = run_trial(world, origin_transform, path_x, path_y, path,
                                                    blueprint, imu_bp, controller, args,
                                                    recorder_factory(key, len(keys)))
     except KeyboardInterrupt:
@@ -459,12 +470,17 @@ def main():
             if len(results) > 1:
                 print(f"\n### {label} ###")
             print_error_summary(hist, args.target_speed)  # plot_results prints it otherwise
-    else:
-        data = results if len(results) > 1 else next(iter(results.values()))
-        title = " vs ".join(results) if len(results) > 1 else next(iter(results), "")
+    elif len(results) == 1:
+        hist = next(iter(results.values()))
         try:
-            plot_results(path_x, path_y, data, args.target_speed, args.plot_dir,
-                         label=f"Stanley + {title}")
+            plot_results(path_x, path_y, hist, args.target_speed, args.plot_dir,
+                         label=f"Stanley + {next(iter(results))}")
+        except Exception as exc:
+            print(f"Plotting failed: {exc}")
+            print_error_summary(hist, args.target_speed)
+    else:
+        try:
+            plot_comparison(results, path_x, path_y, args.plot_dir, args.target_speed)
         except Exception as exc:
             print(f"Plotting failed: {exc}")
             for label, hist in results.items():

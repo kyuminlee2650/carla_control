@@ -12,6 +12,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.interpolate import UnivariateSpline
 
 # CARLA's PyPI wheel (`pip install carla`) only ships the compiled client API; the navigation
 # helpers under PythonAPI/carla/agents (GlobalRoutePlanner) only exist in the simulator's own
@@ -278,24 +279,11 @@ def clipping(value,max_val,min_val):
 
 
 
-def heading_from_points(path_x, path_y, stencil=6):
-    """Path heading from a centred finite difference over the polyline.
-
-    Preferred over each waypoint's own rotation.yaw, which is noisy around junctions and lane
-    changes -- that jitter fed straight into e_theta and showed up as steering chatter.
-    """
-    n = len(path_x)
-    unwrapper = AngleUnwrapper()
-    headings = []
-    for i in range(n):
-        a = max(0, i - stencil)
-        b = min(n - 1, i + stencil)
-        headings.append(unwrapper.step(math.atan2(path_y[b] - path_y[a], path_x[b] - path_x[a])))
-    return headings
-
-
 def build_path(world, sampling_resolution=1, origin_index=0, dest_index=100):
-    """Trace a route with GlobalRoutePlanner and flatten it into x/y/yaw arrays."""
+    """Trace a route with GlobalRoutePlanner and flatten it into x/y arrays. Heading/curvature are
+    no longer derived here -- see build_path_spline()/PathSpline, which fits a continuous curve to
+    these same points and gets yaw/kappa from its own derivatives instead of a finite-difference
+    stencil over this array."""
     spawn_points = world.get_map().get_spawn_points()
     dest_index = min(dest_index, len(spawn_points) - 1)
     if dest_index == origin_index:
@@ -311,8 +299,108 @@ def build_path(world, sampling_resolution=1, origin_index=0, dest_index=100):
 
     path_x = [wp.transform.location.x for wp, _ in route]
     path_y = [wp.transform.location.y for wp, _ in route]
-    path_yaw = heading_from_points(path_x, path_y)
-    return origin_transform, path_x, path_y, path_yaw
+    return origin_transform, path_x, path_y
+
+
+def _chord_length_station(path_x, path_y):
+    """Cumulative Euclidean (chord-length) distance along the raw point sequence -- only an
+    approximation of true arc length along the curve PathSpline later fits, but a standard and
+    (at GlobalRoutePlanner's ~1m point spacing) accurate enough way to get an initial station
+    parameterization to fit x(s)/y(s) against in the first place."""
+    s = [0.0]
+    for i in range(1, len(path_x)):
+        s.append(s[-1] + math.hypot(path_x[i] - path_x[i - 1], path_y[i] - path_y[i - 1]))
+    return np.asarray(s, dtype=float)
+
+
+class PathSpline:
+    """Arc-length-parameterized SMOOTHING cubic spline fit of a path: x(s), y(s). yaw(s) and
+    kappa(s) are analytic derivatives of that fit (atan2(y', x') and the standard curvature formula
+    (x'y''-y'x'')/(x'^2+y'^2)^1.5) -- no finite-difference stencil, no dependence on how densely or
+    evenly the input points happen to be sampled. Point-to-path queries (project()) work the same
+    way regardless of the input source (dense GlobalRoutePlanner waypoints today, sparser planner
+    output like VAD later): a coarse scan followed by Newton refinement on the continuous curve,
+    rather than a nearest-neighbor search over a specific discrete array.
+
+    smoothing: UnivariateSpline's own smoothing factor (0 = exact interpolation through every input
+    point, which lets input noise show up directly in kappa's second derivative; larger = smoother
+    fit, less exact through the points). Tune by eye against a route's known corners, the same way
+    Cf/Cr got tuned against measured behavior elsewhere in this project.
+    """
+
+    def __init__(self, path_x, path_y, smoothing=1.0, min_spacing=0.01):
+        s = _chord_length_station(path_x, path_y)
+        px = np.asarray(path_x, dtype=float)
+        py = np.asarray(path_y, dtype=float)
+        # UnivariateSpline requires strictly increasing x. GlobalRoutePlanner's route can repeat
+        # (or nearly repeat) a waypoint at junctions/lane-change points -- 14 such spots on the
+        # default Town10HD_Opt route alone -- which silently corrupts the whole fit (not just near
+        # the duplicate) if left in, so drop the second of any pair closer than min_spacing rather
+        # than assume the input is already well-formed.
+        keep = np.concatenate([[True], np.diff(s) > min_spacing])
+        s, px, py = s[keep], px[keep], py[keep]
+
+        self.s_min, self.s_max = float(s[0]), float(s[-1])
+        self._sx = UnivariateSpline(s, px, k=3, s=smoothing)
+        self._sy = UnivariateSpline(s, py, k=3, s=smoothing)
+
+    def xy(self, s):
+        return self._sx(s), self._sy(s)
+
+    def yaw(self, s):
+        return np.arctan2(self._sy(s, 1), self._sx(s, 1))
+
+    def kappa(self, s):
+        dx, dy = self._sx(s, 1), self._sy(s, 1)
+        ddx, ddy = self._sx(s, 2), self._sy(s, 2)
+        denom = (dx * dx + dy * dy) ** 1.5   # ~v_x^3 in the parameterization's own speed; never
+        return (dx * ddy - dy * ddx) / np.maximum(denom, 1e-9)   # near 0 for an arc-length fit
+
+    def project(self, x, y, last_s, window=30.0, coarse_step=0.5, newton_iters=4):
+        """Closest point on the spline to (x, y), searched forward from last_s (never backward --
+        same forward-only assumption lateral_error()'s old array search made). Coarse scan over
+        [last_s, min(s_max, last_s+window)] at coarse_step to land in the right basin, then a few
+        Newton steps on the orthogonality condition (C(s)-P)*C'(s)=0 for sub-sample accuracy.
+
+        Returns (s_star, e_y). e_y is (vehicle - path) projected onto the path's own left-normal
+        n(yaw) = (-sin(yaw), cos(yaw)) -- the same Frenet, vehicle-minus-path sign convention the
+        old array-based lateral_error() used (positive = vehicle to the left of the path's own
+        tangent direction; see LateralMPC's docstring for why this is the convention e_y_dot =
+        v_y + v_x*e_psi needs)."""
+        lo = last_s
+        hi = min(self.s_max, last_s + window)
+        if hi <= lo:
+            lo, hi = self.s_max - 1e-6, self.s_max
+        s_grid = np.arange(lo, hi, coarse_step)
+        if s_grid.size == 0:
+            s_grid = np.array([lo])
+        xs, ys = self.xy(s_grid)
+        d2 = (xs - x) ** 2 + (ys - y) ** 2
+        s_star = float(s_grid[np.argmin(d2)])
+
+        for _ in range(newton_iters):
+            cx, cy = self.xy(s_star)
+            dx, dy = float(self._sx(s_star, 1)), float(self._sy(s_star, 1))
+            ddx, ddy = float(self._sx(s_star, 2)), float(self._sy(s_star, 2))
+            f = (cx - x) * dx + (cy - y) * dy
+            fp = dx * dx + dy * dy + (cx - x) * ddx + (cy - y) * ddy
+            if abs(fp) < 1e-9:
+                break
+            s_star -= f / fp
+            s_star = min(max(s_star, self.s_min), self.s_max)
+
+        cx, cy = self.xy(s_star)
+        yaw_s = float(self.yaw(s_star))
+        dx_v, dy_v = x - float(cx), y - float(cy)
+        e_y = -math.sin(yaw_s) * dx_v + math.cos(yaw_s) * dy_v
+        return s_star, e_y
+
+
+def build_path_spline(path_x, path_y, smoothing=1.0):
+    """Fit a PathSpline to build_path()'s raw x/y arrays -- the one-time step every controller
+    calls right after build_path(), same way build_path_station()/build_path_curvature() used to
+    be called once after it."""
+    return PathSpline(path_x, path_y, smoothing=smoothing)
 
 
 def get_vehicle_geometry(vehicle, spawn_transform):
@@ -389,19 +477,17 @@ class CollisionWatch:
 
 
 
-def lateral_error(x, y, yaw, path_x, path_y, last_idx, search_window=30):
-    """Signed cross-track error of (x, y) against an arbitrary fixed path -- independent of whatever
+def lateral_error(x, y, path, last_s, window=30.0):
+    """Signed cross-track error of (x, y) against a PathSpline -- independent of whatever
     trajectory a controller happens to be tracking. Used to score true deviation from the global
     route, since the local plan resets itself to the vehicle's position every replan and so can't
-    be used to measure real tracking performance (see the "isn't this cheating" discussion)."""
-    lo = last_idx
-    hi = min(len(path_x), last_idx + search_window)
-    dists = [math.hypot(x - path_x[i], y - path_y[i]) for i in range(lo, hi)]
-    idx = lo + dists.index(min(dists))
-    dx = path_x[idx] - x
-    dy = path_y[idx] - y
-    err = -math.sin(yaw) * dx + math.cos(yaw) * dy
-    return idx, err
+    be used to measure real tracking performance (see the "isn't this cheating" discussion).
+
+    Thin wrapper over PathSpline.project(): kept as its own function since every caller in this
+    repo already spells it this way, but the actual projection (coarse scan + Newton refine on the
+    continuous curve) and the Frenet vehicle-minus-path sign convention both live on PathSpline now
+    -- see its docstring. Returns (s_star, e_y), station replacing the old integer array index."""
+    return path.project(x, y, last_s, window=window)
 
 
 def speed_reference(args, t):
@@ -419,15 +505,50 @@ def speed_reference(args, t):
     return args.initial_speed
 
 
-def reference_preview(args, t0, n_p, dt, warmed_up):
+def reference_preview(args, t0, n_p, dt, warmed_up, speed_fn=speed_reference):
     """Length-Np array of v_des at t0, t0+dt, ..., t0+(Np-1)*dt -- the MPC's look-ahead.
 
+    speed_fn(args, t) -> float supplies the actual profile; defaults to this module's own
+    speed_reference() but is injectable so a script with a different profile set/args shape (e.g.
+    stanley_mpc.py's own speed_reference(), which adds an "estop" profile and uses args.target_speed
+    instead of args.initial_speed) can still share this walking/warm-up logic instead of keeping a
+    second copy of it.
+
     Before warm-up completes the profile hasn't started yet (t is undefined relative to it), so
-    preview a flat initial_speed instead, same as the t=0 value every profile shares.
+    preview a flat speed_fn(args, 0.0) instead -- every profile's own t=0 value already equals its
+    steady-state target (sin(0)=0, no step/stop yet), so this is the same flat value as before
+    without hardcoding which attribute name holds it.
     """
     if not warmed_up:
-        return np.full(n_p, args.initial_speed)
-    return np.array([speed_reference(args, t0 + k * dt) for k in range(n_p)])
+        return np.full(n_p, speed_fn(args, 0.0))
+    return np.array([speed_fn(args, t0 + k * dt) for k in range(n_p)])
+
+
+def refine_speed_preview(v_preview, path, last_s, dt, a_y_max=4.9):
+    """Clip a time-domain speed preview (reference_preview()'s output) to what upcoming curvature
+    allows: v_target[k] = min(v_preview[k], sqrt(a_y_max/|kappa(s_k)|)), the same v <= sqrt(a_y/kappa)
+    relation behind every a_y=v^2/r note elsewhere in this project about corners this route's
+    lateral controllers can't out-steer at speed. Without this, the reference profile a longitudinal
+    MPC tracks has no idea a curve is coming and only reacts to it laterally, after the fact.
+
+    s_k is found by walking a station cursor forward using the ALREADY-refined v_target at each
+    prior step, not the raw v_preview -- self-consistent, since slowing down now means arriving at
+    a later station later too, the same forward-walk idea curvature_preview() already uses for the
+    lateral MPC's own kappa preview (just threaded through v itself here instead of only read).
+
+    a_y_max: comfortable/grip lateral-acceleration budget (m/s^2) a curve of a given radius is
+    allowed to demand. Tune like any other physical limit in this project (Cf/Cr, delta_max, ...).
+    """
+    v_preview = np.asarray(v_preview, dtype=float)
+    s_cursor = last_s
+    out = np.empty_like(v_preview)
+    for k, v in enumerate(v_preview):
+        kappa = float(path.kappa(min(s_cursor, path.s_max)))
+        v_curve = math.sqrt(a_y_max / abs(kappa)) if abs(kappa) > 1e-6 else float("inf")
+        v_k = min(v, v_curve)
+        out[k] = v_k
+        s_cursor += max(v_k, 0.0) * dt
+    return out
 
 
 
