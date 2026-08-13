@@ -279,6 +279,20 @@ def clipping(value,max_val,min_val):
 
 
 
+def spawn_at(world, x, y, z_margin=0.5):
+    """A carla.Transform for a raw (x, y) map coordinate, snapped onto the nearest road waypoint
+    (for correct lane heading/z -- an unsnapped raw Location has no orientation and may sit inside
+    the road mesh) with a small z margin, same as CARLA's own spawn points carry, so the vehicle
+    doesn't spawn clipped into the ground. Does NOT touch the route itself (build_path()'s
+    path_x/path_y stay exactly as traced) -- callers use this only to place the vehicle somewhere
+    other than the route's own start, e.g. further back on a straight stretch so it can reach
+    --initial-speed before run_trial()'s curvature-based logging gate (see mpc_mpc1.py) lets it
+    start scoring."""
+    wp = world.get_map().get_waypoint(carla.Location(x=x, y=y, z=0.0))
+    t = wp.transform
+    return carla.Transform(carla.Location(t.location.x, t.location.y, t.location.z + z_margin), t.rotation)
+
+
 def build_path(world, sampling_resolution=1, origin_index=0, dest_index=100):
     """Trace a route with GlobalRoutePlanner and flatten it into x/y arrays. Heading/curvature are
     no longer derived here -- see build_path_spline()/PathSpline, which fits a continuous curve to

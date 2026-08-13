@@ -43,7 +43,7 @@ Usage (Windows):
     cd C:\Users\mumu2\carla_control
     .venv\Scripts\python.exe mpc_mpc1.py --profile constant --initial-speed 5
     .venv\Scripts\python.exe mpc_mpc1.py --profile sine --initial-speed 5 --sine-amplitude 2 --sine-period 5
-    .venv\Scripts\python.exe mpc_mpc1.py --profile step --initial-speed 5 --step-size 2 --step-time 10
+    .venv\Scripts\python.exe mpc_mpc1.py --profile constant --initial-speed 5 --save-plot --record --controller mpc vad-pid
 """
 
 import argparse
@@ -71,7 +71,8 @@ import carla
 
 from functions import (AngleUnwrapper, ImuAcceleration, LowPassFilter, build_path,
                        build_path_spline, control_input, get_vehicle_geometry, lateral_error,
-                       normalize_angle, reference_preview, refine_speed_preview, speed_reference)
+                       normalize_angle, reference_preview,
+                       refine_speed_preview, speed_reference, spawn_at)
 from longitudinal_lut import LongitudinalLUT
 from lookup_controller import LookupController
 from longitudinal_mpc import SpeedMPC
@@ -83,9 +84,10 @@ from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_compari
 # indices) is a property of this specific map, not something to rediscover via CLI flags.
 MAP_NAME = "Town10HD_Opt"
 
-WARM_START_SPEED_TOL = 0.3   # m/s
-WARM_START_ACCEL_TOL = 0.5   # m/s^2
-WARM_START_TIMEOUT = 15.0    # s -- safety cap in case initial_speed is unreachable
+WARM_START_SPEED_TOL = 0.3    # m/s
+WARM_START_ACCEL_TOL = 0.5    # m/s^2
+WARM_START_REACH_TOL = 0.5    # m -- how close to spawn_to_start_m counts as "reached" (GPS/tick noise)
+WARM_START_TIMEOUT = 15.0     # s -- safety cap in case initial_speed is unreachable
 
 
 def _load_vehicle_defaults():
@@ -489,9 +491,21 @@ class VadPidController:
 
 # ----------------------------------------------------------------------------- one trial
 
-def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, controller,
-             controller_key, args, video_suffix=""):
+def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, controller,
+             controller_key, args, spawn_to_start_m=0.0, video_suffix=""):
     """Spawn one vehicle, drive it under `controller`, tear it down.
+
+    spawn_transform is where the vehicle actually spawns -- with --spawn-x/-y this sits well before
+    path's own s=0 (see functions.spawn_at()), NOT the route's own start; path/path_x/path_y are
+    untouched either way. last_s starts at 0.0 below regardless: path.project() clips to the nearest
+    in-domain station until the vehicle physically reaches the route's start, so a spawn point behind
+    the route just means the first several ticks project onto s=0 (near-zero e_y, since --spawn-x/-y
+    is meant to sit on the same straight road) rather than requiring the path itself to reach back to
+    where the car spawned.
+
+    spawn_to_start_m: main()'s own straight-line distance from spawn_transform to the route's actual
+    start (origin_transform.location). Used below both to size warm_start_timeout and, together with
+    v_x/a_x, to gate when logging starts -- see the warm-up gate note below.
 
     controller_key selects the per-tick control branch: "mpc" runs the existing split
     MpcLongitudinal (longitudinal) + LateralMPC (lateral) pair; "vad-pid" runs `controller` (a
@@ -502,14 +516,18 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
     other's mp4 -- main() passes the controller key here when 2+ controllers are selected, "" (no
     change) for a single one.
 
-    Same warm-up gate as stanley_mpc.py/longitudinal_mpc.py: launch from rest under the real
-    longitudinal controller and hold off on logging until v_x/a_x have actually settled near the
-    profile's own t=0 value (initial_speed) instead of faking that starting condition. Steering
-    (lateral or combined) runs from tick one regardless -- only the *logging* start is gated.
+    Same warm-up gate as stanley_mpc.py/longitudinal_mpc.py in spirit -- launch from rest under the
+    real longitudinal controller and hold off on logging until v_x/a_x have actually settled near the
+    profile's own t=0 value (--initial-speed) -- but ANDed with one more condition: the vehicle must
+    also have physically covered spawn_to_start_m, i.e. actually reached the route's own s=0, not
+    just gotten close to --initial-speed somewhere on the spawn-to-route-start stretch. Without that,
+    logging could start (and the flat --v_des_log profile with it) before the car has rejoined the
+    scored route at all. Steering (lateral or combined) runs from tick one regardless -- only the
+    *logging* start is gated.
     """
-    vehicle = world.spawn_actor(blueprint, origin_transform)
+    vehicle = world.spawn_actor(blueprint, spawn_transform)
     physics = vehicle.get_physics_control()
-    _, lf, lr, max_steer = get_vehicle_geometry(vehicle, origin_transform)
+    _, lf, lr, max_steer = get_vehicle_geometry(vehicle, spawn_transform)
 
     # delta_max capped well under max_steer (the wheel's own physical limit, ~70 deg): Cf/Cr were
     # calibrated over an ~8-16 deg range (estimate_cornering_stiffness.py), so the linear tire model
@@ -541,6 +559,14 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
             "a_cmd": []}
     warmed_up = False
     log_start_i = 0
+    # WARM_START_TIMEOUT (15s) alone assumed warm-up only ever needs to cover a speed/accel
+    # transient; the reach-the-route-start gate below can genuinely need longer than that to also
+    # cover spawn_to_start_m at a modest --initial-speed -- pad the cap by a generous (1.5x, so the
+    # vehicle doesn't need to be at cruise speed for the whole stretch) estimate of that drive time
+    # rather than let a legitimate --spawn-x/-y distance get cut off by timed_out.
+    warm_start_timeout = max(WARM_START_TIMEOUT,
+                             1.5 * spawn_to_start_m / max(args.initial_speed, 0.5)
+                             + WARM_START_TIMEOUT)
 
     imu = None
     recorder = None
@@ -563,7 +589,7 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
             recorder = VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
                                      width=rec_w, height=rec_h, view=args.record_view)
 
-        steps = int((args.max_duration + WARM_START_TIMEOUT) / args.dt)
+        steps = int((args.max_duration + warm_start_timeout) / args.dt)
         for i in range(steps):
             step_start = time.time()
             world.tick()
@@ -632,15 +658,24 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
             follow_with_spectator(world, vehicle)
 
             if not warmed_up:
+                # dist_from_spawn stays < spawn_to_start_m the whole time the car is still short of
+                # the route's actual start -- straight-line, not path station, since last_s itself
+                # stays pinned at path.s_min (0.0) the whole time the car is behind the route (see
+                # the module docstring), so it can't tell "still approaching" from "just arrived".
+                dist_from_spawn = math.hypot(ego_x - spawn_transform.location.x,
+                                             ego_y - spawn_transform.location.y)
+                reached_start = dist_from_spawn >= spawn_to_start_m - WARM_START_REACH_TOL
                 converged = (abs(v_x - args.initial_speed) < WARM_START_SPEED_TOL
-                            and abs(a_x) < WARM_START_ACCEL_TOL)
-                timed_out = i * args.dt >= WARM_START_TIMEOUT
+                            and abs(a_x) < WARM_START_ACCEL_TOL
+                            and reached_start)
+                timed_out = i * args.dt >= warm_start_timeout
                 if converged or timed_out:
                     warmed_up = True
                     log_start_i = i
                     controller.reset(reset_arg)
-                    status = "converged" if converged else f"timed out after {WARM_START_TIMEOUT:.0f}s"
-                    print(f"Warm-start {status}: v_x={v_x:.2f} m/s, a_x={a_x:.2f} m/s^2 -- "
+                    status = "converged" if converged else f"timed out after {warm_start_timeout:.0f}s"
+                    print(f"Warm-start {status}: v_x={v_x:.2f} m/s, a_x={a_x:.2f} m/s^2, "
+                          f"dist_from_spawn={dist_from_spawn:.1f}/{spawn_to_start_m:.1f} m -- "
                           f"logging starts now.")
                 else:
                     elapsed = time.time() - step_start
@@ -703,6 +738,16 @@ def main():
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
     parser.add_argument("--times-run", type=float, default=20.0, help="how times for simulation running?")
     parser.add_argument("--max-duration", type=float, default=100.0, help="scored run length (s)")
+    parser.add_argument("--spawn-x", type=float, default=-120.0,
+                        help="m -- vehicle spawns at the road waypoint nearest this raw map (x, y) "
+                             "(see functions.spawn_at), NOT the route's own start; the scored route "
+                             "itself (path_x/path_y, from build_path()'s own origin/dest indices) is "
+                             "untouched. Gives the warm-up gate (see run_trial docstring) a straight "
+                             "run-up to ramp up to --initial-speed on. Default (-90, 25) is this "
+                             "map's own route start (-64.8, 24.5) backed up along the same straight "
+                             "road; pick a point on this specific route's own straight lead-up for a "
+                             "different route.")
+    parser.add_argument("--spawn-y", type=float, default=25.0, help="m -- see --spawn-x")
 
     # ---- speed profile ---- #
     parser.add_argument("--profile", default="constant", choices=("constant", "sine", "step"),
@@ -727,7 +772,7 @@ def main():
     mpc.add_argument("--w-j", type=float, default=30, help="commanded-acceleration rate (jerk) weight")
     mpc.add_argument("--a-min", type=float, default=-4.05, help="hard lower bound on a_cmd (m/s^2)")
     mpc.add_argument("--a-max", type=float, default=2.4, help="hard upper bound on a_cmd (m/s^2)")
-    mpc.add_argument("--ay-max", type=float, default=4.15,
+    mpc.add_argument("--ay-max", type=float, default=4.9,
                      help="comfortable/grip lateral-accel budget (m/s^2) a curve of a given radius "
                           "is allowed to demand -- caps the speed preview itself via v <= "
                           "sqrt(ay_max/kappa) ahead of the curve, per functions.refine_speed_preview. "
@@ -820,8 +865,17 @@ def main():
     print(f"Route: {len(path_x)} points, {path.s_max:.1f} m, "
           f"start=({path_x[0]:.1f}, {path_y[0]:.1f}) goal=({path_x[-1]:.1f}, {path_y[-1]:.1f})")
 
+    # Only the vehicle's spawn point moves -- path_x/path_y/path above stay exactly the traced
+    # route, so scoring/logging (last_s, e_y, ...) is unaffected by where the car spawns.
+    spawn_transform = spawn_at(world, args.spawn_x, args.spawn_y)
+    spawn_to_start_m = origin_transform.location.distance(spawn_transform.location)
+    print(f"Spawn: ({args.spawn_x:.1f}, {args.spawn_y:.1f}) -> nearest waypoint "
+          f"({spawn_transform.location.x:.1f}, {spawn_transform.location.y:.1f}), "
+          f"{spawn_to_start_m:.1f} m from route start "
+          f"({origin_transform.location.x:.1f}, {origin_transform.location.y:.1f}).")
+
     for actor in world.get_actors().filter("vehicle.*"):
-        if actor.get_location().distance(origin_transform.location) < 5.0:
+        if actor.get_location().distance(spawn_transform.location) < 5.0:
             actor.destroy()
 
     blueprint = world.get_blueprint_library().filter("vehicle.lincoln.mkz_2020")[0]
@@ -834,8 +888,9 @@ def main():
         for key in args.controller:
             controller = MpcLongitudinal(args) if key == "mpc" else VadPidController(args)
             print(f"\n=== running controller: {controller_labels[key]} ===")
-            hist = run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp,
-                             controller, key, args, video_suffix=key if multi else "")
+            hist = run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp,
+                             controller, key, args, spawn_to_start_m=spawn_to_start_m,
+                             video_suffix=key if multi else "")
             if hist and hist["t"]:
                 results[controller_labels[key]] = hist
     except KeyboardInterrupt:
