@@ -1,49 +1,36 @@
-r"""Lateral LPV-MPC, built from scratch (mpc_mpc.py is left untouched, kept only as a reference).
+r"""Closed-loop verification of VyKalmanFilter (kalman_filter.py): drive the same route twice under
+the identical LateralMPC/MpcLongitudinal control law, once with x0's v_y taken from CARLA's own
+ground truth ("mpc") and once with it taken from the Kalman filter's own online estimate ("mpc-kf"),
+then compare the two runs (trajectory overlay, 8-metric comparison, each trial's own lateral/
+longitudinal pair) via viz_utils.plot_comparison(). Structurally this file IS mpc_mpc_comparison.py
+(LateralMPC/MpcLongitudinal/run_trial/main all copied from it) with its "vad-pid" baseline swapped
+for "mpc-kf" -- see mpc_mpc_comparison.py's own docstring for the shared Step 1-4 design (route
+spline, longitudinal SpeedMPC, the LateralMPC QP itself, wiring order).
 
-Step 1: get the route as flat coordinate arrays and fit a PathSpline (functions.py) to them --
-a smoothing cubic spline x(s)/y(s) parameterized by arc length, with yaw(s)/kappa(s) as its own
-analytic derivatives. Replaces this file's old build_path_station()/build_path_curvature()
-finite-difference stencils; every "where am I on the path" state is now a float station (last_s),
-not an array index.
+Step 5 (the one addition): "mpc-kf" runs one VyKalmanFilter per trial (constructed in run_trial(),
+not main() -- OSQP/Kalman state is per-vehicle, same reason a fresh LateralMPC is built per trial).
+Each tick, BEFORE x0/delta are computed (v_y_hat has to already exist to build x0), the filter's
+predict()+update() run once using vx (measured, trusted directly) and delta_prev (whatever steering
+was actually applied last tick -- this tick's own delta doesn't exist yet, see kalman_filter.py's
+docstring on causality). Its gyro/accel inputs are the sim IMU's clean r/a_y plus injected synthetic
+Gaussian noise (--kf-gyro-std/--kf-accel-std) -- default CARLA IMU noise is ~0, so without this the
+filter would just be handed the truth and R would have nothing real to be tuned against, same reason
+kalman_filter.py's offline replay injects it. Only x0's v_y slot is replaced by v_y_hat; x0's r stays
+the real (clean) gyro reading both runs use, so the comparison isolates the v_y-estimation effect
+specifically instead of also degrading yaw-rate feedback. hist["v_y"] (ground truth) is still logged
+every tick regardless of controller, so the "mpc-kf" run's own v_y_hat can be checked against it
+after a real drive, not just against the offline-replayed one -- see viz_utils.plot_lateral()'s
+v_y panel (ref_key="v_y_hat") and print_error_summary()'s "v_y estimate" row.
 
-Step 2: spawn the vehicle and drive it longitudinally under longitudinal_mpc.SpeedMPC.
-MpcLongitudinal below is this file's own copy of stanley_mpc.MpcLongitudinal's wrapper (SpeedMPC ->
-a_cmd -> LUT+PID pedal layer), written here rather than imported since this file reuses the
-*design*, not stanley_mpc.py's code. The one piece actually imported is SpeedMPC itself (the QP),
-plus the reference-profile functions that used to live in longitudinal_mpc.py and were moved to
-functions.py so this file (and any other) can share them without copying.
-
-Step 3: LateralMPC -- the LPV-MPC QP itself (condensed state-space, output tracking, box/rate
-constraints), per the derivation given for this file.
-
-Step 4: wire LateralMPC into run_trial(). Which speed plan feeds its curvature preview matters: it
-schedules against MpcLongitudinal's own condensed prediction (ctx.v_x_preview, stashed in Step 2),
-not the raw reference profile -- the reference ignores a_min/a_max and so can promise a station the
-car physically cannot reach yet, which would desync the previewed curvature from where the vehicle
-will actually be. Final control goes through functions.control_input, not a hand-rolled
-carla.VehicleControl -- see its own docstring for why (Ackermann inner/outer split + steering-curve
-speed scaling).
-
-
-Tuning notes (from actually driving this route, Town10HD_Opt idx 0->100): w_ey/w_epsi/w_ddelta and
---lat-np were retuned (60/15/4, Np 20->30) after the defaults tracked poorly through two ~10-13m
-radius corners around path idx~90-150 -- but weight/horizon changes only moved cross-track RMSE a
-little (1.25m -> 1.22m at 5 m/s). The dominant lever turned out to be speed, not the QP: a_y=v^2/r
-at that radius is ~2.5 m/s^2 at 5 m/s but ~6.4 m/s^2 at 8 m/s, which is a mismatch no amount of
-lateral-only retuning fixes -- 6 and 8 m/s both ran off-road there even with a widened preview.
---initial-speed therefore defaults to 5, not because the QP can't be pushed harder, but because
-this decoupled architecture has no curvature-aware speed reduction feeding back from the lateral
-side into SpeedMPC's reference -- that would be the real fix, and is future work, not a tuning knob.
-
-Usage (Ubuntu) :
+Usage (Ubuntu):
     cd carla_control
-    python3 mpc_mpc1.py --profile constant --initial-speed 5 --save-plot
-
-Usage (Windows):
-    cd C:\Users\mumu2\carla_control
-    .venv\Scripts\python.exe mpc_mpc1.py --profile constant --initial-speed 5
-    .venv\Scripts\python.exe mpc_mpc1.py --profile sine --initial-speed 5 --sine-amplitude 2 --sine-period 5
-    .venv\Scripts\python.exe mpc_mpc1.py --profile step --initial-speed 5 --step-size 2 --step-time 10
+    # ground-truth baseline alone (3 figures, same as mpc_mpc.py)
+    python3 mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --controller mpc
+    # closed-loop KF verification: both runs + comparison figures
+    python3 mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --controller mpc mpc-kf
+    # with Q/R found by `python3 kalman_filter.py --tune`
+    python3 mpc_mpc_KF.py --controller mpc mpc-kf --save-plot \
+        --kf-q-vy 1e-3 --kf-q-r 1e-3 --kf-r-dpsi 1e-5 --kf-r-ay 4e-2
 """
 
 import argparse
@@ -71,20 +58,23 @@ import carla
 
 from functions import (AngleUnwrapper, ImuAcceleration, LowPassFilter, build_path,
                        build_path_spline, control_input, get_vehicle_geometry, lateral_error,
-                       normalize_angle, reference_preview, refine_speed_preview, speed_reference)
+                       normalize_angle, reference_preview,
+                       refine_speed_preview, speed_reference, spawn_at)
+from kalman_filter.kalman_filter import VyKalmanFilter
 from longitudinal_lut import LongitudinalLUT
 from lookup_controller import LookupController
 from longitudinal_mpc import SpeedMPC
-from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_results,
-                       print_error_summary, run_name)
+from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_comparison, plot_kf_run,
+                       plot_results, print_error_summary, run_name)
 
 # Fixed on purpose, same as stanley_mpc.py: the route (build_path()'s default origin/dest spawn
 # indices) is a property of this specific map, not something to rediscover via CLI flags.
 MAP_NAME = "Town10HD_Opt"
 
-WARM_START_SPEED_TOL = 0.3   # m/s
-WARM_START_ACCEL_TOL = 0.5   # m/s^2
-WARM_START_TIMEOUT = 15.0    # s -- safety cap in case initial_speed is unreachable
+WARM_START_SPEED_TOL = 0.3    # m/s
+WARM_START_ACCEL_TOL = 0.5    # m/s^2
+WARM_START_REACH_TOL = 0.5    # m -- how close to spawn_to_start_m counts as "reached" (GPS/tick noise)
+WARM_START_TIMEOUT = 15.0     # s -- safety cap in case initial_speed is unreachable
 
 
 def _load_vehicle_defaults():
@@ -126,10 +116,10 @@ def curvature_preview(path, last_s, vx_preview, dt):
     return kappa_prev
 
 
-# ----------------------------------------------------------------------------- lateral MPC (LPV)
+# ----------------------------------------------------------------------------- lateral MPC
 
 class LateralMPC:
-    r"""LPV-MPC lateral controller over the 2-DOF bicycle-model error dynamics.
+    r"""MPC lateral controller over the 2-DOF bicycle-model error dynamics.
 
         x = [v_y, r, e_y, e_psi]^T,  input delta (front steer, rad),  disturbance kappa (path
         curvature, 1/m), r = yaw rate:
@@ -143,7 +133,7 @@ class LateralMPC:
             B = [Cf/m, lf Cf/Iz, 0, 0]^T                E(v_x) = [0, 0, 0, -vx]^T
 
     v_x is the scheduling parameter (previewed over the horizon, not held fixed), so A/E/C below are
-    re-linearized and re-discretized at every predicted step -- the "LPV" in the name.
+    re-linearized and re-discretized at every predicted step.
 
     Output y = [e_y, e_psi, a_y, r, r_dot]^T. e_y, e_psi, r come straight off the state; a_y and
     r_dot don't, so they're derived from the state equation rather than being new unknowns: r_dot is
@@ -412,20 +402,45 @@ def vx_preview_for_lateral(ctx, n_p_lat):
 
 # ----------------------------------------------------------------------------- one trial
 
-def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, controller, args):
-    """Spawn one vehicle, drive it under `controller` (longitudinal MPC) + LateralMPC (lateral),
-    tear it down.
+def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, controller,
+             controller_key, args, spawn_to_start_m=0.0, video_suffix=""):
+    """Spawn one vehicle, drive it under `controller`, tear it down.
 
-    Same warm-up gate as stanley_mpc.py/longitudinal_mpc.py: launch from rest under the real
-    longitudinal controller and hold off on logging until v_x/a_x have actually settled near the
-    profile's own t=0 value (initial_speed) instead of faking that starting condition. The lateral
-    MPC runs from tick one regardless -- only the *logging* start is gated, same as stanley_mpc.py's
-    Stanley half (it has nothing to warm up; steering the whole time is what keeps the car on the
-    route while the speed loop settles).
+    spawn_transform is where the vehicle actually spawns -- with --spawn-x/-y this sits well before
+    path's own s=0 (see functions.spawn_at()), NOT the route's own start; path/path_x/path_y are
+    untouched either way. last_s starts at 0.0 below regardless: path.project() clips to the nearest
+    in-domain station until the vehicle physically reaches the route's start, so a spawn point behind
+    the route just means the first several ticks project onto s=0 (near-zero e_y, since --spawn-x/-y
+    is meant to sit on the same straight road) rather than requiring the path itself to reach back to
+    where the car spawned.
+
+    spawn_to_start_m: main()'s own straight-line distance from spawn_transform to the route's actual
+    start (origin_transform.location). Used below both to size warm_start_timeout and, together with
+    v_x/a_x, to gate when logging starts -- see the warm-up gate note below.
+
+    controller_key: "mpc" and "mpc-kf" both run the identical MpcLongitudinal (longitudinal) +
+    LateralMPC (lateral) pair -- they differ in exactly one thing, what feeds x0's v_y slot each
+    tick. "mpc" uses CARLA's own ground truth (vehicle.get_velocity(), body frame); "mpc-kf" runs a
+    VyKalmanFilter (constructed below, per-trial like lateral_mpc) and uses its v_y_hat instead --
+    see the module docstring's "Step 5" for the causality/noise details.
+
+    video_suffix: appended to the recorded filename (run_name()'s own suffix mechanism) so two
+    controllers recorded in the same process (--controller a b --record) don't overwrite each
+    other's mp4 -- main() passes the controller key here when 2+ controllers are selected, "" (no
+    change) for a single one.
+
+    Same warm-up gate as stanley_mpc.py/longitudinal_mpc.py in spirit -- launch from rest under the
+    real longitudinal controller and hold off on logging until v_x/a_x have actually settled near the
+    profile's own t=0 value (--initial-speed) -- but ANDed with one more condition: the vehicle must
+    also have physically covered spawn_to_start_m, i.e. actually reached the route's own s=0, not
+    just gotten close to --initial-speed somewhere on the spawn-to-route-start stretch. Without that,
+    logging could start (and the flat --v_des_log profile with it) before the car has rejoined the
+    scored route at all. Steering (lateral or combined) runs from tick one regardless -- only the
+    *logging* start is gated.
     """
-    vehicle = world.spawn_actor(blueprint, origin_transform)
+    vehicle = world.spawn_actor(blueprint, spawn_transform)
     physics = vehicle.get_physics_control()
-    _, lf, lr, _ = get_vehicle_geometry(vehicle, origin_transform)
+    _, lf, lr, _ = get_vehicle_geometry(vehicle, spawn_transform)
 
     # delta_max capped well under max_steer (the wheel's own physical limit, ~70 deg): Cf/Cr were
     # calibrated over an ~8-16 deg range (estimate_cornering_stiffness.py), so the linear tire model
@@ -441,6 +456,20 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
         w_delta=args.w_delta, w_ddelta=args.w_ddelta,
         delta_max=math.radians(args.delta_max_deg), ddelta_max=math.radians(args.ddelta_max_deg) * args.dt)
 
+    # v_y estimator for "mpc-kf" -- one filter per trial, same reason lateral_mpc above is built
+    # fresh per trial rather than shared. prev_delta_for_kf carries the steering angle actually
+    # applied last tick into this tick's predict()/update() (see module docstring on causality);
+    # kf_rng draws the synthetic gyro/accel noise this filter sees (real CARLA IMU noise is ~0).
+    kf, kf_rng, prev_delta_for_kf = None, None, 0.0
+    if controller_key == "mpc-kf":
+        kf = VyKalmanFilter(
+            dt=args.dt, mass=args.mass, Iz=args.iz, lf=lf, lr=lr, Cf=args.cf, Cr=args.cr,
+            Q=np.diag([args.kf_q_vy, args.kf_q_r]),
+            R=np.diag([args.kf_r_dpsi if args.kf_r_dpsi is not None else math.radians(args.kf_gyro_std) ** 2,
+                      args.kf_r_ay if args.kf_r_ay is not None else args.kf_accel_std ** 2]),
+            vx_floor=0.5, x0=[0.0, 0.0], P0=np.eye(2))
+        kf_rng = np.random.default_rng(args.kf_seed)
+
     accel = ImuAcceleration(dt=args.dt)
     yaw_unwrapper = AngleUnwrapper()
     rh_unwrapper = AngleUnwrapper()
@@ -448,13 +477,26 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
     prev_yaw_rate_rad = None
     last_s = 0.0
 
-    # matches plot_results()'s expectations (viz_utils.plot_lateral/plot_longitudinal/plot_trajectory)
-    hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], "jerk": [],
-            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "steer_deg": [],
+    # matches plot_results()'s expectations (viz_utils.plot_lateral/plot_longitudinal/plot_trajectory).
+    # v_y_hat/dpsi_noisy/ay_noisy only ever get appended to for "mpc-kf" below -- stay empty for
+    # "mpc", which viz_utils._get() treats the same as "never recorded" (see plot_lateral's
+    # ref_key="v_y_hat", print_error_summary's "v_y estimate" row, and main()'s extra
+    # plot_kf_run() figure for the "mpc-kf" trial only).
+    hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_y_hat": [], "dpsi_noisy": [],
+            "ay_noisy": [], "v_des": [], "a_x": [],
+            "jerk": [], "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "steer_deg": [],
             "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [], "e_theta": [],
             "a_cmd": []}
     warmed_up = False
     log_start_i = 0
+    # WARM_START_TIMEOUT (15s) alone assumed warm-up only ever needs to cover a speed/accel
+    # transient; the reach-the-route-start gate below can genuinely need longer than that to also
+    # cover spawn_to_start_m at a modest --initial-speed -- pad the cap by a generous (1.5x, so the
+    # vehicle doesn't need to be at cruise speed for the whole stretch) estimate of that drive time
+    # rather than let a legitimate --spawn-x/-y distance get cut off by timed_out.
+    warm_start_timeout = max(WARM_START_TIMEOUT,
+                             1.5 * spawn_to_start_m / max(args.initial_speed, 0.5)
+                             + WARM_START_TIMEOUT)
 
     imu = None
     recorder = None
@@ -466,13 +508,18 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
         imu.listen(imu_queue.put)
 
         if args.record:
-            video_path = (os.path.join(args.video_dir, run_name() + ".mp4")
-                         if args.record == "auto" else args.record)
+            if args.record == "auto":
+                video_path = os.path.join(args.video_dir, run_name(video_suffix) + ".mp4")
+            elif video_suffix:
+                base, ext = os.path.splitext(args.record)
+                video_path = f"{base}_{video_suffix}{ext}"
+            else:
+                video_path = args.record
             rec_w, rec_h = (int(v) for v in args.record_res.lower().split("x"))
             recorder = VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
                                      width=rec_w, height=rec_h, view=args.record_view)
 
-        steps = int((args.max_duration + WARM_START_TIMEOUT) / args.dt)
+        steps = int((args.max_duration + warm_start_timeout) / args.dt)
         for i in range(steps):
             step_start = time.time()
             world.tick()
@@ -498,38 +545,67 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
                 0.0 if prev_yaw_rate_rad is None else (r - prev_yaw_rate_rad) / args.dt)
             prev_yaw_rate_rad = r
 
-            # ---- longitudinal (MPC) -- runs first so ctx.v_x_preview is ready for the lateral
-            # schedule below (see the "which speed plan" discussion in the module docstring) ---- #
             t = (i - log_start_i) * args.dt
             v_ref = args.initial_speed if not warmed_up else speed_reference(args, t)
             ctx = SimpleNamespace(t=t, v_x=v_x, v_ref=v_ref, a_x=a_x, a_x_raw=a_x_raw,
                                   gear=vehicle.get_control().gear, warmed_up=warmed_up,
-                                  path=path, last_s=last_s)
+                                  path=path, last_s=last_s, ego_x=ego_x, ego_y=ego_y, yaw=yaw)
+
+            # v_y source for x0, computed BEFORE x0 itself: "mpc-kf" needs its filter's predict()+
+            # update() to have already run this tick (using vx measured just above and
+            # prev_delta_for_kf -- last tick's delta, since this tick's doesn't exist until
+            # lateral_mpc.solve() below computes it) -- see module docstring's Step 5. x0's r stays
+            # the real gyro reading either way, only v_y is swapped.
+            if controller_key == "mpc-kf":
+                r_meas = r + kf_rng.normal(0.0, math.radians(args.kf_gyro_std))
+                ay_meas = a_y + kf_rng.normal(0.0, args.kf_accel_std)
+                kf.step(v_x, prev_delta_for_kf, [r_meas, ay_meas])
+                v_y_for_x0 = kf.v_y
+            else:
+                v_y_for_x0 = v_y   # "mpc" -- ground truth
+
+            # longitudinal (MPC) runs first so ctx.v_x_preview is ready for the lateral schedule
+            # below (see the "which speed plan" discussion in mpc_mpc_comparison.py's module
+            # docstring)
             u = controller.step(ctx)
 
-            # ---- lateral (LPV-MPC) ---- #
             last_s, raw_e_y = lateral_error(ego_x, ego_y, path, last_s)
             yaw_s = float(path.yaw(last_s))
             road_heading = rh_unwrapper.step(yaw_s)
             e_theta = normalize_angle(yaw_s - yaw)
             vx_preview = vx_preview_for_lateral(ctx, lateral_mpc.n_p)
             kappa_preview = curvature_preview(path, last_s, vx_preview, args.dt)
-            x0 = [v_y, r, raw_e_y, -e_theta]
+            x0 = [v_y_for_x0, r, raw_e_y, -e_theta]
             delta = lateral_mpc.solve(x0, vx_preview, kappa_preview)
+            prev_delta_for_kf = delta   # this tick's delta becomes next tick's "already applied"
 
             control = control_input(u, delta, v_x, vehicle, physics)
+            steer_deg = math.degrees(delta)
+            throttle_log, brake_log = control.throttle, control.brake
+            a_cmd_log, v_des_log = ctx.a_cmd, ctx.v_ref_curve
+            reset_arg = u
+
             follow_with_spectator(world, vehicle)
 
             if not warmed_up:
+                # dist_from_spawn stays < spawn_to_start_m the whole time the car is still short of
+                # the route's actual start -- straight-line, not path station, since last_s itself
+                # stays pinned at path.s_min (0.0) the whole time the car is behind the route (see
+                # the module docstring), so it can't tell "still approaching" from "just arrived".
+                dist_from_spawn = math.hypot(ego_x - spawn_transform.location.x,
+                                             ego_y - spawn_transform.location.y)
+                reached_start = dist_from_spawn >= spawn_to_start_m - WARM_START_REACH_TOL
                 converged = (abs(v_x - args.initial_speed) < WARM_START_SPEED_TOL
-                            and abs(a_x) < WARM_START_ACCEL_TOL)
-                timed_out = i * args.dt >= WARM_START_TIMEOUT
+                            and abs(a_x) < WARM_START_ACCEL_TOL
+                            and reached_start)
+                timed_out = i * args.dt >= warm_start_timeout
                 if converged or timed_out:
                     warmed_up = True
                     log_start_i = i
-                    controller.reset(u)
-                    status = "converged" if converged else f"timed out after {WARM_START_TIMEOUT:.0f}s"
-                    print(f"Warm-start {status}: v_x={v_x:.2f} m/s, a_x={a_x:.2f} m/s^2 -- "
+                    controller.reset(reset_arg)
+                    status = "converged" if converged else f"timed out after {warm_start_timeout:.0f}s"
+                    print(f"Warm-start {status}: v_x={v_x:.2f} m/s, a_x={a_x:.2f} m/s^2, "
+                          f"dist_from_spawn={dist_from_spawn:.1f}/{spawn_to_start_m:.1f} m -- "
                           f"logging starts now.")
                 else:
                     elapsed = time.time() - step_start
@@ -543,26 +619,29 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
             hist["y"].append(ego_y)
             hist["v_x"].append(v_x)
             hist["v_y"].append(v_y)
-            hist["v_des"].append(ctx.v_ref_curve)
+            if controller_key == "mpc-kf":
+                hist["v_y_hat"].append(v_y_for_x0)
+                hist["dpsi_noisy"].append(math.degrees(r_meas))   # same unit as hist["yaw_rate"]
+                hist["ay_noisy"].append(ay_meas)                  # same unit as hist["a_y"]
+            hist["v_des"].append(v_des_log)
             hist["a_x"].append(a_x)
             hist["jerk"].append(jerk)
             hist["a_y"].append(a_y)
             hist["yaw_rate"].append(yaw_rate_deg)
             hist["yaw_acc"].append(yaw_acc)
             hist["jerk_total"].append(jerk_total)
-            hist["steer_deg"].append(math.degrees(delta))
-            hist["throttle"].append(control.throttle)
-            hist["brake"].append(control.brake)
+            hist["steer_deg"].append(steer_deg)
+            hist["throttle"].append(throttle_log)
+            hist["brake"].append(brake_log)
             hist["e_y"].append(raw_e_y)
             hist["yaw"].append(math.degrees(yaw))
             hist["path_yaw"].append(math.degrees(road_heading))
             hist["e_theta"].append(math.degrees(e_theta))
-            hist["a_cmd"].append(ctx.a_cmd)
+            hist["a_cmd"].append(a_cmd_log)
 
             if i % 20 == 0:
-                print(f"t={t:5.1f}s  v_x={v_x:5.2f}/{v_ref:.2f} m/s  a_cmd={ctx.a_cmd:+.2f} m/s^2  "
-                      f"delta={math.degrees(delta):+.2f} deg  e_y={raw_e_y:+.2f} m  "
-                      f"s={last_s:6.1f}/{path.s_max:.1f} m")
+                print(f"t={t:5.1f}s  v_x={v_x:5.2f}/{v_ref:.2f} m/s  steer={steer_deg:+.2f} deg  "
+                      f"e_y={raw_e_y:+.2f} m  s={last_s:6.1f}/{path.s_max:.1f} m")
 
             if last_s >= path.s_max - 0.1:
                 print(f"Reached end of path (s={last_s:.1f}/{path.s_max:.1f} m).")
@@ -581,7 +660,7 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
             imu.destroy()
         vehicle.destroy()
 
-    return hist, lf, lr
+    return hist
 
 
 def main():
@@ -593,6 +672,16 @@ def main():
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
     parser.add_argument("--times-run", type=float, default=20.0, help="how times for simulation running?")
     parser.add_argument("--max-duration", type=float, default=100.0, help="scored run length (s)")
+    parser.add_argument("--spawn-x", type=float, default=-120.0,
+                        help="m -- vehicle spawns at the road waypoint nearest this raw map (x, y) "
+                             "(see functions.spawn_at), NOT the route's own start; the scored route "
+                             "itself (path_x/path_y, from build_path()'s own origin/dest indices) is "
+                             "untouched. Gives the warm-up gate (see run_trial docstring) a straight "
+                             "run-up to ramp up to --initial-speed on. Default (-90, 25) is this "
+                             "map's own route start (-64.8, 24.5) backed up along the same straight "
+                             "road; pick a point on this specific route's own straight lead-up for a "
+                             "different route.")
+    parser.add_argument("--spawn-y", type=float, default=25.0, help="m -- see --spawn-x")
 
     # ---- speed profile ---- #
     parser.add_argument("--profile", default="constant", choices=("constant", "sine", "step"),
@@ -617,7 +706,7 @@ def main():
     mpc.add_argument("--w-j", type=float, default=30, help="commanded-acceleration rate (jerk) weight")
     mpc.add_argument("--a-min", type=float, default=-4.05, help="hard lower bound on a_cmd (m/s^2)")
     mpc.add_argument("--a-max", type=float, default=2.4, help="hard upper bound on a_cmd (m/s^2)")
-    mpc.add_argument("--ay-max", type=float, default=4.15,
+    mpc.add_argument("--ay-max", type=float, default=4.9,
                      help="comfortable/grip lateral-accel budget (m/s^2) a curve of a given radius "
                           "is allowed to demand -- caps the speed preview itself via v <= "
                           "sqrt(ay_max/kappa) ahead of the curve, per functions.refine_speed_preview. "
@@ -632,23 +721,23 @@ def main():
     mpc.add_argument("--u-tau", type=float, default=0.02,
                      help="low-pass filter time constant on the pedal command u, before it's applied (s)")
 
-    # ---- lateral LPV-MPC ---- #
-    lat = parser.add_argument_group("lateral LPV-MPC")
+    # ---- lateral MPC ---- #
+    lat = parser.add_argument_group("lateral MPC")
     lat.add_argument("--lat-np", dest="lat_n_p", type=int, default=25,
                      help="lateral prediction horizon (steps) -- 1.25s at dt=0.05. Narrowed back "
                           "down from 30 in the same B2D-penalty search that set --ay-max: 30 (and "
                           "45) measurably worsened lateral_error, likely too long relative to the "
                           "route's tighter corners for the tuning at hand")
     lat.add_argument("--lat-nc", dest="lat_n_c", type=int, default=25, help="lateral control horizon (steps, <= --lat-np)")
-    lat.add_argument("--w-ey", type=float, default=4000.0, help="cross-track error weight")
-    lat.add_argument("--w-epsi", type=float, default=100.0, help="heading error weight")
-    lat.add_argument("--w-ay", type=float, default=0,
+    lat.add_argument("--w-ey", type=float, default=10.0, help="cross-track error weight")
+    lat.add_argument("--w-epsi", type=float, default=10.0, help="heading error weight")
+    lat.add_argument("--w-ay", type=float, default=1,
                      help="lateral acceleration tracking weight -- default 0 (see mpc_mpc.py's "
                           "LateralMPC docstring: forcing a_y/r/r_dot toward the steady-turn "
                           "feedforward fights e_y/e_psi's own targets in a curve and was measured "
                           "to cost ~2m of steady cross-track offset before this was found)")
-    lat.add_argument("--w-r", type=float, default=0, help="yaw rate tracking weight (see --w-ay)")
-    lat.add_argument("--w-rdot", type=float, default=0.0, help="yaw acceleration tracking weight (see --w-ay)")
+    lat.add_argument("--w-r", type=float, default=3, help="yaw rate tracking weight (see --w-ay)")
+    lat.add_argument("--w-rdot", type=float, default=120, help="yaw acceleration tracking weight (see --w-ay)")
     lat.add_argument("--w-delta", type=float, default=1, help="steer magnitude weight")
     lat.add_argument("--w-ddelta", type=float, default=30,
                      help="steer rate weight -- raised from 1 in the same B2D-penalty search that "
@@ -664,6 +753,38 @@ def main():
     lat.add_argument("--cf", type=float, default=VEHICLE_DEFAULTS["cf"], help="front cornering stiffness (N/rad)")
     lat.add_argument("--cr", type=float, default=VEHICLE_DEFAULTS["cr"], help="rear cornering stiffness (N/rad)")
 
+    # ---- controller selection ---- #
+    parser.add_argument("--controller", nargs="+", default=["mpc"],
+                        choices=("mpc", "mpc-kf"),
+                        help="which controller(s) to run this route with. One controller (default): "
+                             "unchanged single-trial output (3 figures). Two or more: each runs its "
+                             "own trial and results are compared instead (trajectory overlay + "
+                             "8-metric comparison figure + each trial's own lateral/longitudinal pair). "
+                             "'mpc' and 'mpc-kf' run the identical LateralMPC/MpcLongitudinal pair -- "
+                             "'mpc' feeds x0 CARLA's own ground-truth v_y, 'mpc-kf' feeds it "
+                             "VyKalmanFilter's online estimate instead (kalman_filter.py); running both "
+                             "is the closed-loop verification this file exists for -- see module docstring.")
+
+    # ---- Kalman filter (v_y estimation, --controller mpc-kf) ---- #
+    kfg = parser.add_argument_group("Kalman filter (--controller mpc-kf)")
+    kfg.add_argument("--kf-gyro-std", type=float, default=10,
+                     help="synthetic gyro (dpsi) noise stddev fed to the filter, deg/s -- CARLA's "
+                          "own sensor.other.imu runs near-noiseless by default, see kalman_filter.py")
+    kfg.add_argument("--kf-accel-std", type=float, default=1,
+                     help="synthetic accelerometer (a_y) noise stddev fed to the filter, m/s^2")
+    kfg.add_argument("--kf-seed", type=int, default=0, help="seed for the filter's synthetic measurement noise")
+    kfg.add_argument("--kf-q-vy", type=float, default=1e-3, help="process noise variance on v_y, (m/s)^2/step")
+    kfg.add_argument("--kf-q-r", type=float, default=1e-3, help="process noise variance on r, (rad/s)^2/step")
+    kfg.add_argument("--kf-r-dpsi", type=float, default=None,
+                     help="measurement noise variance on dpsi, (rad/s)^2 -- default: matches "
+                          "--kf-gyro-std^2 (the noise actually injected)")
+    kfg.add_argument("--kf-r-ay", type=float, default=None,
+                     help="measurement noise variance on a_y, (m/s^2)^2 -- default: matches "
+                          "--kf-accel-std^2 (the noise actually injected). Both Q/R default to a "
+                          "generic starting point -- `python3 kalman_filter.py --tune` finds better "
+                          "values against logged data (mpc_mpc.py --log-npz) far cheaper than tuning "
+                          "against live CARLA runs here.")
+
     # ---- plot ---- #
     parser.add_argument("--plot-dir", default=os.path.join(HERE, "plots"),
                         help="directory to save the end-of-run result figures into")
@@ -678,16 +799,6 @@ def main():
     parser.add_argument("--record-view", default="chase", choices=sorted(VIEWS),
                         help="camera mount for the recording")
     parser.add_argument("--record-res", default="1280x720", help="recording resolution, WxH")
-
-    # ---- KF data logging ---- #
-    parser.add_argument("--log-npz", nargs="?", const="auto", default="",
-                        help="dump this run's hist (v_x, v_y ground truth, yaw_rate, a_y, "
-                             "steer_deg, ...) plus the vehicle params actually used (lf, lr, "
-                             "mass, iz, cf, cr, dt) to an .npz, for offline v_y Kalman-filter "
-                             "tuning (mpc_mpc_KF.py); bare flag auto-names it under --log-dir")
-    parser.add_argument("--log-dir", default=os.path.join(HERE, "kalman_filter", "kf_data"),
-                        help="where auto-named --log-npz dumps go -- matches kalman_filter.py's "
-                             "own --log-dir default so its offline replay finds these with no flags")
     args = parser.parse_args()
 
     client = carla.Client(args.host, args.port)
@@ -709,44 +820,82 @@ def main():
     print(f"Route: {len(path_x)} points, {path.s_max:.1f} m, "
           f"start=({path_x[0]:.1f}, {path_y[0]:.1f}) goal=({path_x[-1]:.1f}, {path_y[-1]:.1f})")
 
+    # Only the vehicle's spawn point moves -- path_x/path_y/path above stay exactly the traced
+    # route, so scoring/logging (last_s, e_y, ...) is unaffected by where the car spawns.
+    spawn_transform = spawn_at(world, args.spawn_x, args.spawn_y)
+    spawn_to_start_m = origin_transform.location.distance(spawn_transform.location)
+    print(f"Spawn: ({args.spawn_x:.1f}, {args.spawn_y:.1f}) -> nearest waypoint "
+          f"({spawn_transform.location.x:.1f}, {spawn_transform.location.y:.1f}), "
+          f"{spawn_to_start_m:.1f} m from route start "
+          f"({origin_transform.location.x:.1f}, {origin_transform.location.y:.1f}).")
+
     for actor in world.get_actors().filter("vehicle.*"):
-        if actor.get_location().distance(origin_transform.location) < 5.0:
+        if actor.get_location().distance(spawn_transform.location) < 5.0:
             actor.destroy()
 
     blueprint = world.get_blueprint_library().filter("vehicle.lincoln.mkz_2020")[0]
     imu_bp = world.get_blueprint_library().find("sensor.other.imu")
 
+    controller_labels = {"mpc": "MPC", "mpc-kf": "MPC-KF"}
+    multi = len(args.controller) > 1
+    results = {}
     try:
-        controller = MpcLongitudinal(args)
-        hist, lf, lr = run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp,
-                                 controller, args)
+        for key in args.controller:
+            controller = MpcLongitudinal(args)   # both "mpc" and "mpc-kf" drive through this
+            print(f"\n=== running controller: {controller_labels[key]} ===")
+            hist = run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp,
+                             controller, key, args, spawn_to_start_m=spawn_to_start_m,
+                             video_suffix=key if multi else "")
+            if hist and hist["t"]:
+                results[controller_labels[key]] = hist
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        hist, lf, lr = None, None, None
     finally:
         world.apply_settings(original_settings)
         print("Cleaned up: world settings restored.")
 
-    if hist and hist["t"]:
-        if args.log_npz:
-            log_path = (os.path.join(args.log_dir, run_name() + ".npz")
-                       if args.log_npz == "auto" else args.log_npz)
-            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-            # lf/lr come back from run_trial (measured off the spawned vehicle's own geometry, see
-            # get_vehicle_geometry) rather than args, since there's no --lf/--lr CLI flag; mass/
-            # iz/cf/cr are the args actually fed into LateralMPC this run, not just the JSON
-            # defaults, in case they were overridden on the command line.
-            np.savez(log_path, **{k: np.array(v) for k, v in hist.items()},
-                     dt=args.dt, mass=args.mass, iz=args.iz, cf=args.cf, cr=args.cr, lf=lf, lr=lr)
-            print(f"Logged run data -> {log_path}")
+    if len(results) == 1:
+        (label, hist), = results.items()
         if args.save_plot:
             try:
-                plot_results(path_x, path_y, hist, args.initial_speed, args.plot_dir, label="LPV-MPC")
+                plot_results(path_x, path_y, hist, args.initial_speed, args.plot_dir, label=label)
             except Exception as exc:
                 print(f"Plotting failed: {exc}")
                 print_error_summary(hist, args.initial_speed)
         else:
             print_error_summary(hist, args.initial_speed)
+    elif len(results) >= 2:
+        if args.save_plot:
+            try:
+                plot_comparison(results, path_x, path_y, args.plot_dir, args.initial_speed)
+            except Exception as exc:
+                print(f"Plotting failed: {exc}")
+                for label, hist in results.items():
+                    print(f"\n--- {label} ---")
+                    print_error_summary(hist, args.initial_speed)
+        else:
+            for label, hist in results.items():
+                print(f"\n--- {label} ---")
+                print_error_summary(hist, args.initial_speed)
+
+    # Extra, on top of whatever plot_results()/plot_comparison() above already drew (same format as
+    # mpc_mpc_comparison.py, untouched) -- one more figure just for the "mpc-kf" trial: v_y estimate
+    # vs. ground truth stacked over the dpsi/a_y clean-vs-noisy sensor channels the filter actually
+    # ran on, same 3-panel report kalman_filter.py's own offline replay draws (viz_utils.plot_kf_run).
+    # Runs whenever "mpc-kf" was one of --controller's picks, regardless of whether it ran alone or
+    # against "mpc".
+    if args.save_plot and "MPC-KF" in results:
+        try:
+            import matplotlib.pyplot as plt
+            fig = plot_kf_run(results["MPC-KF"],
+                              title="MPC-KF: v_y estimate + sensor noise")
+            os.makedirs(args.plot_dir, exist_ok=True)
+            out_path = os.path.join(args.plot_dir, run_name("kf") + ".png")
+            fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+            plt.close(fig)
+            print(f"Figure saved: {out_path}")
+        except Exception as exc:
+            print(f"MPC-KF report plotting failed: {exc}")
 
 
 if __name__ == "__main__":

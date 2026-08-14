@@ -132,6 +132,22 @@ def _legend(ax, **kwargs):
     ax.legend(frameon=False, labelcolor=COLOR_INK, fontsize=FONTSIZE_LEGEND, **kwargs)
 
 
+def _bottom_legend(fig, handles, title=None, max_ncol=6):
+    """Shared fig-level legend below every axes, sized to clear the bottom row's own xlabel
+    instead of plot_comparison()'s fixed bbox_to_anchor=(0.5, -0.02) -- that offset only clears
+    the xlabel when the figure has enough rows above it that one more legend row is a small
+    fraction of the total height; a single-row figure (this file's newer per-speed/per-steer
+    reports) needs noticeably more room, and more again once enough handles wrap the legend onto a
+    second row. ncol is capped at max_ncol so a long handle list wraps instead of running off the
+    figure edge or shrinking to unreadable size.
+    """
+    ncol = max(1, min(len(handles), max_ncol))
+    rows = math.ceil(len(handles) / ncol)
+    fig.legend(handles=handles, loc="lower center", ncol=ncol, frameon=False,
+              labelcolor=COLOR_INK, fontsize=FONTSIZE_LEGEND,
+              bbox_to_anchor=(0.5, -0.06 - 0.09 * rows), title=title)
+
+
 # ---------------------------------------------------------------------------
 # 3. spectator camera
 # ---------------------------------------------------------------------------
@@ -473,18 +489,6 @@ B2D_COMFORT_LIMITS = {
     "jerk_total": (0.0, 8.37),     # m/s^3 -- a norm (||j||), always >= 0, so the "lo" half of the
 }                                   # excess formula below is naturally always 0 for this one
 
-# e_y has no B2D-given tolerance band, so it's scored as direct |error|/scale rather than an
-# excess-outside-a-band -- scale is "how big an error already counts as one full unit of badness",
-# picked to sit in the same rough ballpark as the comfort terms' own P=1 semantics.
-LATERAL_ERROR_SCALE = 1.75   # m -- roughly half a CARLA lane width
-
-# Total station length (m) of the one fixed route every script in this repo drives (build_path()'s
-# default origin_index=0/dest_index=100 on Town10HD_Opt) -- computed once (PathSpline.s_max against
-# that route's own waypoints) and hardcoded here rather than re-fit on every scoring call, since the
-# route itself never changes. Re-measure this if MAP_NAME/origin/dest ever do.
-ROUTE_LENGTH_M = 327.1153449836924
-
-
 def _band_penalty(values, lo, hi):
     """Mean, band-width-normalized excess-outside-[lo,hi]: 0 if the signal never left the band,
     1 if it sat a full band-width past the limit for the entire run. Continuous rather than B2D's
@@ -500,39 +504,16 @@ def _band_penalty(values, lo, hi):
     return (sum(excess) / len(excess)) / width
 
 
-def _magnitude_penalty(values, scale):
-    """Mean |value| / scale -- for signals with no natural tolerance band (0 is the ideal value),
-    rather than an excess-outside-a-band. None if `values` is empty."""
-    values = [abs(v) for v in values if v is not None and not math.isnan(v)]
-    if not values:
-        return None
-    return (sum(values) / len(values)) / scale
-
-
-def _lap_time_penalty(hist, target_speed_ms):
-    """(actual completion time - target completion time) / target completion time, target =
-    ROUTE_LENGTH_M / target_speed_ms -- the lap time the route would take at a constant,
-    never-slowed target speed.
-
-    Replaces a per-tick |v_ref - v_x| error: that reference (hist["v_des"]) is already
-    curvature-reduced (see functions.refine_speed_preview()), so a controller correctly slowing
-    for a corner would score as if it were "tracking well" even though it's deliberately slower
-    than target_speed right then -- lap time instead captures the thing that actually matters (did
-    the whole drive end up slower than it had to be), independent of how the reference was shaped
-    along the way. None if hist has no logged samples."""
-    if not hist.get("t"):
-        return None
-    target_time = ROUTE_LENGTH_M / target_speed_ms
-    actual_time = hist["t"][-1]
-    return (actual_time - target_time) / target_time
-
-
-def b2d_comfort_penalty(hist, target_speed_ms):
+def b2d_comfort_penalty(hist):
     """B2D Comfortness-style penalty terms for one run: {name: P}, P=0 perfect, growing
     unboundedly worse (no cap) the further/longer a signal sits outside its limit. "total" sums
     whatever terms this hist actually recorded (None for any that weren't, e.g. a steer=0 run has
-    no a_y/yaw_rate/yaw_acc/e_y at all) -- route completion is deliberately not a term here since
-    incomplete runs are eyeballed and thrown away rather than scored."""
+    no a_y/yaw_rate/yaw_acc at all) -- route completion is deliberately not a term here since
+    incomplete runs are eyeballed and thrown away rather than scored.
+
+    Comfort/smoothness terms only (a_x/a_y/yaw_rate/yaw_acc/jerk/jerk_total) -- lateral_error and
+    lap_time score tracking/route-progress, a different thing, and were dropped from this scoring
+    entirely rather than just excluded from "total"."""
     terms = {}
     terms["a_x"] = _band_penalty(hist.get("a_x", []), *B2D_COMFORT_LIMITS["a_x"])
     terms["a_y"] = _band_penalty(hist.get("a_y", []), *B2D_COMFORT_LIMITS["a_y"])
@@ -541,8 +522,6 @@ def b2d_comfort_penalty(hist, target_speed_ms):
     terms["yaw_acc"] = _band_penalty(hist.get("yaw_acc", []), *B2D_COMFORT_LIMITS["yaw_acc"])
     terms["jerk"] = _band_penalty(hist.get("jerk", []), *B2D_COMFORT_LIMITS["jerk"])
     terms["jerk_total"] = _band_penalty(hist.get("jerk_total", []), *B2D_COMFORT_LIMITS["jerk_total"])
-    terms["lateral_error"] = _magnitude_penalty(hist.get("e_y", []), LATERAL_ERROR_SCALE)
-    terms["lap_time"] = _lap_time_penalty(hist, target_speed_ms)
 
     available = [v for v in terms.values() if v is not None]
     terms["total"] = sum(available) if available else None
@@ -560,10 +539,19 @@ def print_error_summary(hist, target_speed_ms):
     if not hist["t"]:
         return
 
+    # v_y_hat - v_y (a genuine tracking error, unlike a_y/yaw_rate/... below which are raw
+    # dynamics signals with no target) only exists for a run that logged a Kalman-filter v_y
+    # estimate alongside ground truth (mpc_mpc_KF.py's "mpc-kf" controller) -- [] for every other
+    # hist, same "row only appears if recorded" gating the dynamics sections already use.
+    v_y_hat = hist.get("v_y_hat", [])
+    v_y_est_err = ([hat - true for hat, true in zip(v_y_hat, hist["v_y"])]
+                  if len(v_y_hat) and len(v_y_hat) == len(hist.get("v_y", [])) else [])
+
     print(f"\n=== error summary: {len(hist['t'])} steps, {hist['t'][-1]:.1f} s ===")
     for name, unit, series in (("cross-track", "m", hist.get("e_y", [])),
                                ("heading    ", "deg", hist.get("e_theta", [])),
-                               ("speed      ", "m/s", speed_error_series(hist, target_speed_ms))):
+                               ("speed      ", "m/s", speed_error_series(hist, target_speed_ms)),
+                               ("v_y estimate", "m/s", v_y_est_err)):
         stats = error_stats(series)
         if stats is None:
             continue
@@ -589,13 +577,12 @@ def print_error_summary(hist, target_speed_ms):
             mean_abs, peak = stats
             print(f"  {name}  mean|.|={mean_abs:7.3f} {unit:<7}  peak|.|={peak:7.3f} {unit}")
 
-    penalty = b2d_comfort_penalty(hist, target_speed_ms)
+    penalty = b2d_comfort_penalty(hist)
     if penalty["total"] is not None:
-        print("  -- B2D comfort/tracking penalty (0 = perfect, unbounded above) --")
+        print("  -- B2D comfort penalty (0 = perfect, unbounded above) --")
         for key, label in (("a_x", "long accel  "), ("a_y", "lat accel   "),
                            ("yaw_rate", "yaw rate    "), ("yaw_acc", "yaw accel   "),
-                           ("jerk", "long jerk   "), ("jerk_total", "|jerk| total"),
-                           ("lateral_error", "lateral err "), ("lap_time", "lap time    ")):
+                           ("jerk", "long jerk   "), ("jerk_total", "|jerk| total")):
             if penalty[key] is not None:
                 print(f"    {label}  P={penalty[key]:.4f}")
         print(f"    {'TOTAL':<12}  P={penalty['total']:.4f}")
@@ -714,13 +701,25 @@ def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_colo
         if ref is not None:
             has_ref = True
             series_label = label if label else "actual"
-        ax.plot(t, series, color=color, linewidth=1.3 if multi else 1.5,
+        # When there's a ref line to overlay, swap to LINEWIDTH_THIN (series) / LINEWIDTH (ref,
+        # thicker) instead of the plain multi/non-multi widths below -- a thin solid + thick dashed
+        # pair reads clearly even when the two nearly overlap (v_y_hat tracking v_y closely, a_cmd
+        # tracking a_x closely, ...), which same-width same-color-plus-alpha didn't: the dashed line
+        # all but disappeared under the solid one. ref is always COLOR_RED regardless of the
+        # series' own color -- every current caller draws at most one (series, ref) pair per panel
+        # (plot_lateral()'s ref_key uses are all multi=False; plot_kf_series() always hands this a
+        # single-entry runs dict), so a fixed contrasting ref color never collides with another
+        # run's own ref, and reads as "the estimate/reference" at a glance instead of just a paler
+        # copy of whatever color the series happened to get. No ref -> untouched (1.3/1.5 as before).
+        series_lw = LINEWIDTH_THIN if ref is not None else (1.3 if multi else 1.5)
+        ax.plot(t, series, color=color, linewidth=series_lw,
                solid_capstyle="round", label=series_label)
         if not multi and fill_color:
             ax.fill_between(t, series, 0, color=fill_color, alpha=0.15)
         if ref is not None:
             ref_label = f"{label} ref" if label else "reference"
-            ax.plot(t, ref, color=color, linewidth=1.2, linestyle="--", alpha=0.7, label=ref_label)
+            ax.plot(t, ref, color=COLOR_RED, linewidth=LINEWIDTH, linestyle="--", alpha=0.9,
+                   label=ref_label)
     if not found:
         _not_recorded(ax, key)
     else:
@@ -784,13 +783,147 @@ def plot_lateral(hist, title="Lateral tracking performance"):
     _b2d_limit_lines(ax_r, *(math.degrees(v) for v in B2D_COMFORT_LIMITS["yaw_rate"]))
     _dynamics_panel(ax_racc, runs, colors, False, "yaw_acc", "yaw accel (rad/s$^2$)", "Yaw acceleration")
     _b2d_limit_lines(ax_racc, *B2D_COMFORT_LIMITS["yaw_acc"])
-    _dynamics_panel(ax_vy, runs, colors, False, "v_y", "$v_y$ (m/s)", "Lateral velocity (body frame)")
+    # ref_key="v_y_hat": when a run logged a Kalman-filter v_y estimate alongside ground truth
+    # (mpc_mpc_KF.py's "mpc-kf" controller), it's overlaid as a dashed line in the same color --
+    # see _dynamics_panel's ref_key doc. Runs that never log it (every other stack, plus this same
+    # stack's own ground-truth "mpc" baseline run) just get _get()==None and the overlay is skipped,
+    # so this is a no-op for every plot_lateral() caller that existed before mpc_mpc_KF.py.
+    _dynamics_panel(ax_vy, runs, colors, False, "v_y", "$v_y$ (m/s)", "Lateral velocity (body frame)",
+                    ref_key="v_y_hat")
     _dynamics_panel(ax_ay, runs, colors, False, "a_y", "$a_y$ (m/s$^2$)", "Lateral acceleration (body frame)")
     _b2d_limit_lines(ax_ay, *B2D_COMFORT_LIMITS["a_y"])
     ax_ay.set_xlabel("t (s)")
 
     _dynamics_panel(ax_steer, runs, colors, False, "steer_deg", "steer (deg)", "Steering angle (front wheel)")
     ax_steer.set_xlabel("t (s)")
+
+    return fig
+
+
+def plot_kf_series(runs, key, ref_key, ylabel, title):
+    """One-panel time-series overlay across several runs: `key` (solid) vs. `ref_key` (dashed, if
+    logged), one color per run via COMPARE_COLORS. This is the shared machinery behind plot_kf_vy()
+    (v_y_hat vs. ground-truth v_y) and kalman_filter.py's clean-vs-noisy sensor channel plots (dpsi,
+    a_y) alike -- reuses _dynamics_panel's own multi-run/ref_key mechanism (same one plot_lateral()'s
+    single-run panels use) rather than a bespoke routine, so every one of these figures stays on the
+    same LINEWIDTH/FONTSIZE/COLOR_* knobs as everything else in this file.
+
+    runs: {label: hist}, e.g. {"5 m/s": hist_5, "10 m/s": hist_10, "15 m/s": hist_15} -- same shape
+    plot_comparison() takes. A run missing `ref_key` just draws `key` alone (ref line skipped, per
+    _dynamics_panel's own "not recorded" handling).
+    """
+    colors = {label: COMPARE_COLORS[i % len(COMPARE_COLORS)] for i, label in enumerate(runs)}
+    fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    fig.suptitle(title, fontsize=FONTSIZE_TITLE, color=COLOR_INK, fontweight="bold")
+    _style_axes(ax)
+    _dynamics_panel(ax, runs, colors, True, key, ylabel, "", ref_key=ref_key)
+    ax.set_xlabel("t (s)")
+    return fig
+
+
+def plot_kf_vy(runs, title="v_y: Kalman-filter estimate vs. ground truth"):
+    """v_y_hat (dashed) vs. ground-truth v_y (solid) -- see plot_kf_series(), which this wraps."""
+    return plot_kf_series(runs, "v_y", "v_y_hat", "$v_y$ (m/s)", title)
+
+
+def plot_kf_run(hist, title=""):
+    """kalman_filter.py's whole per-run report as ONE figure, 3 stacked panels sharing a time axis --
+    v_y estimate vs. ground truth, dpsi clean vs. noisy sensor, a_y clean vs. noisy sensor -- instead
+    of 3 separate plot_kf_series() figures/windows for the same run. hist needs "v_y_hat" (from
+    replay()) and "dpsi_noisy"/"ay_noisy" (the noisy measurements replay() actually fed the filter,
+    see kalman_filter.py's main()) alongside the usual "v_y"/"yaw_rate"/"a_y" ground truth.
+
+    Single-run (not {label: hist}) on purpose, unlike plot_kf_series/plot_kf_vy -- this is one run's
+    full picture, not several runs' v_y overlaid, so it reuses _dynamics_panel with multi=False (same
+    convention plot_lateral()'s own single-run panels use) rather than the multi-run color cycle.
+    """
+    runs, colors = {"": hist}, {"": COLOR_BLUE}
+    fig, (ax_vy, ax_dpsi, ax_ay) = plt.subplots(3, 1, figsize=(11, 12), sharex=True,
+                                                constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    if title:
+        fig.suptitle(title, fontsize=FONTSIZE_TITLE, color=COLOR_INK, fontweight="bold")
+    for ax in (ax_vy, ax_dpsi, ax_ay):
+        _style_axes(ax)
+
+    _dynamics_panel(ax_vy, runs, colors, False, "v_y", "$v_y$ (m/s)",
+                    "v_y estimate vs. ground truth", ref_key="v_y_hat")
+    _dynamics_panel(ax_dpsi, runs, colors, False, "yaw_rate", "dpsi (deg/s)",
+                    "dpsi: clean vs. noisy sensor", ref_key="dpsi_noisy")
+    _dynamics_panel(ax_ay, runs, colors, False, "a_y", "$a_y$ (m/s$^2$)",
+                    "a_y: clean vs. noisy sensor", ref_key="ay_noisy")
+    ax_ay.set_xlabel("t (s)")
+    return fig
+
+
+def plot_trajectory_fit(fwd, lat, path, vx_spline, s_max_wp, s_mid, v_seg, vx_preview, kappa_preview,
+                        dt, speed, title=""):
+    r"""b2d_controller's single-sample deep dive: how one VAD-waypoint PathSpline+vx-spline fit
+    (mpc_kf_controller.py's build_trajectory_splines()/preview_from_splines()) actually looks --
+    4 panels sharing the same COLOR_*/LINEWIDTH/FONTSIZE_* knobs as every other figure in this file.
+    Built for b2d_controller/inspect_one_sample.py, which computes every array this takes (it needs
+    the same intermediates for its own printed formulas, so recomputing them here would just be a
+    second, possibly-divergent copy).
+
+    fwd, lat: the fit's own input points in this file's (forward, lateral) convention -- [origin,
+    *waypoints, target], length N. path: the fitted PathSpline. vx_spline: the fitted speed spline.
+    s_max_wp: station of the last REAL waypoint (vx_spline has no data past this -- see
+    build_trajectory_splines()'s docstring). s_mid, v_seg: the per-interval speed samples vx_spline
+    was fit against. vx_preview, kappa_preview: preview_from_splines()'s own output (length n_p).
+    dt: control period, used only to reconstruct the preview's own station cursor for plotting.
+    speed: current speed (m/s, at t=0) -- NOT what vx_preview/vx_spline show, which is VAD's own
+    predicted FUTURE speed along the trajectory; the two can differ a lot (e.g. current speed high,
+    predicted speed low -- VAD forecasting a slowdown into a turn), by design, not by mistake.
+
+    Note kappa_preview/vx_preview only ever cover station 0 to roughly n_p*dt*vx -- a TIME horizon,
+    not path.kappa(s)/vx_spline(s)'s own full spatial domain (0 to path.s_max / s_max_wp). At low
+    speed that's a small fraction of the fitted curve; the dense curves are still fit from every
+    input point regardless of how far the preview's own marker series happens to reach.
+    """
+    s_cursor = np.concatenate([[0.0], np.cumsum(np.asarray(vx_preview) * dt)[:-1]])
+    s_dense = np.linspace(0.0, path.s_max, 300)
+    fx, fy = path.xy(s_dense)
+    yaw_dense = np.degrees(path.yaw(s_dense))
+    kappa_dense = path.kappa(s_dense)
+    s_dense_wp = np.linspace(0.0, s_max_wp, 100)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    if title:
+        fig.suptitle(title, fontsize=FONTSIZE_TITLE, color=COLOR_INK, fontweight="bold")
+    for ax in axes.ravel():
+        _style_axes(ax)
+
+    ax = axes[0, 0]
+    ax.plot(fx, fy, "-", color=COLOR_BLUE, linewidth=LINEWIDTH, label="fitted PathSpline")
+    ax.plot(fwd[:-1], lat[:-1], "o", color=COLOR_ORANGE, markersize=8, label="VAD waypoints (+origin)")
+    ax.plot(fwd[-1], lat[-1], "s", color=COLOR_RED, markersize=8, label="target (extrap.)")
+    ax.set_xlabel("forward (m)"); ax.set_ylabel("lateral (m)")
+    _title(ax, "path fit"); _legend(ax, loc="best"); ax.axis("equal")
+
+    ax = axes[0, 1]
+    ax.plot(s_dense, yaw_dense, "-", color=COLOR_PURPLE, linewidth=LINEWIDTH)
+    ax.axvline(s_max_wp, color=COLOR_AXIS, linestyle=":",
+              label="last VAD waypoint (past here: target's linear extrapolation, not real output)")
+    ax.set_xlabel("station s (m)"); ax.set_ylabel("yaw (deg)")
+    _title(ax, "path.yaw(s)"); _legend(ax, loc="best")
+
+    ax = axes[1, 0]
+    ax.plot(s_dense, kappa_dense, "-", color=COLOR_PURPLE, linewidth=LINEWIDTH, label="path.kappa(s): the fit")
+    ax.plot(s_cursor, kappa_preview, "o", color=COLOR_RED, markersize=5, label="kappa_preview")
+    ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
+    ax.set_xlabel("station s (m)"); ax.set_ylabel("kappa (1/m)")
+    _title(ax, "curvature"); _legend(ax, loc="lower right")
+
+    ax = axes[1, 1]
+    ax.plot(s_dense_wp, vx_spline(s_dense_wp), "-", color=COLOR_AQUA, linewidth=LINEWIDTH, label="vx_spline(s)")
+    ax.plot(s_mid, v_seg, "o", color=COLOR_ORANGE, markersize=7, label="speed samples (input)")
+    ax.plot(s_cursor, vx_preview, "x", color=COLOR_RED, markersize=6, label="vx_preview")
+    ax.axhline(speed, color=COLOR_AXIS, linestyle="--",
+              label="current speed (now, t=0 -- VAD predicts this changing over the horizon)")
+    ax.set_xlabel("station s (m)"); ax.set_ylabel("vx (m/s)")
+    _title(ax, "speed fit"); _legend(ax, loc="best")
 
     return fig
 
@@ -1297,148 +1430,205 @@ def plot_lut_surfaces(gear_tables, out_dir, raw=None, show=True, elev=25.0, azim
 # 9. lateral parameter identification figures
 # ---------------------------------------------------------------------------
 
-def plot_cornering_stiffness_fit(log, window, fit, out_dir=None, show=True, name=None):
-    """For estimate_cornering_stiffness.py: run overview (steady window shaded) plus the two
-    per-axle Fy-vs-alpha fits.
+def plot_cornering_stiffness_speed_bands(queued, pooled, by_speed, out_dir=None, show=True,
+                                         name=None):
+    """For estimate_cornering_stiffness.py: alpha-vs-Fy fit for the selected speeds, colored by
+    target speed, with ONE band spanning the selected speeds' own point-estimate Cf/Cr values
+    (not each speed's internal per-steer spread) drawn behind the final pooled line.
 
-    The scatter in the two fit panels is usually a tight cloud, not a spread-out line -- one run
-    holds one speed and one steer angle, so it is a single operating point measured many times,
-    not a sweep. A real Cf/Cr campaign runs the script at several speeds/steer angles and pools
-    the (alpha, Fy) pairs before fitting; this figure is per-run.
+    The point being made is "pooling the selected speeds into one Cf/Cr is justified": if the
+    band spanning what each selected speed's own Cf/Cr independently came out to is already
+    tight around the pooled (black dashed) line, the data itself says Cf/Cr doesn't drift across
+    the speeds that made it through selection -- rather than just asserting that and pooling
+    anyway. This is deliberately NOT each speed's own internal uncertainty (that question --
+    "is any given speed's own fit noisy" -- is what estimate_cornering_stiffness.py's speed
+    SELECTION step already answered before a speed's trials ever reach this plot).
 
-    Markers are drawn last (highest zorder) with a background-colored edge so they read as
-    distinct dots even where they sit almost exactly on the fit line -- a plain small marker at
-    low alpha gets visually absorbed by the line and the shaded bracket band under it.
+    queued/pooled/by_speed: collect_sweep_trials()'s own return values (or, from estimate_
+    cornering_stiffness.py's main(), the selected-speed subset of them), plotted as-is -- the
+    estimation itself (fit_cornering_stiffness/pool_trials/pool_by_speed) is untouched by this
+    function. by_speed[v]["Cf"/"Cr"] (one point estimate per speed) is what the band's min/max is
+    drawn from, not by_speed[v]["Cf_min"/"Cf_max"] (that speed's own internal spread).
     """
     import matplotlib.pyplot as plt
 
-    start, end = window
-    t = np.asarray(log["t"], dtype=float)
+    done = [tr for tr in queued if tr.get("fit") is not None]
+    speeds = sorted({tr["target_speed"] for tr in done})
+    cmap = plt.get_cmap("plasma")
+    # continuous norm over the actual speed values (not evenly spaced by rank), so the colorbar's
+    # own axis is a true speed scale -- 4 and 5 m/s sit close together on it, 4 and 15 m/s far
+    # apart, matching what the tick labels say rather than just enumerating "speed #3 of 12".
+    speed_norm = plt.Normalize(min(speeds), max(speeds)) if len(speeds) > 1 else None
+    speed_color = ({v: cmap(speed_norm(v)) for v in speeds} if speed_norm
+                   else {speeds[0]: cmap(0.5)})
 
-    fig, (ax_t, ax_f, ax_r) = plt.subplots(1, 3, figsize=(17, 5), constrained_layout=True)
+    fig, (ax_f, ax_r) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
     fig.patch.set_facecolor(COLOR_BG)
-    for ax in (ax_t, ax_f, ax_r):
+    for ax in (ax_f, ax_r):
         _style_axes(ax)
-
-    ax_t.plot(t, log["v_x"], color=COLOR_BLUE, linewidth=LINEWIDTH, label="v_x (m/s)")
-    ax_t.plot(t, np.degrees(log["r"]), color=COLOR_ORANGE, linewidth=LINEWIDTH,
-             label="psi_dot (deg/s)")
-    ax_t.plot(t, log["a_y_imu"], color=COLOR_AQUA, linewidth=LINEWIDTH, label="a_y IMU (m/s^2)")
-    ax_t.axvspan(t[start], t[end - 1], color=COLOR_BLUE, alpha=0.12, label="steady window")
-    ax_t.set_xlabel("t (s)")
-    _title(ax_t, "Run overview")
-    _legend(ax_t)
-
-    for ax, alpha, Fy, C, C_lo, C_hi, color, axle in (
-            (ax_f, fit["alpha_f"], fit["Fyf"], fit["Cf"], fit["Cf_forward"], fit["Cf_reverse"],
-             COLOR_BLUE, "front"),
-            (ax_r, fit["alpha_r"], fit["Fyr"], fit["Cr"], fit["Cr_forward"], fit["Cr_reverse"],
-             COLOR_ORANGE, "rear")):
-        alpha_deg = np.degrees(np.asarray(alpha, dtype=float))
-        Fy = np.asarray(Fy, dtype=float)
         ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
         ax.axvline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
 
-        lo, hi = min(0.0, alpha_deg.min()), max(0.0, alpha_deg.max())
-        xs = np.linspace(lo, hi, 20)
-        ax.fill_between(xs, C_lo * np.radians(xs), C_hi * np.radians(xs), color=color, alpha=0.12,
-                        zorder=1, label=f"bracket [{C_lo:,.0f}, {C_hi:,.0f}]")
-        ax.plot(xs, C * np.radians(xs), color=color, linewidth=LINEWIDTH, linestyle="--",
-               zorder=2, label=f"C={C:,.0f} N/rad")
-        ax.scatter(alpha_deg, Fy, s=MARKERSIZE, facecolor=color, edgecolor=COLOR_BG,
-                  linewidth=0.6, alpha=0.85, zorder=3, label="measured")
-
-        ax.set_xlabel(f"alpha_{axle[0]} (deg)")
-        ax.set_ylabel(f"Fy{axle[0]} (N)")
-        _title(ax, f"{axle.capitalize()} axle: Fy = C * alpha")
-        _legend(ax)
-
-    out_path = None
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = _save(fig, out_dir, run_name("cornering_stiffness", name))
-        print(f"Figure saved: {out_path}")
-    if show:
-        plt.show()
-    plt.close(fig)
-    return out_path
-
-
-def plot_cornering_stiffness_sweep(trials, pooled, out_dir=None, show=True, name=None):
-    """For estimate_cornering_stiffness.py's --sweep: the two per-axle Fy-vs-alpha fits pooled
-    across every settled trial, plus a third panel scoring the sweep itself -- does each trial's
-    own Cf/Cr agree with the pooled number, or does it drift with a_y (the standard tell that a
-    trial left the tire's linear region -- see ISO 4138's steady-state circular test, which is
-    what this sweep effectively runs).
-
-    trials: list of per-trial dicts with "target_speed", "a_y_est" and "window" set by
-    run_sweep(), plus a "fit" dict (from fit_cornering_stiffness) for every trial pool_trials()
-    was able to fit. Trials with window is None or no "fit" are skipped here.
-    """
-    import matplotlib.pyplot as plt
-
-    done = [tr for tr in trials if tr.get("fit") is not None]
-
-    fig, (ax_f, ax_r, ax_c) = plt.subplots(1, 3, figsize=(18, 5.5), constrained_layout=True)
-    fig.patch.set_facecolor(COLOR_BG)
-    for ax in (ax_f, ax_r, ax_c):
-        _style_axes(ax)
-
-    a_y_vals = [tr["a_y_est"] for tr in done]
-    cmap = plt.get_cmap("viridis")
-    norm = (plt.Normalize(min(a_y_vals), max(a_y_vals)) if len(set(a_y_vals)) > 1 else None)
-
-    for ax, key_alpha, key_Fy, C, C_lo, C_hi, axle in (
-            (ax_f, "alpha_f", "Fyf", pooled["Cf"], pooled["Cf_forward"], pooled["Cf_reverse"],
-             "front"),
-            (ax_r, "alpha_r", "Fyr", pooled["Cr"], pooled["Cr_forward"], pooled["Cr_reverse"],
-             "rear")):
-        color = COLOR_BLUE if axle == "front" else COLOR_ORANGE
-        ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
-        ax.axvline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
-
+    for ax, key_alpha, key_Fy, c_key, C_pooled, axle in (
+            (ax_f, "alpha_f", "Fyf", "Cf", pooled["Cf"], "front"),
+            (ax_r, "alpha_r", "Fyr", "Cr", pooled["Cr"], "rear")):
         all_alpha_deg = np.degrees(pooled[key_alpha])
         lo, hi = min(0.0, all_alpha_deg.min()), max(0.0, all_alpha_deg.max())
         xs = np.linspace(lo, hi, 20)
-        ax.fill_between(xs, C_lo * np.radians(xs), C_hi * np.radians(xs), color=color, alpha=0.12,
-                        zorder=1, label=f"bracket [{C_lo:,.0f}, {C_hi:,.0f}]")
-        ax.plot(xs, C * np.radians(xs), color=color, linewidth=LINEWIDTH, linestyle="--",
-               zorder=2, label=f"pooled C={C:,.0f} N/rad")
+
+        C_vals = [r[c_key] for r in by_speed.values() if r is not None]
+        if C_vals:
+            C_lo, C_hi = min(C_vals), max(C_vals)
+            ax.fill_between(xs, C_lo * np.radians(xs), C_hi * np.radians(xs), color=COLOR_MUTED,
+                            alpha=0.18, zorder=1,
+                            label=f"selected speeds' C range [{C_lo:,.0f}, {C_hi:,.0f}]")
 
         for tr in done:
             alpha_deg = np.degrees(tr["fit"][key_alpha])
             Fy = tr["fit"][key_Fy]
-            c = cmap(norm(tr["a_y_est"])) if norm else color
-            ax.scatter(alpha_deg, Fy, s=MARKERSIZE, facecolor=c, edgecolor=COLOR_BG,
-                      linewidth=0.6, alpha=0.9, zorder=3)
+            ax.scatter(alpha_deg, Fy, s=MARKERSIZE, facecolor=speed_color[tr["target_speed"]],
+                      edgecolor=COLOR_BG, linewidth=0.6, alpha=0.9, zorder=3)
 
+        ax.plot(xs, C_pooled * np.radians(xs), color=COLOR_INK, linewidth=LINEWIDTH * 1.4,
+               linestyle="--", zorder=4, label=f"pooled C={C_pooled:,.0f} N/rad")
         ax.set_xlabel(f"alpha_{axle[0]} (deg)")
         ax.set_ylabel(f"Fy{axle[0]} (N)")
-        _title(ax, f"{axle.capitalize()} axle: {len(done)} trials pooled (color = a_y)")
+        _title(ax, f"{axle.capitalize()} axle: Fy = C * alpha, selected speeds")
         _legend(ax)
 
-    ays = [tr["a_y_est"] for tr in done]
-    Cfs = [tr["fit"]["Cf"] for tr in done]
-    Crs = [tr["fit"]["Cr"] for tr in done]
-    ax_c.axhline(pooled["Cf"], color=COLOR_BLUE, linewidth=LINEWIDTH_THIN, linestyle="--",
-                label=f"pooled Cf={pooled['Cf']:,.0f}")
-    ax_c.axhline(pooled["Cr"], color=COLOR_ORANGE, linewidth=LINEWIDTH_THIN, linestyle="--",
-                label=f"pooled Cr={pooled['Cr']:,.0f}")
-    ax_c.scatter(ays, Cfs, s=MARKERSIZE, facecolor=COLOR_BLUE, edgecolor=COLOR_BG, linewidth=0.6,
-                zorder=3, label="Cf per trial")
-    ax_c.scatter(ays, Crs, s=MARKERSIZE, facecolor=COLOR_ORANGE, edgecolor=COLOR_BG,
-                linewidth=0.6, zorder=3, label="Cr per trial")
-    ax_c.set_xlabel("a_y (m/s^2, kinematic estimate)")
-    ax_c.set_ylabel("C (N/rad)")
-    _title(ax_c, "Constancy check: C should not drift with a_y")
-    _legend(ax_c)
+    # vertical colorbar (not a swatch legend) so "what speed is this color" reads off a continuous
+    # scale instead of matching dots to a wrapped multi-row legend -- the right call once there
+    # are enough speeds that a legend row per speed stops being readable.
+    if speed_norm is not None:
+        sm = plt.cm.ScalarMappable(norm=speed_norm, cmap=cmap)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=[ax_f, ax_r], pad=0.02, aspect=30)
+        cbar.set_label("target speed (m/s)", fontsize=FONTSIZE_LABEL, color=COLOR_MUTED)
+        cbar.ax.tick_params(colors=COLOR_MUTED, labelsize=FONTSIZE_TICK)
+        cbar.outline.set_visible(False)
 
     out_path = None
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-        out_path = _save(fig, out_dir, run_name("cornering_stiffness_sweep", name))
+        out_path = _save(fig, out_dir, run_name("cornering_stiffness_speed_bands", name))
         print(f"Figure saved: {out_path}")
     if show:
         plt.show()
     plt.close(fig)
     return out_path
+
+
+def plot_speed_slip_angle(queued, out_dir=None, show=True, name=None):
+    """For estimate_cornering_stiffness.py: every steady-window sample's (v_x, alpha) plotted
+    directly, colored by steer angle -- shows how far alpha_f/alpha_r actually swept at each speed
+    (not just its fitted Cf), which is the evidence --speeds should be widened or narrowed against:
+    a speed whose slip-angle range has collapsed toward the noise floor, or whose steer-angle
+    "rays" have started crossing, is a speed no longer worth including in the pooled fit.
+    """
+    import matplotlib.pyplot as plt
+
+    done = [tr for tr in queued if tr.get("fit") is not None]
+    steers = sorted({tr["steer_deg"] for tr in done})
+    cmap = plt.get_cmap("viridis")
+    steer_color = {d: cmap(i / max(1, len(steers) - 1)) for i, d in enumerate(steers)}
+
+    fig, (ax_f, ax_r) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    for ax in (ax_f, ax_r):
+        _style_axes(ax)
+        ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
+
+    for tr in done:
+        color = steer_color[tr["steer_deg"]]
+        v_x = np.asarray(tr["log"]["v_x"])[slice(*tr["window"])]
+        alpha_f_deg = np.degrees(tr["fit"]["alpha_f"])
+        alpha_r_deg = np.degrees(tr["fit"]["alpha_r"])
+        ax_f.scatter(v_x, alpha_f_deg, s=MARKERSIZE * 0.5, facecolor=color, edgecolor="none",
+                    alpha=0.5, zorder=2)
+        ax_r.scatter(v_x, alpha_r_deg, s=MARKERSIZE * 0.5, facecolor=color, edgecolor="none",
+                    alpha=0.5, zorder=2)
+
+    ax_f.set_xlabel("v_x (m/s)"); ax_f.set_ylabel("alpha_f (deg)")
+    ax_r.set_xlabel("v_x (m/s)"); ax_r.set_ylabel("alpha_r (deg)")
+    _title(ax_f, "Front slip angle vs speed")
+    _title(ax_r, "Rear slip angle vs speed")
+
+    handles = [plt.Line2D([0], [0], marker="o", linestyle="", markerfacecolor=steer_color[d],
+                          markeredgecolor="none", markersize=8, label=f"{d:g} deg")
+              for d in steers]
+    _bottom_legend(fig, handles, title="steer")
+
+    out_path = None
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = _save(fig, out_dir, run_name("speed_slip_angle", name))
+        print(f"Figure saved: {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+def cornering_stiffness_speed_stats(queued, by_speed):
+    """Per-speed sample count / Cf & Cr / std(C across that speed's own steer angles) / alpha
+    range, front AND rear axle both -- the numbers behind both print_cornering_stiffness_speed_
+    table() and estimate_cornering_stiffness.py's own speed-selection step (drop a speed if
+    either axle's C_std_pct or alpha_max_deg exceeds a threshold), split out as its own function
+    so both read the exact same numbers instead of the selection logic recomputing its own
+    version of what the table already printed.
+
+    Returns {v: {"n_samples", "Cf", "Cf_std", "Cf_std_pct", "alpha_f_min_deg", "alpha_f_max_deg",
+    "Cr", "Cr_std", "Cr_std_pct", "alpha_r_min_deg", "alpha_r_max_deg"}}, skipping speeds with no
+    settled trial (by_speed.get(v) is None). n_samples is shared (front/rear windows are the same
+    ticks, just a different axle's slip angle/force).
+    """
+    done = [tr for tr in queued if tr.get("fit") is not None]
+    stats = {}
+    for v in sorted({tr["target_speed"] for tr in done}):
+        trials_v = [tr for tr in done if tr["target_speed"] == v]
+        r = by_speed.get(v)
+        if r is None or not trials_v:
+            continue
+        n_samples = sum(len(tr["fit"]["alpha_f"]) for tr in trials_v)
+        Cf_std = float(np.std([tr["fit"]["Cf"] for tr in trials_v]))
+        Cr_std = float(np.std([tr["fit"]["Cr"] for tr in trials_v]))
+        alpha_f_all = np.degrees(np.concatenate([tr["fit"]["alpha_f"] for tr in trials_v]))
+        alpha_r_all = np.degrees(np.concatenate([tr["fit"]["alpha_r"] for tr in trials_v]))
+        stats[v] = {
+            "n_samples": n_samples,
+            "Cf": r["Cf"], "Cf_std": Cf_std,
+            "Cf_std_pct": 100.0 * Cf_std / r["Cf"] if r["Cf"] else float("inf"),
+            "alpha_f_min_deg": float(alpha_f_all.min()), "alpha_f_max_deg": float(alpha_f_all.max()),
+            "Cr": r["Cr"], "Cr_std": Cr_std,
+            "Cr_std_pct": 100.0 * Cr_std / r["Cr"] if r["Cr"] else float("inf"),
+            "alpha_r_min_deg": float(alpha_r_all.min()), "alpha_r_max_deg": float(alpha_r_all.max()),
+        }
+    return stats
+
+
+def print_cornering_stiffness_speed_table(queued, by_speed):
+    """Per-speed sample count / Cf & Cr / std(C across that speed's own steer angles) / alpha
+    range, front and rear both -- the plain-text companion to
+    plot_cornering_stiffness_speed_bands(): n_samples too small or the alpha range collapsing
+    toward 0 both say a speed has hit the noise floor; a wide C std says it's drifting instead.
+    Together with plot_speed_slip_angle(), this is the evidence for deciding which speeds are
+    actually worth pooling into the final Cf/Cr -- on EITHER axle, not just the front, since a
+    speed can look fine at the front and still be noise on the rear (lower Fzr/alpha_r means the
+    rear fit generally has less signal to work with).
+    """
+    stats = cornering_stiffness_speed_stats(queued, by_speed)
+    print(f"\n{'v (m/s)':>8} {'n samp':>7} "
+          f"{'Cf (N/rad)':>12} {'Cf std%':>8} {'alpha_f (deg)':>18} "
+          f"{'Cr (N/rad)':>12} {'Cr std%':>8} {'alpha_r (deg)':>18}")
+    all_speeds = sorted({tr["target_speed"] for tr in queued})
+    for v in all_speeds:
+        s = stats.get(v)
+        if s is None:
+            print(f"{v:8.1f} {'--':>7} {'--':>12} {'--':>8} {'--':>18} "
+                  f"{'--':>12} {'--':>8} {'--':>18}")
+            continue
+        print(f"{v:8.1f} {s['n_samples']:7d} "
+              f"{s['Cf']:12,.0f} {s['Cf_std_pct']:7.1f}% "
+              f"[{s['alpha_f_min_deg']:+6.2f},{s['alpha_f_max_deg']:+6.2f}] "
+              f"{s['Cr']:12,.0f} {s['Cr_std_pct']:7.1f}% "
+              f"[{s['alpha_r_min_deg']:+6.2f},{s['alpha_r_max_deg']:+6.2f}]")

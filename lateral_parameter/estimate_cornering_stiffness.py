@@ -1,4 +1,9 @@
-r"""Flat test pad for constant-radius cornering experiments.
+r"""Cf/Cr cornering-stiffness sweep: flat test pad, drive/fit/pool pipeline, and the evidence
+report built on top of it -- one file. (Previously split across this script, which only did the
+drive/fit/pool sweep and an older per-a_y plot, and a separate estimate_cornering_stiffness.py
+that reused it for a different report; merged back into one file under this name since nothing
+outside this file ever imported the old script as a module -- only its JSON output, which this
+script still produces.)
 
 The pad is generated at runtime from a hand-written OpenDRIVE string -- one straight road with a
 lot of wide lanes -- via client.generate_opendrive_world(). No Unreal Editor, no map files, no
@@ -25,24 +30,42 @@ stock maps. That is expected rather than lucky: with tire_friction 3.5 the opera
 far below saturation, and in a tire's linear region the lateral force is set by lat_stiff_value
 and vertical load, with surface friction only fixing the ceiling.
 
-Two modes:
-    single run   (default)   one (--target-speed, --steer-deg), full per-tick printout, one figure.
-    --sweep                  every combination of --speeds x --steers, filtered by --min-radius/
-                              --max-ay, pooled into one Cf/Cr fit -- see run_sweep()'s docstring
-                              for why pooling beats picking a single "best" operating point.
+Pipeline, run end to end by main() on every invocation:
+
+  1. collect_sweep_trials() drives every (speed, steer) combination in --speeds x --steers
+     (default 1-15 m/s, all --steers), filtered by --min-radius/--max-ay, and fits each settled
+     trial -- see its own docstring for why the final Cf/Cr is a pooled through-origin regression,
+     not an average of per-trial numbers.
+  2. print_cornering_stiffness_speed_table() + plot_speed_slip_angle() report EVERY driven speed,
+     unfiltered -- sample count, Cf/Cr, std(C) across that speed's own steer angles, and the alpha
+     range actually swept, front AND rear axle both. This is the evidence the next step acts on,
+     not just a courtesy log.
+  3. Speed selection: a speed is dropped from the final Cf/Cr if EITHER axle's std(C) across its
+     own steer angles exceeds --max-cf-std-pct/--max-cr-std-pct of that axle's own C (the low-a_y
+     noise-floor tell -- this is what excludes 1-3 m/s by default), or its largest |alpha| sample
+     on that axle exceeds --max-alpha-f-deg/--max-alpha-r-deg (the tell that speed is pushing the
+     tire response out of the linear region the whole rig assumes). Checked separately per axle
+     since the rear fit generally has less signal (lower Fzr/alpha_r) and can fail where the front
+     passes. --no-select pools every driven speed instead.
+  4. The final Cf/Cr is pool_trials()/pool_by_speed() run again, this time over only the trials at
+     selected speeds. plot_cornering_stiffness_speed_bands() (alpha-vs-Fy scatter colored by
+     target speed, with a vertical colorbar, each selected speed's own Cf/Cr line + spread band,
+     and the final pooled line on top) is drawn from that same selected-speed subset, and the
+     selection itself (kept/dropped speeds and why) is written into --out alongside it.
+  5. --record: one mp4 per (speed, steer) trial, via collect_sweep_trials()'s video_factory hook
+     (VideoRecorder + follow_with_spectator -- follow_with_spectator itself is already called
+     every tick inside drive_and_log()).
 
 Usage (Ubuntu):
     cd ~/carla_control
-    python3 lateral_parameter/estimate_cornering_stiffness.py
-    python3 lateral_parameter/estimate_cornering_stiffness.py --lanes 16 --length 200
-    python3 lateral_parameter/estimate_cornering_stiffness.py --sweep
-    python3 lateral_parameter/estimate_cornering_stiffness.py --sweep --speeds 2,5,8 --steers 8,14,20
+    python3 lateral_parameter/estimate_cornering_stiffness.py --save-plot
+    python3 lateral_parameter/estimate_cornering_stiffness.py --speeds 4,5,6,7,8,9,10 --save-plot
+    python3 lateral_parameter/estimate_cornering_stiffness.py --record --save-plot
+    python3 lateral_parameter/estimate_cornering_stiffness.py --max-cf-std-pct 10 --max-alpha-f-deg 6 --save-plot
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
-    .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py
-    .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py --lanes 16 --length 200
-    .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py --sweep
+    .venv\Scripts\python.exe lateral_parameter\estimate_cornering_stiffness.py --save-plot
 """
 
 import argparse
@@ -63,16 +86,21 @@ from functions import get_vehicle_geometry, PID, LowPassFilter, clipping, contro
 
 import carla
 
-from viz_utils import (follow_with_spectator, plot_cornering_stiffness_fit,
-                       plot_cornering_stiffness_sweep)
+from viz_utils import (VIEWS, VideoRecorder, cornering_stiffness_speed_stats,
+                       follow_with_spectator, plot_cornering_stiffness_speed_bands,
+                       plot_speed_slip_angle, print_cornering_stiffness_speed_table, run_name)
 
-from bicycle import (bracket, front_steer_angle, report, slip_angles, steady_axle_forces,
-                     steer_convention_report, zero_phase_derivative)
+from bicycle import bracket, front_steer_angle, report, slip_angles, steady_axle_forces, \
+    zero_phase_derivative
 
 
 LANE_WIDTH = 3.5
 VEHICLE_BP = "vehicle.lincoln.mkz_2020"
 
+
+# --------------------------------------------------------------------------------------------
+# pad + vehicle
+# --------------------------------------------------------------------------------------------
 
 def build_xodr(lanes_each_side=12, length=130.0, lane_width=LANE_WIDTH):
     """OpenDRIVE for a single straight road, `lanes_each_side` lanes wide on each side.
@@ -180,14 +208,18 @@ def attach_imu(world, vehicle, centre_of_mass):
     return imu, queue_
 
 
+# --------------------------------------------------------------------------------------------
+# drive + fit
+# --------------------------------------------------------------------------------------------
+
 def drive_and_log(world, vehicle, physics, max_steer, args, target_speed, delta, imu_queue,
                   verbose=True):
     """Settle onto the surface, then hold `delta` (bicycle-model wheel angle, rad) while a PID
     chases `target_speed`, logging every tick. Returns the log dict (derivatives not added yet).
 
-    A fresh PID/LowPassFilter every call, not one shared across a whole --sweep -- otherwise
-    trial N's integral windup and filter state would bias trial N+1's transient, which would
-    then bleed into how quickly it reaches (and stays inside) the steady window.
+    A fresh PID/LowPassFilter every call, not one shared across a whole sweep -- otherwise trial
+    N's integral windup and filter state would bias trial N+1's transient, which would then bleed
+    into how quickly it reaches (and stays inside) the steady window.
     """
     pid = PID(kp=args.pid_kp, ki=args.pid_ki, kd=args.pid_kd, dt=args.dt)
     speed_filter = LowPassFilter(tau=args.speed_filter_tau, dt=args.dt, initial=0.0)
@@ -372,11 +404,10 @@ def pool_trials(trials, mass, lf, lr):
     """Fit each settled trial individually, then once more pooled across all of them -- the
     number that actually gets used. Mutates each trial dict in place with its own "fit".
 
-    Fitting every trial on its own first (rather than only the pooled fit) is what makes the
-    per-trial Cf/Cr table in run_sweep() possible: systematic drift of the individual numbers
-    with a_y or speed is the standard tell that some trials have left the tire's linear region
-    (this whole sweep is, in effect, an ISO 4138 steady-state circular test). Returns None if no
-    trial ever settled.
+    Fitting every trial on its own first (rather than only the pooled fit) is what makes a
+    per-trial Cf/Cr table possible: systematic drift of the individual numbers with a_y or speed
+    is the standard tell that some trials have left the tire's linear region (this whole sweep is,
+    in effect, an ISO 4138 steady-state circular test). Returns None if no trial ever settled.
     """
     alpha_f_all, Fyf_all, alpha_r_all, Fyr_all = [], [], [], []
     for tr in trials:
@@ -407,10 +438,10 @@ def pool_by_speed(trials, mass, lf, lr):
     pairs on its own -- one Cf/Cr per speed (steer angle collapsed out) instead of one number for
     the whole sweep. Must run after pool_trials() has populated tr["fit"] for every settled trial.
 
-    This is the speed-only cut of the same constancy check pool_trials()'s per-trial table
-    already gives across the full (speed, steer) grid: if Cf/Cr still drifts once every steer
-    angle at a given speed is pooled together, the drift tracks speed itself (actuator lag,
-    steering-curve residual, ...) rather than just a_y.
+    This is the speed-only cut of the same constancy check pool_trials()'s per-trial fits already
+    give across the full (speed, steer) grid: if Cf/Cr still drifts once every steer angle at a
+    given speed is pooled together, the drift tracks speed itself (actuator lag, steering-curve
+    residual, ...) rather than just a_y.
 
     Also reports, per speed, how much the *individual* per-trial Cf/Cr (one per steer angle)
     disagree with each other -- min/max and the spread as a percentage of their mean. A wide
@@ -451,129 +482,9 @@ def pool_by_speed(trials, mass, lf, lr):
     return result
 
 
-def summarise(log, args, thresholds):
-    """Find the steady-state window and report it: is it steady, and do the two routes to a_y
-    agree? Returns the (start, end) index pair of the window used, or None if the run never
-    settled.
-
-    Picks the longest run found by find_steady_windows() rather than the first -- the car is
-    still accelerating up to target_speed early on, so an early short-lived dip under threshold
-    (e.g. while v_x is crossing its own noise floor on the way up) should not pre-empt the real
-    settled tail later in the run.
-    """
-    t = np.array(log["t"])
-    window = longest_window(find_steady_windows(log, args.dt, thresholds, hold_s=args.steady_hold))
-    if window is None:
-        print(f"\nnever settled: v_x, v_y, psi_dot and a_y never all stayed under threshold for "
-              f"{args.steady_hold:.1f}s straight")
-        mask = steady_mask(log, thresholds)
-        best = max((e - s for s, e in runs(mask)), default=0)
-        print(f"  longest run with all four under threshold: {best*args.dt:.2f}s ({best} ticks, "
-              f"needed {args.steady_hold:.2f}s / {int(round(args.steady_hold/args.dt))} ticks)")
-        print("  per-signal (over the whole run -- which one is the bottleneck):")
-        for key, thr in thresholds.items():
-            v = np.abs(np.array(log[key]))
-            print(f"    {key:>10}: threshold {thr:.4f}  observed max {v.max():.4f}  "
-                  f"p95 {np.percentile(v, 95):.4f}  under-threshold {100*(v < thr).mean():4.1f}% "
-                  f"of ticks")
-        return None
-    start, end = window
-    steady = slice(start, end)
-
-    def stat(key, scale=1.0):
-        v = np.array(log[key])[steady] * scale
-        return v.mean(), v.std()
-
-    print(f"\n--- steady state: t={t[start]:.2f}-{t[end-1]:.2f}s "
-          f"({t[end-1]-t[start]:.2f}s, reached after {t[start]:.2f}s) ---")
-    for label, key, unit, scale in (
-            ("v_x", "v_x", "m/s", 1.0),
-            ("v_y", "v_y", "m/s", 1.0),
-            ("psi_dot", "r", "deg/s", 180.0 / math.pi),
-            ("delta", "delta", "deg", 180.0 / math.pi),
-            ("v_x_dot", "v_x_dot", "m/s^2", 1.0),
-            ("v_y_dot", "v_y_dot", "m/s^2", 1.0),
-            ("psi_ddot", "psi_ddot", "deg/s^2", 180.0 / math.pi),
-            ("a_y IMU", "a_y_imu", "m/s^2", 1.0),
-            ("a_y_dot", "a_y_dot", "m/s^2", 1.0)):
-        mean, std = stat(key, scale)
-        print(f"  {label:>9}: {mean:+9.4f} +/- {std:7.4f} {unit}")
-
-    v_x = np.array(log["v_x"])[steady]
-    r = np.array(log["r"])[steady]
-    a_y_kin = v_x * r
-    a_y_imu = np.array(log["a_y_imu"])[steady]
-    print(f"\n  a_y from v_x*psi_dot : {a_y_kin.mean():+.4f} +/- {a_y_kin.std():.4f}")
-    print(f"  a_y from the IMU     : {a_y_imu.mean():+.4f} +/- {a_y_imu.std():.4f}")
-    print(f"  gap                  : {a_y_imu.mean() - a_y_kin.mean():+.4f} m/s^2")
-    print("  In steady state the two must agree -- their difference is v_y_dot. A gap that "
-          "persists\n  while v_y_dot is ~0 is the accelerometer reading something else: it "
-          "measures specific\n  force in the BODY frame, so body roll tilts g into its y axis.")
-    print(f"  IMU noise is {a_y_imu.std()/max(a_y_kin.std(), 1e-9):.0f}x the kinematic route's, "
-          f"and scales like 1/dt (dt={args.dt})")
-    return start, end
-
-
-def run_single(world, centre, args, thresholds):
-    """One (--target-speed, --steer-deg) run: full per-tick printout, one fit, one figure."""
-    vehicle, geometry = spawn_vehicle(world, centre, VEHICLE_BP)
-    wheelbase, lf, lr, max_steer, mass, com = geometry
-    physics = vehicle.get_physics_control()
-    imu = None
-    try:
-        delta = math.radians(args.steer_deg)
-        if abs(delta) > max_steer:
-            raise SystemExit(f"--steer-deg {args.steer_deg} exceeds this vehicle's "
-                             f"{math.degrees(max_steer):.1f} deg of steering")
-        print(f"\nholding a {args.steer_deg:+.2f} deg wheel angle "
-              f"(kinematic radius L/tan(delta) = {wheelbase/math.tan(abs(delta)):.2f} m "
-              f"before any tire slip)")
-
-        imu, imu_queue = attach_imu(world, vehicle, com)
-        log = drive_and_log(world, vehicle, physics, max_steer, args, args.target_speed, delta,
-                            imu_queue, verbose=True)
-    finally:
-        if imu is not None:
-            imu.stop()
-            imu.destroy()
-        vehicle.destroy()
-        print("actors destroyed")
-
-    add_derivatives(log, args.dt)
-    window = summarise(log, args, thresholds)
-
-    slope, note = steer_convention_report(log["delta_measured"], log["delta"])
-    print(f"\nmeasured/commanded steer slope: {slope:.3f}" + (f"\n  {note}" if note else ""))
-
-    if window is None:
-        return
-
-    fit = fit_cornering_stiffness(log, slice(*window), mass, lf, lr)
-    print(f"\nCf = {fit['Cf']:,.0f} N/rad  (bracket [{fit['Cf_forward']:,.0f}, "
-          f"{fit['Cf_reverse']:,.0f}])")
-    print(f"Cr = {fit['Cr']:,.0f} N/rad  (bracket [{fit['Cr_forward']:,.0f}, "
-          f"{fit['Cr_reverse']:,.0f}])")
-    report(fit["Cf"], fit["Cr"], mass, lf, lr)
-
-    result = {
-        "Cf": fit["Cf"], "Cr": fit["Cr"], "mass": mass, "lf": lf, "lr": lr,
-        "target_speed": args.target_speed, "steer_deg": args.steer_deg,
-        "steady_t_start": log["t"][window[0]], "steady_t_end": log["t"][window[1] - 1],
-    }
-    with open(args.out, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"\nSaved: {args.out}")
-
-    if not args.no_plot:
-        plot_cornering_stiffness_fit(log, window, fit,
-                                     out_dir=args.plot_dir if args.save_plot else None,
-                                     show=not args.no_show)
-
-
-def run_sweep(world, centre, args, thresholds):
-    """Drive every (speed, steer) combination in --speeds x --steers, pool every settled
-    window's (alpha, Fy) pairs into one fit, and report per-trial Cf/Cr alongside the pooled
-    number.
+def collect_sweep_trials(world, centre, args, thresholds, video_factory=None):
+    """Drive every (speed, steer) combination in --speeds x --steers, fit each settled trial, and
+    pool -- the actual data-collection/estimation pipeline this whole script's report is built on.
 
     Why pool instead of just averaging Cf across trials: alpha_f/alpha_r and Fyf/Fyr both scale
     with the operating point, so a plain average of per-trial Cf weights a barely-turning 1 m/s
@@ -583,11 +494,20 @@ def run_sweep(world, centre, args, thresholds):
     least-squares fit is supposed to.
 
     Combinations are filtered before anything drives: R < --min-radius breaks the bicycle model's
-    small-angle assumption (documented next to bicycle.CIRCLE_SITES: ~9% kinematic error at R=5m,
-    ~4% at R=8m), and a_y > --max-ay is skipped because higher lateral acceleration measurably
-    increases body roll here -- run_single's own IMU-vs-kinematic gap check saw ~0.16 m/s^2 of
-    roll-induced bias at just 2.6 m/s^2 of a_y, which is exactly the contamination the whole rig
-    is built to avoid (see attach_imu's docstring).
+    small-angle assumption (~9% kinematic error at R=5m, ~4% at R=8m), and a_y > --max-ay is
+    skipped because higher lateral acceleration measurably increases body roll here -- a live
+    IMU-vs-kinematic gap check saw ~0.16 m/s^2 of roll-induced bias at just 2.6 m/s^2 of a_y,
+    which is exactly the contamination the whole rig is built to avoid (see attach_imu's
+    docstring).
+
+    video_factory(vehicle, trial) -> VideoRecorder|None, called right after a trial's vehicle is
+    spawned, before that trial drives. If it returns a recorder, this closes it once the trial's
+    drive finishes, before vehicle.destroy() (VideoRecorder's own lifecycle requirement -- the
+    camera is attached to the vehicle). None (the default) records nothing.
+
+    Returns (queued, pooled, by_speed, mass, lf, lr). pooled/by_speed are None if no trial ever
+    settled (queued may still be non-empty in that case); queued is [] only if nothing was queued
+    at all (every combination filtered out), in which case pooled/by_speed are also None.
     """
     speeds = [float(v) for v in args.speeds.split(",")]
     steers = [float(d) for d in args.steers.split(",")]
@@ -620,18 +540,20 @@ def run_sweep(world, centre, args, thresholds):
           f"(mass={mass:.0f} kg  lf={lf:.2f} m  lr={lr:.2f} m)")
     if not queued:
         print("nothing to run -- widen --speeds/--steers or relax --min-radius/--max-ay")
-        return
+        return queued, None, None, mass, lf, lr
 
     for n, trial in enumerate(queued, 1):
         v, d = trial["target_speed"], trial["steer_deg"]
         print(f"\n[{n}/{len(queued)}] v={v:.1f} m/s  delta={d:.1f}deg  "
               f"R~{trial['R']:.1f}m  a_y~{trial['a_y_est']:.2f} m/s^2")
         trial["window"] = None
-        vehicle = imu = log = None
+        vehicle = imu = log = recorder = None
         try:
             vehicle, _ = spawn_vehicle(world, centre, VEHICLE_BP)
             physics = vehicle.get_physics_control()
             imu, imu_queue = attach_imu(world, vehicle, physics.center_of_mass)
+            if video_factory is not None:
+                recorder = video_factory(vehicle, trial)
             log = drive_and_log(world, vehicle, physics, max_steer, args, v, math.radians(d),
                                 imu_queue, verbose=False)
         except Exception as exc:
@@ -640,6 +562,8 @@ def run_sweep(world, centre, args, thresholds):
             # the ones still queued after it -- print, clean up what exists, and move on.
             print(f"  trial failed ({exc!r}) -- skipping")
         finally:
+            if recorder is not None:
+                recorder.close()   # before vehicle.destroy(): the camera is attached to it
             if imu is not None:
                 imu.stop()
                 imu.destroy()
@@ -662,69 +586,35 @@ def run_sweep(world, centre, args, thresholds):
                   f"({t[window[1]-1]-t[window[0]]:.2f}s)")
 
     pooled = pool_trials(queued, mass, lf, lr)
-    if pooled is None:
-        print("\nno trial ever settled -- nothing to fit")
-        return
+    by_speed = pool_by_speed(queued, mass, lf, lr) if pooled is not None else None
+    return queued, pooled, by_speed, mass, lf, lr
 
-    print(f"\n{'v (m/s)':>8} {'delta (deg)':>12} {'R (m)':>7} {'a_y (m/s^2)':>12} "
-          f"{'Cf (N/rad)':>12} {'Cr (N/rad)':>12}")
-    for tr in queued:
-        if tr["window"] is None:
-            continue
-        fit = tr["fit"]
-        print(f"{tr['target_speed']:8.1f} {tr['steer_deg']:12.1f} {tr['R']:7.1f} "
-              f"{tr['a_y_est']:12.2f} {fit['Cf']:12,.0f} {fit['Cr']:12,.0f}")
-    print("  (large swings across rows -- especially at small a_y, where alpha/Fy are close to "
-          "the noise floor -- are the standard tell that a trial's estimate is unreliable, not "
-          "that the tire is nonlinear there; the pooled fit below already down-weights it.)")
 
-    by_speed = pool_by_speed(queued, mass, lf, lr)
-    print(f"\n{'speed (m/s)':>11} {'n steers':>8} {'Cf (N/rad)':>12} {'Cf spread':>10} "
-          f"{'Cr (N/rad)':>12} {'Cr spread':>10}")
-    for v in sorted({tr["target_speed"] for tr in queued}):
-        r = by_speed.get(v)
-        if r is None:
-            print(f"{v:11.1f} {0:8d} {'--':>12} {'--':>10} {'--':>12} {'--':>10}"
-                  f"   (nothing settled at this speed)")
+# --------------------------------------------------------------------------------------------
+# video + report
+# --------------------------------------------------------------------------------------------
+
+def make_video_factory(world, args):
+    """--record -> a collect_sweep_trials() video_factory(vehicle, trial) that opens one
+    VideoRecorder per (speed, steer) trial, named after that trial so a whole sweep's worth of
+    clips don't overwrite each other -- same auto-naming split mpc_mpc1.py uses for its own
+    --controller a b --record case, just keyed on (speed, steer) instead of controller name."""
+    if not args.record:
+        return None
+
+    rec_w, rec_h = (int(v) for v in args.record_res.lower().split("x"))
+
+    def factory(vehicle, trial):
+        suffix = f"v{trial['target_speed']:g}_d{trial['steer_deg']:g}"
+        if args.record == "auto":
+            video_path = os.path.join(args.video_dir, run_name(suffix) + ".mp4")
         else:
-            print(f"{v:11.1f} {r['n_trials']:8d} {r['Cf']:12,.0f} {r['Cf_spread_pct']:9.1f}% "
-                  f"{r['Cr']:12,.0f} {r['Cr_spread_pct']:9.1f}%")
-    print("  (spread = (max-min)/pooled_C across this speed's own steer angles -- wide spread "
-          "at low a_y is the noise floor, not nonlinearity; see run_sweep()'s per-trial table "
-          "above for the individual numbers behind it.)")
+            base, ext = os.path.splitext(args.record)
+            video_path = f"{base}_{suffix}{ext}"
+        return VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
+                             width=rec_w, height=rec_h, view=args.record_view)
 
-    print(f"\nPooled over {pooled['n_trials']} settled trials (all speeds together):")
-    print(f"Cf = {pooled['Cf']:,.0f} N/rad  (bracket [{pooled['Cf_forward']:,.0f}, "
-          f"{pooled['Cf_reverse']:,.0f}])")
-    print(f"Cr = {pooled['Cr']:,.0f} N/rad  (bracket [{pooled['Cr_forward']:,.0f}, "
-          f"{pooled['Cr_reverse']:,.0f}])")
-    report(pooled["Cf"], pooled["Cr"], mass, lf, lr)
-
-    result = {
-        "Cf": pooled["Cf"], "Cr": pooled["Cr"], "mass": mass, "lf": lf, "lr": lr,
-        "n_trials": pooled["n_trials"],
-        "by_speed": {
-            str(v): {"Cf": r["Cf"], "Cr": r["Cr"], "n_trials": r["n_trials"],
-                    "Cf_min": r["Cf_min"], "Cf_max": r["Cf_max"],
-                    "Cf_spread_pct": r["Cf_spread_pct"],
-                    "Cr_min": r["Cr_min"], "Cr_max": r["Cr_max"],
-                    "Cr_spread_pct": r["Cr_spread_pct"]}
-            for v, r in sorted(by_speed.items())
-        },
-        "trials": [
-            {"target_speed": tr["target_speed"], "steer_deg": tr["steer_deg"], "R": tr["R"],
-             "a_y_est": tr["a_y_est"], "Cf": tr["fit"]["Cf"], "Cr": tr["fit"]["Cr"]}
-            for tr in queued if tr["window"] is not None
-        ],
-    }
-    with open(args.out, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"\nSaved: {args.out}")
-
-    if not args.no_plot:
-        plot_cornering_stiffness_sweep(
-            queued, pooled, out_dir=args.plot_dir if args.save_plot else None,
-            show=not args.no_show)
+    return factory
 
 
 def main():
@@ -739,22 +629,16 @@ def main():
     parser.add_argument("--length", type=float, default=1000.0, help="pad length (m)")
 
     # ---- simulation ---- #
-    parser.add_argument("--times-run", type=float, default=5.0,
+    parser.add_argument("--times-run", type=float, default=20.0,
                         help="simulation speed relative to real time: 1 = real time, 2 = twice as "
                              "fast, and so on. The simulator has no clock of its own in "
                              "synchronous mode, so this is purely how long the client waits "
                              "between ticks")
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
-    parser.add_argument("--target-speed", type=float, default=5,
-                        help="single-run mode only (ignored with --sweep)")
-    parser.add_argument("--steer-deg", type=float, default=16.0,
-                        help="front wheel angle to hold, in degrees of actual wheel angle -- not "
-                             "a fraction of max_steer and not a radius. Single-run mode only "
-                             "(ignored with --sweep)")
     parser.add_argument("--settle-ticks", type=int, default=20,
                         help="ticks to let the car drop onto the surface before reporting")
     parser.add_argument("--duration", type=float, default=50,
-                        help="per-trial drive duration (s) -- applies to every trial in --sweep too")
+                        help="per-trial drive duration (s), applies to every trial")
     parser.add_argument("--pid-kp", type=float, default=0.7, help="speed-hold PID proportional gain")
     parser.add_argument("--pid-ki", type=float, default=0.15, help="speed-hold PID integral gain")
     parser.add_argument("--pid-kd", type=float, default=0.05, help="speed-hold PID derivative gain")
@@ -771,34 +655,65 @@ def main():
     parser.add_argument("--thresh-ay-dot", type=float, default=0.1, help="m/s^2")
 
     # ---- sweep ---- #
-    parser.add_argument("--sweep", action="store_true",
-                        help="drive every combination of --speeds x --steers instead of the "
-                             "single --target-speed/--steer-deg run, and pool every settled "
-                             "window into one Cf/Cr fit")
-    parser.add_argument("--speeds", default="1,2,4,6,8,10",
-                        help="comma-separated target speeds (m/s) for --sweep")
+    parser.add_argument("--speeds", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+                        help="comma-separated target speeds (m/s) -- every speed is driven and "
+                             "reported (table + slip-angle plot), then --max-cf-std-pct/"
+                             "--max-alpha-f-deg below decide which of them actually go into the "
+                             "final pooled Cf/Cr")
     parser.add_argument("--steers", default="6,9,12,16,20",
-                        help="comma-separated wheel angles (deg) for --sweep")
+                        help="comma-separated wheel angles (deg) -- every speed is driven at all "
+                             "of these (subject to --min-radius/--max-ay)")
     parser.add_argument("--min-radius", type=float, default=8.0,
-                        help="--sweep only: skip combos whose kinematic radius L/tan(delta) "
-                             "falls below this -- the bicycle model's small-angle assumption "
-                             "runs ~9%% off at R=5m, ~4%% at R=8m (see bicycle.CIRCLE_SITES)")
+                        help="skip combos whose kinematic radius L/tan(delta) falls below this "
+                             "-- the bicycle model's small-angle assumption runs ~9%% off at "
+                             "R=5m, ~4%% at R=8m")
     parser.add_argument("--max-ay", type=float, default=6.0,
-                        help="--sweep only: skip combos whose kinematic a_y = v^2*tan(delta)/L "
-                             "exceeds this (m/s^2) -- keeps clear of tire saturation and of the "
-                             "body-roll IMU contamination that grows with lateral acceleration")
+                        help="skip combos whose kinematic a_y = v^2*tan(delta)/L exceeds this "
+                             "(m/s^2) -- keeps clear of tire saturation and of the body-roll IMU "
+                             "contamination that grows with lateral acceleration")
+
+    # ---- speed selection (applied AFTER the full sweep drives, front AND rear both) ---- #
+    parser.add_argument("--max-cf-std-pct", type=float, default=10.0,
+                        help="drop a speed from the final pooled Cf/Cr if std(Cf) across that "
+                             "speed's own steer angles exceeds this %% of its own Cf -- the "
+                             "low-a_y noise-floor tell (this is what excluded 1-3 m/s by default "
+                             "before --speeds was widened to include them)")
+    parser.add_argument("--max-cr-std-pct", type=float, default=10.0,
+                        help="same as --max-cf-std-pct, rear axle (std(Cr) as %% of that speed's "
+                             "own Cr) -- checked separately since the rear fit generally has less "
+                             "signal (lower Fzr/alpha_r) and can fail this where the front passes")
+    parser.add_argument("--max-alpha-f-deg", type=float, default=7.0,
+                        help="drop a speed from the final pooled Cf/Cr if its largest |alpha_f| "
+                             "sample exceeds this many degrees -- the tell that a speed is "
+                             "pushing this speed/steer combo's tire response out of the linear "
+                             "region the whole rig assumes")
+    parser.add_argument("--max-alpha-r-deg", type=float, default=7.0,
+                        help="same as --max-alpha-f-deg, rear axle")
+    parser.add_argument("--no-select", action="store_true",
+                        help="skip speed selection -- pool every driven speed into the final "
+                             "Cf/Cr instead of only the ones passing the --max-c*-std-pct/"
+                             "--max-alpha-*-deg thresholds on both axles")
 
     # ---- output ---- #
-    parser.add_argument("--out", default=os.path.join(HERE, "cornering_stiffness.json"),
-                        help="where to write Cf/Cr/mass/lf/lr -- estimate_yaw_inertia.py's "
-                             "--cf-cr-file defaults to reading this exact path")
-    parser.add_argument("--no-plot", action="store_true", help="skip the alpha/Fy fit plot")
-    parser.add_argument("--save-plot", action="store_true", help="also save the plot as a PNG")
+    parser.add_argument("--out", default=os.path.join(HERE, "cornering_stiffness_speed_report.json"),
+                        help="where to write the per-speed/pooled Cf/Cr summary (scalars only, no "
+                             "raw per-tick arrays)")
+    parser.add_argument("--no-plot", action="store_true", help="skip every figure, print only")
+    parser.add_argument("--save-plot", action="store_true", help="also save the figures as PNGs")
     parser.add_argument("--no-show", action="store_true",
-                        help="build (and, with --save-plot, save) the figure but never call "
-                             "plt.show() -- for headless/background runs where nothing will be "
-                             "there to close the window")
+                        help="build (and, with --save-plot, save) the figures but never call "
+                             "plt.show() -- for headless/background runs")
     parser.add_argument("--plot-dir", default=os.path.join(HERE, "plots"))
+
+    # ---- video ---- #
+    parser.add_argument("--record", nargs="?", const="auto", default="",
+                        help="record every trial to its own mp4; bare flag auto-names each clip "
+                             "under --video-dir")
+    parser.add_argument("--video-dir", default=os.path.join(HERE, "videos"),
+                        help="where auto-named recordings go")
+    parser.add_argument("--record-view", default="chase", choices=sorted(VIEWS),
+                        help="camera mount for the recordings")
+    parser.add_argument("--record-res", default="1280x720", help="recording resolution, WxH")
     args = parser.parse_args()
 
     client = carla.Client(args.host, args.port)
@@ -818,10 +733,108 @@ def main():
         "a_y_dot": args.thresh_ay_dot,
     }
 
-    if args.sweep:
-        run_sweep(world, centre, args, thresholds)
+    video_factory = make_video_factory(world, args)
+    queued, pooled, by_speed, mass, lf, lr = collect_sweep_trials(
+        world, centre, args, thresholds, video_factory=video_factory)
+
+    if not queued:
+        return   # collect_sweep_trials already printed why
+    if pooled is None:
+        print("\nno trial ever settled -- nothing to report")
+        return
+
+    # ---- report basis: every driven speed, unfiltered -- the evidence the selection below acts on
+    print_cornering_stiffness_speed_table(queued, by_speed)
+    if not args.no_plot:
+        plot_speed_slip_angle(
+            queued, out_dir=args.plot_dir if args.save_plot else None, show=not args.no_show)
+
+    # ---- select which speeds go into the final pooled Cf/Cr (front AND rear both) ---- #
+    def _drop_reasons(s):
+        """Every reason this speed's stats fail the thresholds, front axle then rear -- empty
+        means it's kept. One function shared by the selected_speeds filter and the "why dropped"
+        print below, so the two can never disagree the way they briefly did when the reason
+        printer had its own copy of this logic (a NaN Cf_std_pct silently passed `nan >
+        threshold`, dropping the speed but printing no reason for it).
+        """
+        reasons = []
+        if not math.isfinite(s["Cf_std_pct"]):
+            reasons.append("Cf fit is NaN (alpha_f-Fyf correlation not consistently signed at "
+                           "this speed -- unusable, not just noisy)")
+        elif s["Cf_std_pct"] > args.max_cf_std_pct:
+            reasons.append(f"Cf std {s['Cf_std_pct']:.1f}% > {args.max_cf_std_pct:.1f}%")
+        if s["alpha_f_max_deg"] > args.max_alpha_f_deg:
+            reasons.append(f"alpha_f {s['alpha_f_max_deg']:.2f} deg > {args.max_alpha_f_deg:.1f} deg")
+        if not math.isfinite(s["Cr_std_pct"]):
+            reasons.append("Cr fit is NaN (alpha_r-Fyr correlation not consistently signed at "
+                           "this speed -- unusable, not just noisy)")
+        elif s["Cr_std_pct"] > args.max_cr_std_pct:
+            reasons.append(f"Cr std {s['Cr_std_pct']:.1f}% > {args.max_cr_std_pct:.1f}%")
+        if s["alpha_r_max_deg"] > args.max_alpha_r_deg:
+            reasons.append(f"alpha_r {s['alpha_r_max_deg']:.2f} deg > {args.max_alpha_r_deg:.1f} deg")
+        return reasons
+
+    stats = cornering_stiffness_speed_stats(queued, by_speed)
+    if args.no_select:
+        selected_speeds = sorted(stats)
     else:
-        run_single(world, centre, args, thresholds)
+        selected_speeds = sorted(v for v, s in stats.items() if not _drop_reasons(s))
+    dropped_speeds = sorted(set(stats) - set(selected_speeds))
+
+    print(f"\nSpeed selection (--max-cf-std-pct {args.max_cf_std_pct:.1f}, "
+          f"--max-cr-std-pct {args.max_cr_std_pct:.1f}, "
+          f"--max-alpha-f-deg {args.max_alpha_f_deg:.1f}, "
+          f"--max-alpha-r-deg {args.max_alpha_r_deg:.1f}"
+          f"{', DISABLED (--no-select)' if args.no_select else ''}):")
+    print(f"  kept:    {', '.join(f'{v:g}' for v in selected_speeds) or '(none)'} m/s")
+    for v in dropped_speeds:
+        print(f"  dropped {v:g} m/s: {'; '.join(_drop_reasons(stats[v]))}")
+
+    if not selected_speeds:
+        print("\nno speed survived selection -- widen --max-cf-std-pct/--max-alpha-f-deg")
+        return
+
+    # ---- final Cf/Cr, pooled over only the selected speeds ---- #
+    selected_trials = [tr for tr in queued
+                       if tr.get("fit") is not None and tr["target_speed"] in selected_speeds]
+    final_pooled = pool_trials(selected_trials, mass, lf, lr)
+    final_by_speed = pool_by_speed(selected_trials, mass, lf, lr)
+
+    print(f"\nFinal Cf/Cr, pooled over {final_pooled['n_trials']} trials at the "
+          f"{len(selected_speeds)} selected speed(s):")
+    print(f"Cf = {final_pooled['Cf']:,.0f} N/rad  (bracket [{final_pooled['Cf_forward']:,.0f}, "
+          f"{final_pooled['Cf_reverse']:,.0f}])")
+    print(f"Cr = {final_pooled['Cr']:,.0f} N/rad  (bracket [{final_pooled['Cr_forward']:,.0f}, "
+          f"{final_pooled['Cr_reverse']:,.0f}])")
+    report(final_pooled["Cf"], final_pooled["Cr"], mass, lf, lr)
+
+    result = {
+        "Cf": final_pooled["Cf"], "Cr": final_pooled["Cr"], "mass": mass, "lf": lf, "lr": lr,
+        "n_trials": final_pooled["n_trials"],
+        "selected_speeds": selected_speeds,
+        "dropped_speeds": dropped_speeds,
+        "selection": {"max_cf_std_pct": args.max_cf_std_pct, "max_cr_std_pct": args.max_cr_std_pct,
+                     "max_alpha_f_deg": args.max_alpha_f_deg,
+                     "max_alpha_r_deg": args.max_alpha_r_deg, "disabled": args.no_select},
+        "by_speed": {
+            str(v): {"Cf": r["Cf"], "Cr": r["Cr"], "n_trials": r["n_trials"],
+                    "Cf_min": r["Cf_min"], "Cf_max": r["Cf_max"],
+                    "Cf_spread_pct": r["Cf_spread_pct"],
+                    "Cr_min": r["Cr_min"], "Cr_max": r["Cr_max"],
+                    "Cr_spread_pct": r["Cr_spread_pct"]}
+            for v, r in sorted(final_by_speed.items())
+        },
+        # every driven speed's own diagnostics, selected or not -- the record of why
+        "all_speed_stats": {str(v): s for v, s in sorted(stats.items())},
+    }
+    with open(args.out, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"\nSaved: {args.out}")
+
+    if not args.no_plot:
+        plot_cornering_stiffness_speed_bands(
+            selected_trials, final_pooled, final_by_speed,
+            out_dir=args.plot_dir if args.save_plot else None, show=not args.no_show)
 
 
 if __name__ == "__main__":

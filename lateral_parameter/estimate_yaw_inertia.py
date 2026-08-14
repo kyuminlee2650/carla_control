@@ -88,6 +88,8 @@ from functions import PID, CollisionWatch, LowPassFilter, clipping, get_vehicle_
 
 import carla
 
+from viz_utils import VIEWS, VideoRecorder, run_name
+
 from bicycle import (bracket, centered_integral_pair, fit_inertia_derivative, fit_inertia_integral,
                      front_steer_angle, report, steady_yaw_rate, steer_convention_report,
                      transient_span, zero_phase_derivative, yaw_mode)
@@ -377,6 +379,12 @@ def spawn_airborne(world, blueprint, base_transform, height, imu_bp, settle_tick
     The settle ticks matter: a freshly spawned actor reports zero velocity for a tick or two while
     UE4 registers the body, and an impulse applied inside that window hits a body that is not yet
     integrating.
+
+    Cleans up its own actors if anything here raises (e.g. the settle loop's IMU wait timing out
+    right after a fresh map load, while the server is still streaming assets) -- without this, a
+    failure here leaks the vehicle/IMU, and the very next spawn_actor() at the same base_transform
+    then fails with "collision at spawn position", turning one transient timeout into every
+    subsequent trial failing too.
     """
     transform = carla.Transform(
         carla.Location(base_transform.location.x, base_transform.location.y,
@@ -384,18 +392,26 @@ def spawn_airborne(world, blueprint, base_transform, height, imu_bp, settle_tick
         base_transform.rotation,
     )
     vehicle = world.spawn_actor(blueprint, transform)
-    vehicle.set_simulate_physics(True)
-    vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-    vehicle.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-    # hands off the controls -- a brake command would spin up wheel physics we do not want
-    vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0, hand_brake=False))
+    try:
+        vehicle.set_simulate_physics(True)
+        vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        vehicle.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        # hands off the controls -- a brake command would spin up wheel physics we do not want
+        vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0, hand_brake=False))
 
-    imu_queue = queue.Queue()
-    imu = world.spawn_actor(imu_bp, carla.Transform(), attach_to=vehicle)
-    imu.listen(imu_queue.put)
-    for _ in range(settle_ticks):
-        world.tick()
-        imu_queue.get(timeout=2.0)
+        imu_queue = queue.Queue()
+        imu = world.spawn_actor(imu_bp, carla.Transform(), attach_to=vehicle)
+    except Exception:
+        vehicle.destroy()
+        raise
+    try:
+        imu.listen(imu_queue.put)
+        for _ in range(settle_ticks):
+            world.tick()
+            imu_queue.get(timeout=2.0)
+    except Exception:
+        imu.stop(); imu.destroy(); vehicle.destroy()
+        raise
     return vehicle, imu, imu_queue
 
 
@@ -434,9 +450,16 @@ def fit_decay(t, r):
     return float(sign * math.exp(intercept)), float(-1.0 / slope)
 
 
-def measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args):
-    """Phase 2: angular impulse about z, then log the spin-down."""
+def measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args, video_factory=None):
+    """Phase 2: angular impulse about z, then log the spin-down.
+
+    video_factory(vehicle, J) -> VideoRecorder|None, called right after the vehicle is spawned
+    airborne, before the angular impulse is applied. If it returns a recorder, this closes it
+    once the decay window finishes, before vehicle.destroy() (VideoRecorder's own lifecycle
+    requirement -- the camera is attached to the vehicle). None (the default) records nothing.
+    """
     vehicle, imu, imu_queue = spawn_airborne(world, blueprint, base_transform, args.height, imu_bp)
+    recorder = video_factory(vehicle, J) if video_factory is not None else None
     try:
         vehicle.add_angular_impulse(carla.Vector3D(0.0, 0.0, J))
         ts, rz, rx, ry = [], [], [], []
@@ -452,7 +475,45 @@ def measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args):
                "r0": r0, "tau": tau,
                "cross_axis": float(max(np.max(np.abs(rx)), np.max(np.abs(ry))))}
     finally:
+        if recorder is not None:
+            recorder.close()   # before vehicle.destroy(): the camera is attached to it
         imu.stop(); imu.destroy(); vehicle.destroy()
+
+
+def make_video_factory(world, args):
+    """--record -> a measure_yaw_impulse() video_factory(vehicle, J) that opens one VideoRecorder
+    per airborne trial, named after its impulse magnitude so the probe trial and every sweep
+    trial get their own clip instead of overwriting each other -- same per-trial auto-naming
+    estimate_cornering_stiffness.py uses for its own --record, keyed on J here instead of
+    (speed, steer)."""
+    if not args.record:
+        return None
+
+    rec_w, rec_h = (int(v) for v in args.record_res.lower().split("x"))
+
+    def factory(vehicle, J):
+        suffix = f"J{J:,.0f}".replace(",", "")
+        if args.record == "auto":
+            video_path = os.path.join(args.video_dir, run_name(suffix) + ".mp4")
+        else:
+            base, ext = os.path.splitext(args.record)
+            video_path = f"{base}_{suffix}{ext}"
+        return VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
+                             width=rec_w, height=rec_h, view=args.record_view)
+
+    return factory
+
+
+def print_yaw_impulse_table(trials, targets):
+    """Per-trial J / target rate / measured r0 / decay tau / Iz under both unit candidates /
+    cross-axis leakage -- the plain-text companion to the spin-down and linearity figures
+    (save_plots()'s impulse branch): the numbers those two plots are drawn from, in one place.
+    """
+    print(f"\n{'target (deg/s)':>15} {'J':>12} {'r0 (deg/s)':>11} {'tau (s)':>8} "
+          f"{'Iz [rad] (kg*m^2)':>18} {'Iz [deg] (kg*m^2)':>18} {'cross-axis (rad/s)':>19}")
+    for target, t in zip(targets, trials):
+        print(f"{target:15.1f} {t['J']:12,.0f} {math.degrees(t['r0']):11.2f} {t['tau']:8.2f} "
+              f"{t['Iz_if_rad']:18,.0f} {t['Iz_if_deg']:18,.0f} {t['cross_axis']:19.4f}")
 
 
 def method_impulse(world, args):
@@ -490,8 +551,11 @@ def method_impulse(world, args):
     # there are four candidate conventions. Rather than pick one, probe the actual scale with a
     # small impulse and size the real sweep from it, so the spin is large enough to measure
     # properly and to fit the damping on.
+    video_factory = make_video_factory(world, args)
+
     print("\n=== phase 2a: probing the angular impulse scale ===")
-    probe_t = measure_yaw_impulse(world, blueprint, base_transform, imu_bp, args.probe_impulse, args)
+    probe_t = measure_yaw_impulse(world, blueprint, base_transform, imu_bp, args.probe_impulse, args,
+                                  video_factory=video_factory)
     scale = probe_t["r0"] / args.probe_impulse    # rad/s produced per unit of J
     print(f"  J={args.probe_impulse:,.0f} -> r0={probe_t['r0']:.3e} rad/s   "
           f"=> {scale:.3e} rad/s per unit J")
@@ -505,7 +569,8 @@ def method_impulse(world, args):
     print("\n=== phase 2b: angular impulse about z ===")
     trials = []
     for J in impulses:
-        t = measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args)
+        t = measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args,
+                                video_factory=video_factory)
         t["Iz_if_rad"] = J / t["r0"] if t["r0"] else float("nan")
         t["Iz_if_deg"] = J / math.degrees(t["r0"]) if t["r0"] else float("nan")
         trials.append(t)
@@ -515,6 +580,8 @@ def method_impulse(world, args):
         if t["cross_axis"] > args.cross_axis_tol:
             print(f"    WARNING: roll/pitch rate reached {t['cross_axis']:.3f} rad/s -- the z "
                   f"impulse is exciting other axes, so gyro.z is not a clean measurement here.")
+
+    print_yaw_impulse_table(trials, targets)
 
     iz_rad_all = np.array([t["Iz_if_rad"] for t in trials])
     spread = (iz_rad_all.max() - iz_rad_all.min()) / iz_rad_all.mean()
@@ -579,7 +646,10 @@ def main():
     parser.add_argument("--times-run", type=float, default=25.0, help="how times for simulation running?")
 
     # ---- method = step ---- #
-    parser.add_argument("--cf-cr-file", default=os.path.join(HERE, "cornering_stiffness.json"))
+    parser.add_argument("--cf-cr-file",
+                        default=os.path.join(HERE, "cornering_stiffness_speed_report.json"),
+                        help="Cf/Cr/mass/lf/lr source -- estimate_cornering_stiffness.py's own "
+                             "--out")
     parser.add_argument("--speeds", default="5,6,7,8", help="cruise speeds to step from (m/s)")
     parser.add_argument("--steer-deg", type=float, default=9.0,
                         help="step steer magnitude (deg) -- kept in the range Cf/Cr were "
@@ -617,11 +687,28 @@ def main():
     parser.add_argument("--decay-time", type=float, default=1.0)
     parser.add_argument("--cross-axis-tol", type=float, default=0.05)
 
+    # ---- video (method = impulse only) ---- #
+    parser.add_argument("--record", nargs="?", const="auto", default="",
+                        help="record each airborne trial (probe + sweep) to its own mp4; bare "
+                             "flag auto-names each clip under --video-dir. method=impulse only")
+    parser.add_argument("--video-dir", default=os.path.join(HERE, "videos"),
+                        help="where auto-named recordings go")
+    parser.add_argument("--record-view", default="top", choices=sorted(VIEWS),
+                        help="camera mount for the recordings -- 'top' (default) reads the yaw "
+                             "spin most clearly since the body-rigid-attached camera co-rotates "
+                             "with the car, so a top-down view shows the ground visibly spinning "
+                             "beneath an apparently still car")
+    parser.add_argument("--record-res", default="1280x720", help="recording resolution, WxH")
+
     parser.add_argument("--out", default=None,
                         help="defaults to yaw_inertia.json (step) or yaw_inertia_impulse.json "
                              "(impulse)")
     parser.add_argument("--plot-dir", default=os.path.join(HERE, "plots"))
     parser.add_argument("--save-plot", action="store_true")
+    parser.add_argument("--no-show", action="store_true",
+                        help="build (and, with --save-plot, save) the figure but never call "
+                             "plt.show() -- for headless/background runs where nothing will be "
+                             "there to close the window")
     args = parser.parse_args()
 
     out_path = args.out or os.path.join(
@@ -673,7 +760,9 @@ def main():
 
 
 def save_plots(results, plot_data, args):
-    from viz_utils import COLOR_AXIS, COLOR_BLUE, COLOR_ORANGE, _legend, _save, _style_axes, COLOR_BG
+    from viz_utils import (COLOR_AXIS, COLOR_BLUE, COLOR_ORANGE, COLOR_INK, COLOR_MUTED,
+                           FONTSIZE_LABEL, FONTSIZE_TICK, LINEWIDTH, LINEWIDTH_THIN, MARKERSIZE,
+                           _legend, _save, _style_axes, _title, COLOR_BG)
     import matplotlib.pyplot as plt
 
     fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
@@ -692,7 +781,7 @@ def save_plots(results, plot_data, args):
             ax_a.plot(trial["t"][fs:fe], np.degrees(trial["r"][fs:fe]), linewidth=3, alpha=0.25,
                       color=COLOR_ORANGE)
         ax_a.set_xlabel("time from step (s)"); ax_a.set_ylabel("yaw rate r (deg/s)")
-        ax_a.set_title("Step response (shaded = window used for the fit)")
+        _title(ax_a, "Step response (shaded = window used for the fit)")
 
         S, R = plot_data["S"], plot_data["R"]
         Iz, lo, hi = results["Iz"], results["Iz_forward"], results["Iz_reverse"]
@@ -703,29 +792,58 @@ def save_plots(results, plot_data, args):
                           label=f"bracket [{lo:,.0f}, {hi:,.0f}]")
         ax_b.set_xlabel("yaw rate, centred per trial (rad/s)")
         ax_b.set_ylabel("delivered angular impulse, centred (N*m*s)")
-        ax_b.set_title("Yaw inertia fit: integral(M dt) = Iz * (r - r0)")
+        _title(ax_b, "Yaw inertia fit: integral(M dt) = Iz * (r - r0)")
         stem = "yaw_inertia_step"
+        _legend(ax_a); _legend(ax_b)
     else:
-        for t in results["trials"]:
-            ax_a.plot(t["t"], np.degrees(t["r_z"]), linewidth=1.4, label=f"J={t['J']:,.0f}")
-            ax_a.plot(0.0, math.degrees(t["r0"]), marker="o", markersize=5, color=COLOR_AXIS)
+        trials = results["trials"]
+        rates = [abs(math.degrees(t["r0"])) for t in trials]
+        cmap = plt.get_cmap("plasma")
+        rate_norm = (plt.Normalize(min(rates), max(rates)) if len(set(rates)) > 1 else None)
+        rate_color = ({t["J"]: cmap(rate_norm(abs(math.degrees(t["r0"])))) for t in trials}
+                     if rate_norm else {trials[0]["J"]: cmap(0.5)})
+
+        for t in trials:
+            color = rate_color[t["J"]]
+            t_arr = np.asarray(t["t"], dtype=float)
+            ax_a.plot(t_arr, np.degrees(t["r_z"]), color=color, linewidth=LINEWIDTH, alpha=0.85,
+                     zorder=2)
+            # r(t) = r0*exp(-t/tau), the fit actually used, overlaid on its own raw trace so the
+            # fit is visually checkable rather than just trusting the r0 dot at t=0.
+            r_fit_deg = math.degrees(t["r0"]) * np.exp(-t_arr / t["tau"]) if math.isfinite(t["tau"]) else np.full_like(t_arr, math.degrees(t["r0"]))
+            ax_a.plot(t_arr, r_fit_deg, color=COLOR_INK, linewidth=LINEWIDTH_THIN,
+                     linestyle="--", zorder=3)
+            ax_a.scatter([0.0], [math.degrees(t["r0"])], s=MARKERSIZE, facecolor=color,
+                        edgecolor=COLOR_BG, linewidth=0.6, zorder=4)
         ax_a.set_xlabel("time after impulse (s)"); ax_a.set_ylabel("yaw rate (deg/s)")
-        ax_a.set_title("Airborne spin-down (dots = damping-corrected r0)")
+        _title(ax_a, "Airborne spin-down (dashed = r0*exp(-t/tau) fit)")
 
-        r0s = [t["r0"] for t in results["trials"]]
-        js = [t["J"] for t in results["trials"]]
+        r0s = [t["r0"] for t in trials]
+        js = [t["J"] for t in trials]
         Iz_rad = results["Iz_raw_rad"]
-        ax_b.scatter(r0s, js, color=COLOR_BLUE, zorder=3, label="measured")
+        for t in trials:
+            ax_b.scatter([t["r0"]], [t["J"]], s=MARKERSIZE, facecolor=rate_color[t["J"]],
+                        edgecolor=COLOR_BG, linewidth=0.6, zorder=3)
         xs = np.linspace(0, max(r0s) * 1.05, 20)
-        ax_b.plot(xs, Iz_rad * xs, color=COLOR_BLUE, linestyle="--", label=f"Iz={Iz_rad:,.0f}")
+        ax_b.plot(xs, Iz_rad * xs, color=COLOR_INK, linewidth=LINEWIDTH * 1.2, linestyle="--",
+                 zorder=2, label=f"Iz={Iz_rad:,.0f} kg*m^2 [if rad]")
         ax_b.set_xlabel("yaw rate step r0 (rad/s)"); ax_b.set_ylabel("applied angular impulse J")
-        ax_b.set_title("Linearity: J = Iz * r0")
+        _title(ax_b, "Linearity: J = Iz * r0")
         stem = "yaw_inertia_impulse"
+        _legend(ax_b)   # ax_a's lines are unlabeled -- color already carries |r0| via the colorbar
 
-    _legend(ax_a); _legend(ax_b)
+        if rate_norm is not None:
+            sm = plt.cm.ScalarMappable(norm=rate_norm, cmap=cmap)
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=[ax_a, ax_b], pad=0.02, aspect=30)
+            cbar.set_label("|r0| (deg/s)", fontsize=FONTSIZE_LABEL, color=COLOR_MUTED)
+            cbar.ax.tick_params(colors=COLOR_MUTED, labelsize=FONTSIZE_TICK)
+            cbar.outline.set_visible(False)
+
     os.makedirs(args.plot_dir, exist_ok=True)
     print(f"Figure saved: {_save(fig, args.plot_dir, stem)}")
-    plt.show()
+    if not args.no_show:
+        plt.show()
     plt.close(fig)
 
 
