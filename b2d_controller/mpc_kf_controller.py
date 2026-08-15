@@ -1,7 +1,10 @@
-r"""B2D/VAD closed-loop controller: LateralMPC (carla_control's own LPV bicycle-model QP) + a plain
-speed-error PID + VyKalmanFilter's v_y estimate, meant to replace team_code/pid_controller.py's
+r"""B2D/VAD closed-loop controller: LateralMPC + SpeedMPC (carla_control's own LPV-bicycle-model and
+scalar-integrator QPs) + a speed-error PID pedal tracker + VyKalmanFilter's v_y estimate, meant to
+replace team_code/pid_controller.py's
 PIDController inside team_code/vad_b2d_agent.py's run_step() (see that file's line ~396:
-`self.pidcontroller.control_pid(out_truck, tick_data['speed'], local_command_xy)`).
+`self.pidcontroller.control_pid(out_truck, tick_data['speed'], local_command_xy)` -- this file's own
+control_pid() drops the local_command_xy arg entirely, see point 1 below for why, so the call site
+needs that argument removed, not just renamed).
 
 Self-contained on purpose (no import of carla_control/ or kalman_filter/): this file has to run
 inside the b2d_zoo conda env / the submission .sif, which has no reason to also carry
@@ -13,10 +16,16 @@ own docstrings focus on what's DIFFERENT about running them here.
 Four things are different from carla_control's own driving scripts, and why:
 
 1. No known map route -- VAD's own ~6-waypoint ego-frame prediction (`out_truck`, already cumsum'd
-   from per-step displacements) plus one route-command point (`target`) is all there is each tick.
-   build_trajectory_splines() fits a PathSpline (functions.py's own class, copied verbatim -- its
-   docstring already anticipated this exact use: "sparser planner output like VAD later") directly
-   to those ~8 points instead of a GlobalRoutePlanner route, PLUS a companion vx(s) spline built
+   from per-step displacements) plus the ego origin is all there is each tick (7 points total; no
+   route-command point mixed in -- local_command_xy is a global-route-following aim that
+   pid_controller.py's own steering logic only uses as a same-tick fallback/override for a single
+   angle, never fits into a continuous curve with the waypoints -- see reference_upstream/
+   pid_controller.py's control_pid(). Fitting it into this geometry/speed spline risked bending the
+   fit toward a direction VAD's own local planning never predicted, for a point this controller
+   never actually needs). build_trajectory_splines() fits a PathSpline (functions.py's own class,
+   copied verbatim -- its docstring already anticipated this exact use: "sparser planner output
+   like VAD later") directly to those 7 points instead of a GlobalRoutePlanner route, PLUS a
+   companion vx(s) spline built
    from the waypoints' own known timing (confirmed 0.5s apart -- Bench2DriveZoo/docs/
    CONVERT_GUIDE.md: "Bench2Drive runs at 10Hz... window length... 0.5s"). x0's e_y is 0 and e_psi
    is path.yaw(0) by construction every tick (ego is redefined as the origin of a fresh ego-frame
@@ -41,12 +50,11 @@ Four things are different from carla_control's own driving scripts, and why:
    "primal infeasible" almost every tick. A real speed profile (even this coarse a fit) keeps most
    of the horizon off the floor as soon as the plan says to actually accelerate, which fixes it.
 
-Coordinate convention: VAD's own waypoints/target are [lateral, forward] (index 0 sideways, index 1
+Coordinate convention: VAD's own waypoints are [lateral, forward] (index 0 sideways, index 1
 ahead) -- confirmed by pid_controller.py's own `angle = degrees(pi/2 - atan2(aim[1], aim[0]))`
 formula, which only zeroes out on a straight-ahead point under that ordering. Every function below
-takes/returns that native [lateral, forward] ordering at its public boundary (to keep the
-vad_b2d_agent.py call site a near-drop-in replacement for control_pid()) and converts internally to
-this file's own [forward, lateral] convention (matching carla_control's C(v_x)/x0/PathSpline sign
+takes/returns that native [lateral, forward] ordering at its public boundary and converts internally
+to this file's own [forward, lateral] convention (matching carla_control's C(v_x)/x0/PathSpline sign
 convention) wherever the math needs it.
 """
 import math
@@ -298,6 +306,120 @@ class LateralMPC:
         return float(np.clip(u[0], -self.delta_max, self.delta_max))
 
 
+# ----------------------------------------------------------------------------- SpeedMPC
+# Copy of carla_control/longitudinal_mpc.py's SpeedMPC -- unchanged math (see that file's own class
+# docstring for the QP derivation: a scalar first-order-integrator plant, x_{k+1} = x_k + T*a_k,
+# condensed the same way LateralMPC is). Unlike LateralMPC, H/A here don't depend on the vx preview
+# (the plant here has no scheduling parameter), so this one is built once in __init__ and reused via
+# solver.update() every solve() -- see that docstring for why that's safe here but not for
+# LateralMPC. mpc_mpc_comparison.py's own MpcLongitudinal wraps this with a LUT-feedforward+PID
+# pedal layer calibrated from real CARLA get_physics_control() data (longitudinal_lookup/); that
+# calibration file has no reason to exist inside the .sif, so MpcKfController.control_pid() instead
+# turns this class's own a_cmd into a one-step-ahead desired_speed (speed + a_cmd*dt, consistent
+# with the QP's own plant equation) and hands that to the same speed-error SimplePID pedal tracker
+# the file used before SpeedMPC existed -- see control_pid()'s own comment at the call site.
+
+class SpeedMPC:
+    """Speed-tracking MPC over a scalar first-order integrator: x_k = v_{x,k}, x_{k+1} = A x_k +
+    B a_{x,k}, A=1, B=T. Decision variable is the acceleration sequence itself -- free for the
+    first Nc steps of the horizon Np (Nc <= Np) and held at its last value after that. See
+    carla_control/longitudinal_mpc.py's own SpeedMPC docstring for the full condensed-QP derivation
+    (H/A built once here since neither depends on Uprev; only q and the rate half of l/u move each
+    solve(), via Uprev) -- unchanged here."""
+
+    def __init__(self, dt, n_p, n_c, w_v, w_a, w_j, a_min=-4.05, a_max=2.4, jerk_max=4.13):
+        if not (0 < n_c <= n_p):
+            raise ValueError(f"need 0 < n_c <= n_p, got n_c={n_c}, n_p={n_p}")
+        if not (a_min < a_max):
+            raise ValueError(f"need a_min < a_max, got a_min={a_min}, a_max={a_max}")
+        if not (jerk_max > 0):
+            raise ValueError(f"need jerk_max > 0, got jerk_max={jerk_max}")
+
+        self.T = dt
+        self.n_p = n_p
+        self.n_c = n_c
+        self.a_min = a_min
+        self.a_max = a_max
+        self.jerk_max = jerk_max
+
+        self.A = 1.0   # fixed by the problem: x_{k+1} = A x_k + B a_{x,k}
+        self.B = dt
+
+        self.A_bar = np.full((n_p, 1), self.A)   # A^i = 1 for every i since A=1
+        self.B_bar = self._build_b_bar()
+        self.Phi = self._build_phi()
+
+        W1 = w_v * np.eye(n_p)
+        W2 = w_a * np.eye(n_c)
+        W3 = w_j * np.eye(n_c)   # Phi is now n_c x n_c (see _build_phi), not n_c-1
+
+        self.H = 2.0 * (self.B_bar.T @ W1 @ self.B_bar + W2 + self.Phi.T @ W3 @ self.Phi)
+        self.H = 0.5 * (self.H + self.H.T)      # symmetrize against round-off
+        self._B_W1 = 2.0 * self.B_bar.T @ W1        # reused every cycle to form f
+        self._2PhiT_W3 = 2.0 * self.Phi.T @ W3      # reused every cycle for f's Uprev cross term
+
+        self._A_ineq = sparse.csc_matrix(np.vstack([np.eye(n_c), self.Phi]))
+        self._a_l = a_min * np.ones(n_c)
+        self._a_u = a_max * np.ones(n_c)
+
+        self._solver = osqp.OSQP()
+        self._solver.setup(
+            P=sparse.csc_matrix(self.H),
+            q=np.zeros(n_c),
+            A=self._A_ineq,
+            l=np.concatenate([self._a_l, -jerk_max * dt * np.ones(n_c)]),
+            u=np.concatenate([self._a_u, jerk_max * dt * np.ones(n_c)]),
+            verbose=False,
+            polish=False,
+        )
+        self.last_solution = np.zeros(n_c)
+        self.last_status = "unsolved"
+
+    def _build_b_bar(self):
+        B_bar = np.zeros((self.n_p, self.n_c))
+        for i in range(1, self.n_p + 1):
+            for c in range(1, self.n_c + 1):
+                if c < self.n_c:
+                    if c <= i:
+                        B_bar[i - 1, c - 1] = self.B
+                elif i >= self.n_c:
+                    B_bar[i - 1, c - 1] = (i - self.n_c + 1) * self.B
+        return B_bar
+
+    def _build_phi(self):
+        Phi = np.eye(self.n_c)
+        for l in range(1, self.n_c):
+            Phi[l, l - 1] = -1.0
+        return Phi
+
+    def solve(self, v_x, v_ref_preview):
+        """One receding-horizon step. v_ref_preview: length-Np sequence of desired speed at each
+        future prediction step. Returns a_cmd, the acceleration to hand the pedal layer, clipped to
+        [a_min, a_max]."""
+        x_ref = np.asarray(v_ref_preview, dtype=float).reshape(-1, 1)
+        u_prev = np.zeros((self.n_c, 1))
+        u_prev[0, 0] = self.last_solution[0]
+
+        f = self._B_W1 @ (self.A_bar * v_x - x_ref) - self._2PhiT_W3 @ u_prev
+
+        rate_l = -self.jerk_max * self.T + u_prev.ravel()
+        rate_u = self.jerk_max * self.T + u_prev.ravel()
+        l_full = np.concatenate([self._a_l, rate_l])
+        u_full = np.concatenate([self._a_u, rate_u])
+
+        self._solver.update(q=f.ravel(), l=l_full, u=u_full)
+        result = self._solver.solve()
+        self.last_status = result.info.status
+
+        if result.x is None or not np.all(np.isfinite(result.x)):
+            u = self.last_solution
+        else:
+            u = result.x
+            self.last_solution = u.copy()
+
+        return float(np.clip(u[0], self.a_min, self.a_max))
+
+
 # ----------------------------------------------------------------------------- PathSpline
 # Copy of carla_control/functions.py's PathSpline + _chord_length_station -- unchanged math. Its
 # own docstring already anticipated exactly this use ("sparser planner output like VAD later").
@@ -339,38 +461,43 @@ class PathSpline:
         return (dx * ddy - dy * ddx) / np.maximum(denom, 1e-9)
 
 
-def build_trajectory_splines(waypoints, target, dt_wp=VAD_WP_DT, smoothing_xy=0.05, smoothing_v=0.5):
+def build_trajectory_splines(waypoints, speed, dt_wp=VAD_WP_DT, smoothing_xy=0.05, smoothing_v=0.5):
     r"""Fit a PathSpline (x(s)/y(s)/yaw(s)/kappa(s)) + a companion vx(s) spline directly from VAD's
-    own ~6 waypoints + 1 route-command target point, in place of carla_control's
-    PathSpline-over-a-known-route. See module docstring point 1 for why.
+    own ~6 waypoints plus the ego origin (7 points total), in place of carla_control's
+    PathSpline-over-a-known-route. See module docstring point 1 for why no route-command point
+    (local_command_xy) is mixed into this fit.
 
     waypoints: VAD's out_truck, (N, 2) in its own [lateral, forward] ego-frame convention (index 0
     sideways, index 1 ahead), ego at the origin, heading along +forward, each step dt_wp seconds
-    after the last. target: local_command_xy, same convention, one further point with an unknown
-    timestamp (a route-command aim point, not a VAD-timed prediction) -- included in the geometry
-    fit for shape only, excluded from the speed fit.
+    after the last. speed: the actual MEASURED current speed (m/s, tick_data['speed']) -- anchors
+    the vx(s) fit at s=0. Without it, vx_spline(0) is only VAD's own *implied* average speed over
+    the first waypoint interval (a coarse ds/dt over up to dt_wp seconds of prediction), which can
+    disagree with the real current speed by several m/s (confirmed: one sample's fit started near
+    5.4 m/s against a real 7.04 m/s) -- exactly the value vx_preview[0] hands the MPC for its very
+    first control step, where that gap matters most.
 
     Returns (path, vx_spline, s_max_wp): path is a PathSpline in this file's own (forward, lateral)
     convention; vx_spline(s) -> m/s is a plain UnivariateSpline (speed isn't a geometric property of
-    the path, so it gets its own fit, not a PathSpline derivative); s_max_wp is the last real
-    waypoint's station -- vx_spline is only informed by data up to there, beyond it (out to
-    target's station) callers should hold the last sample rather than trust extrapolation.
+    the path, so it gets its own fit, not a PathSpline derivative); s_max_wp is the last waypoint's
+    station, which is now also path.s_max (the fit no longer extends past the real waypoints) --
+    kept as its own name since it's what vx_spline's own data actually covers.
     """
-    fwd = [0.0] + [wp[1] for wp in waypoints] + [target[1]]
-    lat = [0.0] + [wp[0] for wp in waypoints] + [target[0]]
+    fwd = [0.0] + [wp[1] for wp in waypoints]
+    lat = [0.0] + [wp[0] for wp in waypoints]
     path = PathSpline(fwd, lat, smoothing=smoothing_xy)
 
-    s_all = _chord_length_station(fwd, lat)
+    s_wp = _chord_length_station(fwd, lat)   # station at the origin + each real waypoint
     n_wp = len(waypoints)
-    s_wp = s_all[:n_wp + 1]              # station at the origin + each real waypoint
-    t_wp = np.arange(n_wp + 1) * dt_wp   # 0, dt_wp, 2*dt_wp, ... -- known VAD cadence
+    t_wp = np.arange(n_wp + 1) * dt_wp       # 0, dt_wp, 2*dt_wp, ... -- known VAD cadence
 
     # One speed sample per waypoint interval, assigned to that interval's own arc-length midpoint
-    # (an average speed over [s_{i-1}, s_i] describes the midpoint, not either edge).
+    # (an average speed over [s_{i-1}, s_i] describes the midpoint, not either edge), PLUS the
+    # measured current speed anchored at s=0 itself -- see docstring above for why that anchor is
+    # needed (VAD's own segment averages don't otherwise pin down the fit's value at the origin).
     ds = np.diff(s_wp)
     dt = np.diff(t_wp)
-    v_seg = ds / np.maximum(dt, 1e-3)
-    s_mid = s_wp[:-1] + ds / 2.0
+    v_seg = np.concatenate([[float(speed)], ds / np.maximum(dt, 1e-3)])
+    s_mid = np.concatenate([[0.0], s_wp[:-1] + ds / 2.0])
 
     order = np.argsort(s_mid)
     s_mid, v_seg = s_mid[order], v_seg[order]
@@ -428,13 +555,13 @@ class SimplePID:
 # ----------------------------------------------------------------------------- the drop-in controller
 
 class MpcKfController:
-    r"""Drop-in replacement for team_code/pid_controller.py's PIDController. Same
-    control_pid(waypoints, speed, target) call signature PLUS r_meas/ay_meas appended -- the two
-    IMU channels (gyro z, accelerometer y) PIDController never needed that this file's v_y
-    estimator does. vad_b2d_agent.py's call site needs exactly two lines changed: instantiate this
-    instead of PIDController, and pass tick_data['angular_velocity'][2] /
-    tick_data['acceleration'][1] as the two extra args -- already unpacked into local variables for
-    the can_bus feature every tick, no new sensor wiring needed.
+    r"""Drop-in-ish replacement for team_code/pid_controller.py's PIDController. Unlike
+    PIDController.control_pid(waypoints, speed, target), this drops target/local_command_xy
+    entirely -- see module docstring point 1 for why -- so vad_b2d_agent.py's call site needs that
+    argument removed (not just renamed), in addition to instantiating this class instead of
+    PIDController and passing tick_data['angular_velocity'][2] / tick_data['acceleration'][1] as
+    the two extra args (r_meas, ay_meas) -- already unpacked into local variables for the can_bus
+    feature every tick, no new sensor wiring needed.
 
     No synthetic measurement noise is added anywhere in this file (unlike kalman_filter.py's
     offline replay or mpc_mpc_KF.py's closed-loop comparison harness, which both inject Gaussian
@@ -450,7 +577,8 @@ class MpcKfController:
                 w_delta=1.0, w_ddelta=30.0, delta_max_deg=30.0, ddelta_max_deg=70.0,
                 kf_q_vy=1e-8, kf_q_r=1e-8, kf_r_dpsi=1e-5, kf_r_ay=1e-5,
                 speed_kp=1.0, speed_ki=0.3, speed_kd=0.0, max_throttle=0.75,
-                brake_speed=0.4, brake_ratio=1.1, clip_delta=0.25):
+                brake_speed=0.4, brake_ratio=1.1, clip_delta=0.25,
+                w_v=10.0, w_a=1.0, w_j=30.0, a_min=-4.05, a_max=2.4, jerk_max=4.13):
         self.dt, self.n_p = dt, n_p
         self.lateral_mpc = LateralMPC(
             dt=dt, n_p=n_p, n_c=n_c, mass=VEHICLE_MASS, Iz=VEHICLE_IZ, lf=VEHICLE_LF, lr=VEHICLE_LR,
@@ -458,6 +586,11 @@ class MpcKfController:
             w_delta=w_delta, w_ddelta=w_ddelta,
             delta_max=math.radians(delta_max_deg), ddelta_max=math.radians(ddelta_max_deg) * dt,
             vx_floor=VX_FLOOR)
+        # Same n_p/n_c as lateral_mpc on purpose: both QPs are handed the SAME vx_preview (see
+        # control_pid()) -- one call to preview_from_splines() feeds both, rather than building two
+        # previews of different lengths off the same vx_spline.
+        self.speed_mpc = SpeedMPC(dt=dt, n_p=n_p, n_c=n_c, w_v=w_v, w_a=w_a, w_j=w_j,
+                                  a_min=a_min, a_max=a_max, jerk_max=jerk_max)
         self.kf = VyKalmanFilter(dt=dt, mass=VEHICLE_MASS, Iz=VEHICLE_IZ, lf=VEHICLE_LF, lr=VEHICLE_LR,
                                  Cf=VEHICLE_CF, Cr=VEHICLE_CR, Q=np.diag([kf_q_vy, kf_q_r]),
                                  R=np.diag([kf_r_dpsi, kf_r_ay]), vx_floor=VX_FLOOR,
@@ -467,12 +600,12 @@ class MpcKfController:
             max_throttle, brake_speed, brake_ratio, clip_delta)
         self.prev_delta = 0.0
 
-    def control_pid(self, waypoints, speed, target, r_meas, ay_meas):
-        """waypoints/target: VAD's own [lateral, forward] convention, unconverted (matches
-        PIDController.control_pid()'s own call signature). speed: tick_data['speed'] (m/s).
-        r_meas: yaw rate (rad/s, tick_data['angular_velocity'][2]). ay_meas: lateral accel (m/s^2,
-        tick_data['acceleration'][1]). Returns (steer, throttle, brake, metadata), same shape
-        PIDController.control_pid() returns."""
+    def control_pid(self, waypoints, speed, r_meas, ay_meas):
+        """waypoints: VAD's own [lateral, forward] convention, unconverted. speed:
+        tick_data['speed'] (m/s). r_meas: yaw rate (rad/s, tick_data['angular_velocity'][2]).
+        ay_meas: lateral accel (m/s^2, tick_data['acceleration'][1]). Returns (steer, throttle,
+        brake, metadata), same shape PIDController.control_pid() returns (this one just never
+        takes target/local_command_xy -- see module docstring point 1)."""
         speed = float(speed)
         vx = speed
 
@@ -484,7 +617,7 @@ class MpcKfController:
         # estimate here, same split mpc_mpc_KF.py's "mpc-kf" controller uses.
         r = r_meas
 
-        path, vx_spline, s_max_wp = build_trajectory_splines(waypoints, target)
+        path, vx_spline, s_max_wp = build_trajectory_splines(waypoints, speed)
         vx_preview, kappa_preview = preview_from_splines(path, vx_spline, s_max_wp, self.n_p, self.dt)
 
         x0 = [v_y, r, 0.0, float(path.yaw(0.0))]
@@ -492,11 +625,17 @@ class MpcKfController:
         self.prev_delta = delta
         steer = steer_from_delta(delta)
 
-        # Longitudinal: same brake/throttle shape pid_controller.py's own control_pid() uses (its
-        # desired_speed reused here as vx_preview[0], now spline-derived instead of a raw waypoint-
-        # spacing average), just handed to our own SimplePID instance -- keeps the comparison to
-        # the baseline about the LATERAL controller (this project's actual subject).
-        desired_speed = float(vx_preview[0])
+        # Longitudinal: SpeedMPC (same QP carla_control/longitudinal_mpc.py's own SpeedMPC solves)
+        # plans a_cmd against the SAME vx_preview the lateral side just used -- no LUT+PID pedal
+        # layer here (that stack needs longitudinal_lookup/'s calibration file, which has no reason
+        # to ship inside the .sif, see module docstring point 3's reasoning for the same call on
+        # steer_from_delta()); instead a_cmd is turned into a one-step-ahead desired_speed
+        # (speed + a_cmd*dt, consistent with SpeedMPC's own x_{k+1}=x_k+T*a_k plant equation) and
+        # handed to the same speed-error SimplePID pedal tracker this file always used -- so the QP
+        # actually decides the acceleration plan, but the pedal-tracking loop underneath it is
+        # unchanged from before SpeedMPC existed.
+        a_cmd = self.speed_mpc.solve(speed, vx_preview)
+        desired_speed = float(np.clip(speed + a_cmd * self.dt, 0.0, None))
         brake = bool(desired_speed < self.brake_speed
                     or (speed / desired_speed if desired_speed > 1e-6 else float("inf")) > self.brake_ratio)
         speed_error = float(np.clip(desired_speed - speed, 0.0, self.clip_delta))
@@ -505,7 +644,7 @@ class MpcKfController:
 
         metadata = {
             'speed': speed, 'steer': steer, 'throttle': throttle, 'brake': float(brake),
-            'v_y_hat': v_y, 'delta_rad': delta, 'desired_speed': desired_speed,
-            'kf_status': self.lateral_mpc.last_status,
+            'v_y_hat': v_y, 'delta_rad': delta, 'desired_speed': desired_speed, 'a_cmd': a_cmd,
+            'kf_status': self.lateral_mpc.last_status, 'speed_mpc_status': self.speed_mpc.last_status,
         }
         return steer, throttle, brake, metadata

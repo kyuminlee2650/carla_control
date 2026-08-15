@@ -867,19 +867,22 @@ def plot_trajectory_fit(fwd, lat, path, vx_spline, s_max_wp, s_mid, v_seg, vx_pr
     second, possibly-divergent copy).
 
     fwd, lat: the fit's own input points in this file's (forward, lateral) convention -- [origin,
-    *waypoints, target], length N. path: the fitted PathSpline. vx_spline: the fitted speed spline.
-    s_max_wp: station of the last REAL waypoint (vx_spline has no data past this -- see
-    build_trajectory_splines()'s docstring). s_mid, v_seg: the per-interval speed samples vx_spline
-    was fit against. vx_preview, kappa_preview: preview_from_splines()'s own output (length n_p).
-    dt: control period, used only to reconstruct the preview's own station cursor for plotting.
-    speed: current speed (m/s, at t=0) -- NOT what vx_preview/vx_spline show, which is VAD's own
-    predicted FUTURE speed along the trajectory; the two can differ a lot (e.g. current speed high,
-    predicted speed low -- VAD forecasting a slowdown into a turn), by design, not by mistake.
+    *waypoints], length N (7 for VAD's usual 6 waypoints; no route-command target point mixed in --
+    see mpc_kf_controller.py's build_trajectory_splines() docstring for why). path: the fitted
+    PathSpline. vx_spline: the fitted speed spline. s_max_wp: the last waypoint's station, now also
+    equal to path.s_max (the fit no longer extends past the real waypoints). s_mid, v_seg: the
+    per-interval speed samples vx_spline was fit against. vx_preview, kappa_preview:
+    preview_from_splines()'s own output (length n_p). dt: control period, used only to reconstruct
+    the preview's own station cursor for plotting. speed: current speed (m/s, at t=0) -- NOT what
+    vx_preview/vx_spline show, which is VAD's own predicted FUTURE speed along the trajectory; the
+    two can differ a lot (e.g. current speed high, predicted speed low -- VAD forecasting a
+    slowdown into a turn), by design, not by mistake.
 
     Note kappa_preview/vx_preview only ever cover station 0 to roughly n_p*dt*vx -- a TIME horizon,
-    not path.kappa(s)/vx_spline(s)'s own full spatial domain (0 to path.s_max / s_max_wp). At low
-    speed that's a small fraction of the fitted curve; the dense curves are still fit from every
-    input point regardless of how far the preview's own marker series happens to reach.
+    not path.kappa(s)/vx_spline(s)'s own full spatial domain (0 to path.s_max, now the same as
+    s_max_wp). At low speed that's a small fraction of the fitted curve; the dense curves are still
+    fit from every input point regardless of how far the preview's own marker series happens to
+    reach.
     """
     s_cursor = np.concatenate([[0.0], np.cumsum(np.asarray(vx_preview) * dt)[:-1]])
     s_dense = np.linspace(0.0, path.s_max, 300)
@@ -888,6 +891,11 @@ def plot_trajectory_fit(fwd, lat, path, vx_spline, s_max_wp, s_mid, v_seg, vx_pr
     kappa_dense = path.kappa(s_dense)
     s_dense_wp = np.linspace(0.0, s_max_wp, 100)
 
+    # Legend labels below are kept short on purpose (this file's convention everywhere else) --
+    # a full-sentence label on the speed panel's axhline once made that legend's rendered bbox
+    # bigger than its own panel, and constrained_layout (which sizes each panel around everything
+    # drawn in it, legends included) shrank the actual data area down into a corner to make room.
+    # The fuller explanation lives in the caption below instead.
     fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
     fig.patch.set_facecolor(COLOR_BG)
     if title:
@@ -896,34 +904,40 @@ def plot_trajectory_fit(fwd, lat, path, vx_spline, s_max_wp, s_mid, v_seg, vx_pr
         _style_axes(ax)
 
     ax = axes[0, 0]
-    ax.plot(fx, fy, "-", color=COLOR_BLUE, linewidth=LINEWIDTH, label="fitted PathSpline")
-    ax.plot(fwd[:-1], lat[:-1], "o", color=COLOR_ORANGE, markersize=8, label="VAD waypoints (+origin)")
-    ax.plot(fwd[-1], lat[-1], "s", color=COLOR_RED, markersize=8, label="target (extrap.)")
+    ax.plot(fx, fy, "-", color=COLOR_BLUE, linewidth=LINEWIDTH, label="fitted path")
+    ax.plot(fwd[0], lat[0], "^", color=COLOR_BLUE, markersize=10, label="ego (origin)")
+    ax.plot(fwd[1:], lat[1:], "o", color=COLOR_ORANGE, markersize=8, label="VAD waypoints")
     ax.set_xlabel("forward (m)"); ax.set_ylabel("lateral (m)")
-    _title(ax, "path fit"); _legend(ax, loc="best"); ax.axis("equal")
+    _title(ax, "path fit"); _legend(ax, loc="best")
+    ax.set_aspect("equal", adjustable="datalim")
 
     ax = axes[0, 1]
     ax.plot(s_dense, yaw_dense, "-", color=COLOR_PURPLE, linewidth=LINEWIDTH)
-    ax.axvline(s_max_wp, color=COLOR_AXIS, linestyle=":",
-              label="last VAD waypoint (past here: target's linear extrapolation, not real output)")
     ax.set_xlabel("station s (m)"); ax.set_ylabel("yaw (deg)")
-    _title(ax, "path.yaw(s)"); _legend(ax, loc="best")
+    _title(ax, "path.yaw(s)")
 
     ax = axes[1, 0]
-    ax.plot(s_dense, kappa_dense, "-", color=COLOR_PURPLE, linewidth=LINEWIDTH, label="path.kappa(s): the fit")
+    ax.plot(s_dense, kappa_dense, "-", color=COLOR_PURPLE, linewidth=LINEWIDTH, label="path.kappa(s)")
     ax.plot(s_cursor, kappa_preview, "o", color=COLOR_RED, markersize=5, label="kappa_preview")
     ax.axhline(0.0, color=COLOR_AXIS, linewidth=LINEWIDTH_THIN)
     ax.set_xlabel("station s (m)"); ax.set_ylabel("kappa (1/m)")
-    _title(ax, "curvature"); _legend(ax, loc="lower right")
+    _title(ax, "curvature"); _legend(ax, loc="best")
 
     ax = axes[1, 1]
     ax.plot(s_dense_wp, vx_spline(s_dense_wp), "-", color=COLOR_AQUA, linewidth=LINEWIDTH, label="vx_spline(s)")
-    ax.plot(s_mid, v_seg, "o", color=COLOR_ORANGE, markersize=7, label="speed samples (input)")
+    ax.plot(s_mid, v_seg, "o", color=COLOR_ORANGE, markersize=7, label="speed samples")
     ax.plot(s_cursor, vx_preview, "x", color=COLOR_RED, markersize=6, label="vx_preview")
-    ax.axhline(speed, color=COLOR_AXIS, linestyle="--",
-              label="current speed (now, t=0 -- VAD predicts this changing over the horizon)")
     ax.set_xlabel("station s (m)"); ax.set_ylabel("vx (m/s)")
     _title(ax, "speed fit"); _legend(ax, loc="best")
+
+    # supxlabel (not a bare fig.text): constrained_layout reserves real space for it like any other
+    # figure-level label, so it stays inside the canvas on both plt.show() and savefig() -- a plain
+    # fig.text() placed below the constrained_layout-managed area gets clipped by the display
+    # window and only survives savefig's separate bbox_inches="tight" recompute.
+    fig.supxlabel(
+        "*t=0 speed -- vx_preview/vx_spline show VAD's own predicted FUTURE speed along the path, "
+        "which can differ a lot (e.g. slowing into this turn).",
+        fontsize=FONTSIZE_TICK, color=COLOR_MUTED, wrap=True)
 
     return fig
 

@@ -2,8 +2,10 @@ r"""Validate mpc_kf_controller.py's build_trajectory_splines()/preview_from_spli
 VAD trajectory samples (collect_offline_samples.py's output) -- checks the PathSpline + vx-spline
 fit behaves sanely across a broad batch, not just the handful of cases hand-picked during design.
 
-Usage:
-    python3 validate_trajectory_fit.py --samples vad_trajectory_samples_offline.pkl
+Usage (Windows, from this file's own directory -- .venv lives one level up in carla_control/, so
+invoke its python.exe directly rather than relying on `python` being on PATH):
+    cd C:\Users\mumu2\carla_control\b2d_controller
+    ..\.venv\Scripts\python.exe validate_trajectory_fit.py --samples vad_trajectory_samples_offline.pkl
 """
 import argparse
 import os
@@ -22,7 +24,7 @@ def check_one(record, n_p=20, dt=DT):
     out = dict(idx=record["idx"], folder=record.get("folder", ""), speed=record["speed"], ok=True,
               reasons=[])
     try:
-        path, vx_spline, s_max_wp = build_trajectory_splines(record["out_truck"], record["target"])
+        path, vx_spline, s_max_wp = build_trajectory_splines(record["out_truck"], record["speed"])
         vx_preview, kappa_preview = preview_from_splines(path, vx_spline, s_max_wp, n_p, dt)
     except Exception as exc:
         out["ok"] = False

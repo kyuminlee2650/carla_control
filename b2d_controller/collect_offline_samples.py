@@ -12,18 +12,16 @@ since the config's data_root/ann_file paths are relative to that directory):
     python3 collect_offline_samples.py --n 100
 
 Output: a pickle of one dict per sample (same schema mpc_kf_controller.py's build_trajectory_splines
-consumes): out_truck (VAD's own [lateral, forward] waypoints), target (approximated, see below),
-speed, angular_velocity, acceleration, plus folder/frame_idx for traceability back to the dataset.
+consumes): out_truck (VAD's own [lateral, forward] waypoints), speed, angular_velocity,
+acceleration, plus folder/frame_idx for traceability back to the dataset.
 
-target approximation: the live agent's own local_command_xy comes from a route planner's near-term
-command point, transformed into the ego frame via a specific (compass-based, not ego_yaw-based)
-sign convention baked into vad_b2d_agent.py's tick()/run_step() -- reproducing that exactly from
-this dataset's own (differently-conventioned) ego_yaw/world2lidar fields would need reverse-
-engineering a frame convention this script has no independent way to verify. Since `target` is only
-ever used as one extra shape point stabilizing the curvature spline's tail (not load-bearing for
-validating the core out_truck-driven curvature fit), it's approximated instead as a linear
-extrapolation of out_truck's own last segment -- geometrically reasonable, and it sidesteps that
-whole frame-convention risk entirely rather than risk silently feeding the fit a wrong-signed point.
+No target/local_command_xy here: that point comes from the live agent's own route planner (a
+global-route-following aim, not a VAD-timed trajectory point -- see reference_upstream/
+pid_controller.py's control_pid(), which only ever uses it as a same-tick fallback/override for a
+single steering angle, never fits it into a continuous curve with the waypoints) and this offline
+replay has no independent way to reproduce vad_b2d_agent.py's own compass-based ego-frame transform
+for it anyway. build_trajectory_splines() no longer wants it either now: out_truck's own 6
+waypoints plus the ego origin (7 points) are the whole fit.
 """
 import argparse
 import os
@@ -97,14 +95,10 @@ def main():
             command = int(np.argmax(np.asarray(ego_fut_cmd).reshape(-1)))
             out_truck = all_out_truck[command]
 
-            last_seg = out_truck[-1] - out_truck[-2]
-            target = out_truck[-1] + last_seg   # see module docstring: approximated, not the real
-                                                # route-command point
-
             speed = float(np.linalg.norm(np.asarray(raw_info["ego_vel"], dtype=float)[:2]))
             record = dict(
                 idx=idx, folder=raw_info["folder"], frame_idx=raw_info["frame_idx"],
-                out_truck=out_truck, target=target, speed=speed,
+                out_truck=out_truck, speed=speed,
                 angular_velocity=np.asarray(raw_info["ego_rotation_rate"], dtype=float),
                 acceleration=np.asarray(raw_info["ego_accel"], dtype=float),
             )
