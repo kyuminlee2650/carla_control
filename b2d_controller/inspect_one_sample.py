@@ -98,6 +98,12 @@ def main():
     waypoints, speed = r["out_truck"], r["speed"]
     r_meas = float(r["angular_velocity"][2])   # yaw rate, rad/s -- tick_data['angular_velocity'][2]
     ay_meas = float(r["acceleration"][1])       # lateral accel, m/s^2 -- tick_data['acceleration'][1]
+    a_meas = float(r["acceleration"][0])        # longitudinal accel, m/s^2 -- tick_data['acceleration'][0]
+    # control_mpc() requires gear now (no no-telemetry fallback, see mpc_kf_controller.py module
+    # docstring point 5); this offline dataset has no real gear channel, so this is a speed-only
+    # placeholder purely to exercise LookupController.step() -- see validate_mpc_solve.py's own
+    # _placeholder_gear() for the same reasoning.
+    gear = next((g for top_speed, g in ((3, 1), (7, 2), (12, 3), (18, 4), (25, 5)) if speed < top_speed), 6)
 
     print(f"=== sample idx={idx}  (dataset entry idx={r.get('idx')}, folder={r.get('folder', '?')}) ===")
     print(f"current speed: {speed:.3f} m/s\n")
@@ -165,20 +171,22 @@ def main():
         print(f"  {j:4d}  {s_cursor[j]:7.3f}  {vx_preview[j]:9.3f}  {kappa_preview[j]:+12.5f}")
     print()
 
-    # MpcKfController.control_pid() end-to-end on this one sample (spline fit + KF step +
+    # MpcKfController.control_mpc() end-to-end on this one sample (spline fit + KF step +
     # LateralMPC.solve(), the same QP carla_control/mpc_mpc_comparison.py's own LateralMPC class
     # derives -- mpc_kf_controller.py's copy is unchanged math) -- a FRESH instance, since this one
     # sample is an independent frame, not a continuation of whatever the last-inspected sample was;
     # see validate_mpc_solve.py's own docstring for why the batch check does the same per sample.
     controller = MpcKfController()
-    steer, throttle, brake, metadata = controller.control_pid(waypoints, speed, r_meas, ay_meas)
-    print(f"MpcKfController.control_pid() -- fresh instance, LateralMPC.solve() + SpeedMPC.solve() result:")
+    steer, throttle, brake, metadata = controller.control_mpc(
+        waypoints, speed, r_meas, ay_meas, gear, a_meas)
+    print(f"MpcKfController.control_mpc() -- fresh instance, LateralMPC.solve() + SpeedMPC.solve() result:")
     print(f"  LateralMPC OSQP status: {metadata['kf_status']!r}   "
          f"SpeedMPC OSQP status: {metadata['speed_mpc_status']!r}")
     print(f"  steer={steer:+.4f}  delta={math.degrees(metadata['delta_rad']):+.2f} deg  "
          f"v_y_hat={metadata['v_y_hat']:+.3f} m/s")
-    print(f"  throttle={throttle:.4f}  brake={bool(brake)}  a_cmd={metadata['a_cmd']:+.3f} m/s^2  "
-         f"desired_speed={metadata['desired_speed']:.2f} m/s")
+    print(f"  throttle={throttle:.4f}  brake={brake:.4f}  a_cmd={metadata['a_cmd']:+.3f} m/s^2  "
+         f"gear={metadata['gear']} (placeholder) u_raw={metadata['u_raw']:+.3f} "
+         f"u_filtered={metadata['u_filtered']:+.3f} saturated={metadata['pedal_saturated']}")
 
     # ---- plot (viz_utils.plot_trajectory_fit -- shared COLOR_*/LINEWIDTH/FONTSIZE_* knobs) ----
     # No matplotlib.use() here: viz_utils.py already sets TkAgg at import time (above), which is

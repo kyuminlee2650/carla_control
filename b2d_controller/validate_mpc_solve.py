@@ -1,11 +1,20 @@
 r"""Validate MpcKfController end-to-end (build_trajectory_splines() fit + VyKalmanFilter step +
-LateralMPC.solve() + SpeedMPC.solve() + speed PID pedal tracker) against real VAD trajectory
+LateralMPC.solve() + SpeedMPC.solve() + LUT+PID pedal layer) against real VAD trajectory
 samples (collect_offline_samples.py's output) -- checks that BOTH QPs actually SOLVE (OSQP status,
 finite/in-range control outputs) across a broad batch. mpc_kf_controller.py's LateralMPC/SpeedMPC
 are unchanged copies of carla_control's own mpc_mpc_comparison.py LateralMPC and
 longitudinal_mpc.py's SpeedMPC -- see those files' own class docstrings for the QP derivations
 (condensed LPV-bicycle-model / scalar-integrator state-space, output tracking, box/rate
 constraints) this is exercising.
+
+control_mpc() requires gear/a_meas now (no no-telemetry fallback, see mpc_kf_controller.py module
+docstring point 5) -- a_meas is real offline data (record["acceleration"][0], the same IMU channel
+the live agent reads), but this dataset has no gear channel at all (collect_offline_samples.py's
+own record schema doesn't carry one -- it comes from Bench2Drive's training-data infos, not live
+vehicle telemetry), so _placeholder_gear() below is a speed-only guess purely to exercise the LUT
+path structurally. It is NOT claiming the resulting throttle/brake values are what the real car
+would have done -- only that LookupController.step() runs and returns something finite and
+in-range for a plausible gear at that speed.
 
 validate_trajectory_fit.py already checks the spline fit itself (vx_preview/kappa_preview sanity,
 e.g. no unrealistic curvature); this file goes one step further and actually calls solve() with
@@ -43,8 +52,18 @@ from mpc_kf_controller import MpcKfController
 OK_STATUSES = {"solved", "solved inaccurate"}
 
 
+def _placeholder_gear(speed):
+    """Speed-only stand-in for vehicle.get_control().gear -- this offline dataset has no real gear
+    channel, see module docstring. Rough enough to land on a calibrated gear at each speed, nothing
+    more precise is needed just to exercise LookupController.step()."""
+    for top_speed, gear in ((3, 1), (7, 2), (12, 3), (18, 4), (25, 5)):
+        if speed < top_speed:
+            return gear
+    return 6
+
+
 def check_one(record):
-    """Run MpcKfController.control_pid() on one sample; return a dict of pass/fail + diagnostics.
+    """Run MpcKfController.control_mpc() on one sample; return a dict of pass/fail + diagnostics.
     Never raises -- a call that throws is itself a finding, caught and reported as a failure."""
     out = dict(idx=record["idx"], folder=record.get("folder", ""), speed=record["speed"], ok=True,
               reasons=[], lat_status=None, lon_status=None)
@@ -52,8 +71,10 @@ def check_one(record):
         controller = MpcKfController()
         r_meas = float(record["angular_velocity"][2])
         ay_meas = float(record["acceleration"][1])
-        steer, throttle, brake, metadata = controller.control_pid(
-            record["out_truck"], record["speed"], r_meas, ay_meas)
+        a_meas = float(record["acceleration"][0])
+        gear = _placeholder_gear(record["speed"])
+        steer, throttle, brake, metadata = controller.control_mpc(
+            record["out_truck"], record["speed"], r_meas, ay_meas, gear, a_meas)
     except Exception as exc:
         out["ok"] = False
         out["reasons"].append(f"exception: {exc}")

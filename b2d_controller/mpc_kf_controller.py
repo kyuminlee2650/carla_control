@@ -1,10 +1,13 @@
 r"""B2D/VAD closed-loop controller: LateralMPC + SpeedMPC (carla_control's own LPV-bicycle-model and
-scalar-integrator QPs) + a speed-error PID pedal tracker + VyKalmanFilter's v_y estimate, meant to
+scalar-integrator QPs) + a LUT-feedforward+PID accel-tracking pedal layer (carla_control's own
+MpcLongitudinal, see point 5 below) + VyKalmanFilter's v_y estimate, meant to
 replace team_code/pid_controller.py's
 PIDController inside team_code/vad_b2d_agent.py's run_step() (see that file's line ~396:
 `self.pidcontroller.control_pid(out_truck, tick_data['speed'], local_command_xy)` -- this file's own
-control_pid() drops the local_command_xy arg entirely, see point 1 below for why, so the call site
-needs that argument removed, not just renamed).
+control_mpc() drops the local_command_xy arg entirely, see point 1 below for why, so the call site
+needs that argument removed, not just renamed. Named control_mpc(), not control_pid(), and the
+call site's own attribute should be renamed off self.pidcontroller too (e.g. self.controller) --
+this class is MPC-based, keeping PID-flavored names around would be actively misleading.)
 
 Self-contained on purpose (no import of carla_control/ or kalman_filter/): this file has to run
 inside the b2d_zoo conda env / the submission .sif, which has no reason to also carry
@@ -13,7 +16,7 @@ VyKalmanFilter/LateralMPC/PathSpline below are copies of kalman_filter.py's, mpc
 functions.py's own math (unchanged) -- see those files for the derivation docstrings; this file's
 own docstrings focus on what's DIFFERENT about running them here.
 
-Four things are different from carla_control's own driving scripts, and why:
+Five things are different from carla_control's own driving scripts, and why:
 
 1. No known map route -- VAD's own ~6-waypoint ego-frame prediction (`out_truck`, already cumsum'd
    from per-step displacements) plus the ego origin is all there is each tick (7 points total; no
@@ -31,11 +34,19 @@ Four things are different from carla_control's own driving scripts, and why:
    is path.yaw(0) by construction every tick (ego is redefined as the origin of a fresh ego-frame
    plan every cycle, not carried forward against a persistent map route).
 
-2. No get_physics_control(). carla_control's functions.control_input() reads the vehicle's own
-   max_steer_angle and speed-dependent steering_curve to convert a delta (rad) into CARLA's
-   normalized VehicleControl.steer -- a leaderboard agent can't call get_physics_control() at all.
-   steer_from_delta() below approximates it as a flat delta / MAX_STEER_ANGLE scale, ignoring the
-   curve's own speed-dependent softening. A known simplification, not a bug -- see its docstring.
+2. get_physics_control() isn't reachable through run_step()'s own arguments -- a leaderboard agent
+   only gets sensor input_data and returns a VehicleControl, no vehicle actor reference -- but IS
+   reachable via srunner.scenariomanager.carla_data_provider.CarlaDataProvider.get_hero_actor(),
+   which leaderboard/scenario_runner already register the ego actor into; vad_b2d_agent.py fetches
+   it once (physics is static for a fixed blueprint, same "measured once, reused" convention
+   carla_control's own run_trial()s use) and passes it into control_mpc()'s physics= arg.
+   steer_from_delta_physics() then applies the same Ackermann inner-wheel + speed-dependent
+   steering_curve correction functions.control_input() does (~15% combined error otherwise, see
+   that function's own docstring) -- unchanged math, minus the vehicle.apply_control() side effect
+   (this agent returns VehicleControl, it doesn't apply it itself). steer_from_delta() (the flat
+   delta/MAX_STEER_ANGLE_RAD scale) is kept as the physics=None fallback control_mpc() uses when no
+   physics is available -- e.g. validate_mpc_solve.py/inspect_one_sample.py's offline samples, which
+   have no live vehicle actor to read.
 
 3. Vehicle params are hardcoded (mass/Iz/Cf/Cr/lf/lr), not read from get_physics_control() or
    re-measured -- same reason as #2, and per instruction: reuse carla_control's own
@@ -50,6 +61,32 @@ Four things are different from carla_control's own driving scripts, and why:
    "primal infeasible" almost every tick. A real speed profile (even this coarse a fit) keeps most
    of the horizon off the floor as soon as the plan says to actually accelerate, which fixes it.
 
+5. Longitudinal pedal tracking is now carla_control's own MpcLongitudinal (mpc_mpc_comparison.py/
+   longitudinal_mpc.py), ported verbatim (LongitudinalLUT, LookupController, functions.PID,
+   functions.LowPassFilter, all below): SpeedMPC's own a_cmd goes through a LUT feedforward
+   (longitudinal_lut.npz, calibrated (gear, v_x, a_x) -> pedal-command lookup, accurate to ~0.4
+   m/s^2 inside its envelope per that file's own docstring) + PID closing the remainder, then a
+   low-pass filter (tau=u_tau) before being split into throttle/brake -- not turned into a one-
+   step-ahead desired_speed for a window-PID speed tracker the way an earlier version of this file
+   did. That desired_speed+SimplePID path (and its own SimplePID class) has been removed entirely,
+   not kept as a fallback -- gear/a_meas/longitudinal_lut.npz are now required control_mpc()
+   arguments, on purpose (module docstring point 5's own instruction: match MpcLongitudinal, don't
+   quietly degrade to something untested when telemetry is missing). A caller with no live vehicle
+   actor (offline scripts -- validate_mpc_solve.py/inspect_one_sample.py) has to supply its own
+   gear stand-in; see those files' own comments. gear (vehicle.get_control().gear) and a_meas (a
+   real IMU longitudinal-accel reading, tick_data['acceleration'][0] -- lookup_controller.py's own
+   docstring requires "a real IMU reading", satisfied here the same way ay_meas already is for the
+   Kalman filter) both come from a live vehicle actor, fetched via the same CarlaDataProvider route
+   point 2's physics uses -- see vad_b2d_agent.py.
+
+   Weights (SpeedMPC's w_v/w_a/w_j/a_min/a_max, and the pedal loop's kp/ki/kd/u_tau) are
+   mpc_mpc_comparison.py's own --w-v/--w-a/--w-j/--a-min/--a-max/--kp/--ki/--kd/--u-tau defaults
+   verbatim, not re-tuned for this deployment. SpeedMPC's own n_p/n_c also now match that file's
+   --np/--nc default (40) instead of sharing LateralMPC's n_p (still 20, untouched) -- the two
+   previews still come from ONE preview_from_splines() call (build_trajectory_splines() only fits
+   one spline either way), evaluated at the longer of the two lengths, with LateralMPC taking the
+   matching-length prefix of the same array rather than a second, independently-walked preview.
+
 Coordinate convention: VAD's own waypoints are [lateral, forward] (index 0 sideways, index 1
 ahead) -- confirmed by pid_controller.py's own `angle = degrees(pi/2 - atan2(aim[1], aim[0]))`
 formula, which only zeroes out on a straight-ahead point under that ordering. Every function below
@@ -58,12 +95,12 @@ to this file's own [forward, lateral] convention (matching carla_control's C(v_x
 convention) wherever the math needs it.
 """
 import math
-from collections import deque
+import os
 
 import numpy as np
 import osqp
 from scipy import sparse
-from scipy.interpolate import UnivariateSpline
+from scipy.interpolate import RegularGridInterpolator, UnivariateSpline
 
 # vehicle.lincoln.mkz_2020's own front-wheel lock, matches carla_control/functions.py's
 # MAX_STEER_ANGLE constant -- see module docstring point 2 for why this can't be read live here.
@@ -313,11 +350,9 @@ class LateralMPC:
 # (the plant here has no scheduling parameter), so this one is built once in __init__ and reused via
 # solver.update() every solve() -- see that docstring for why that's safe here but not for
 # LateralMPC. mpc_mpc_comparison.py's own MpcLongitudinal wraps this with a LUT-feedforward+PID
-# pedal layer calibrated from real CARLA get_physics_control() data (longitudinal_lookup/); that
-# calibration file has no reason to exist inside the .sif, so MpcKfController.control_pid() instead
-# turns this class's own a_cmd into a one-step-ahead desired_speed (speed + a_cmd*dt, consistent
-# with the QP's own plant equation) and hands that to the same speed-error SimplePID pedal tracker
-# the file used before SpeedMPC existed -- see control_pid()'s own comment at the call site.
+# pedal layer calibrated from real CARLA get_physics_control() data (longitudinal_lookup/);
+# MpcKfController.control_mpc() now wraps it the same way -- see module docstring point 5 and the
+# LongitudinalLUT/LookupController section below.
 
 class SpeedMPC:
     """Speed-tracking MPC over a scalar first-order integrator: x_k = v_{x,k}, x_{k+1} = A x_k +
@@ -530,26 +565,183 @@ def preview_from_splines(path, vx_spline, s_max_wp, n_p, dt, vx_floor=VX_FLOOR):
 
 def steer_from_delta(delta_rad):
     """delta (rad, LateralMPC's own front-wheel bicycle-model angle) -> CARLA's normalized
-    VehicleControl.steer in [-1, 1]. See module docstring point 2 for why this is a flat scale
-    (MAX_STEER_ANGLE_RAD) rather than the real speed-dependent steering_curve carla_control's own
-    functions.control_input() applies -- no get_physics_control() access here to read that curve."""
+    VehicleControl.steer in [-1, 1]. Flat delta/MAX_STEER_ANGLE_RAD scale, no Ackermann/
+    steering_curve correction -- the physics=None fallback control_mpc() uses when there's no live
+    vehicle actor to read (see module docstring point 2). Prefer steer_from_delta_physics() whenever
+    physics is available."""
     return float(np.clip(delta_rad / MAX_STEER_ANGLE_RAD, -1.0, 1.0))
 
 
-class SimplePID:
-    """Minimal windowed PID -- same shape as team_code/pid_controller.py's own PID class,
-    duplicated (not imported) so this file has no dependency on that module and can be dropped
-    into the .sif build on its own."""
+def track_over_wheelbase(physics):
+    """track / wheelbase, the only vehicle geometry the Ackermann conversion needs. Copy of
+    carla_control/functions.py's track_over_wheelbase() -- unchanged math; see that file's own
+    docstring. physics.wheels order (CARLA convention): [front_left, front_right, rear_left,
+    rear_right]."""
+    wheels = physics.wheels
+    track = math.hypot(wheels[0].position.x - wheels[1].position.x,
+                       wheels[0].position.y - wheels[1].position.y)
+    front_x = 0.5 * (wheels[0].position.x + wheels[1].position.x)
+    front_y = 0.5 * (wheels[0].position.y + wheels[1].position.y)
+    rear_x = 0.5 * (wheels[2].position.x + wheels[3].position.x)
+    rear_y = 0.5 * (wheels[2].position.y + wheels[3].position.y)
+    wheelbase = math.hypot(front_x - rear_x, front_y - rear_y)
+    return track / wheelbase
 
-    def __init__(self, kp, ki, kd, n=20):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self._window = deque([0.0] * n, maxlen=n)
+
+def steering_curve_scale(physics, speed_ms):
+    """The factor CARLA applies to a steer command at this speed. Copy of carla_control/
+    functions.py's steering_curve_scale() -- unchanged math; see that file's own docstring
+    (VehiclePhysicsControl.steering_curve's x axis is km/h, not m/s)."""
+    xs = [point.x for point in physics.steering_curve]
+    ys = [point.y for point in physics.steering_curve]
+    lo, hi = xs[0], xs[-1]
+    x = min(max(speed_ms * 3.6, lo), hi)
+    for i in range(1, len(xs)):
+        if x <= xs[i]:
+            span = xs[i] - xs[i - 1]
+            t = 0.0 if span == 0 else (x - xs[i - 1]) / span
+            return ys[i - 1] + t * (ys[i] - ys[i - 1])
+    return ys[-1]
+
+
+def steer_from_delta_physics(delta_rad, physics, v_x, max_steer_angle_rad=MAX_STEER_ANGLE_RAD):
+    """delta (rad, bicycle-model front-wheel angle) -> CARLA's normalized VehicleControl.steer,
+    WITH the Ackermann inner-wheel + speed-dependent steering_curve corrections carla_control's own
+    functions.control_input() applies (naive delta/max_steer is ~15% off without them, per that
+    function's own docstring). Same math as control_input(), minus the Ackermann geometry's
+    `cot(inner) = cot(bicycle) - track/(2*wheelbase)` being anything other than a straight port, and
+    minus control_input()'s own vehicle.apply_control(control) call -- a leaderboard agent returns
+    VehicleControl, it doesn't apply it itself. physics: vehicle.get_physics_control(), fetched once
+    by the caller (see module docstring point 2 for why it can't be read from here directly) and
+    reused every tick -- steering_curve/wheel geometry are static for a fixed blueprint."""
+    if abs(delta_rad) < 1e-6:
+        inner = 0.0
+    else:
+        cot_inner = 1.0 / math.tan(abs(delta_rad)) - 0.5 * track_over_wheelbase(physics)
+        # cot <= 0 would mean an inner wheel past 90 deg; the steering limit binds long before
+        # that, so clamp rather than let the arithmetic wrap (same as control_input()).
+        inner = max_steer_angle_rad if cot_inner <= 0.0 else math.atan(1.0 / cot_inner)
+        inner = math.copysign(inner, delta_rad)
+    scale = steering_curve_scale(physics, max(v_x, 0.0))
+    return float(np.clip(inner / (max_steer_angle_rad * scale), -1.0, 1.0))
+
+
+# ----------------------------------------------------------------------------- longitudinal pedal layer
+# Copies of carla_control/functions.py's PID/LowPassFilter and
+# carla_control/longitudinal_lookup/longitudinal_lut.py's LongitudinalLUT and
+# lookup_controller.py's LookupController -- unchanged math, see those files' own docstrings for
+# the derivations/tuning notes. Ported here (not imported) for the same self-contained-.sif reason
+# every other embedded copy in this file exists -- see module docstring point 5.
+
+class PID:
+    """Anti-windup-clamped PID -- carla_control/functions.py's own PID class, unchanged. Drives the
+    LUT+PID accel-tracking loop LookupController.step() below uses (module docstring point 5)."""
+
+    def __init__(self, kp, ki, kd, dt):
+        self.kp, self.ki, self.kd, self.dt = kp, ki, kd, dt
+        self._integral = 0.0
+        self._prev_error = 0.0
 
     def step(self, error):
-        self._window.append(error)
-        integral = float(np.mean(self._window))
-        derivative = self._window[-1] - self._window[-2] if len(self._window) >= 2 else 0.0
-        return self.kp * error + self.ki * integral + self.kd * derivative
+        derivative = (error - self._prev_error) / self.dt
+        self._prev_error = error
+
+        trial = self._integral + error * self.dt
+        raw = self.kp * error + self.ki * trial + self.kd * derivative
+        if not ((raw > 1 and error > 0) or (raw < -1 and error < 0)):
+            self._integral = trial
+
+        return self.kp * error + self.ki * self._integral + self.kd * derivative
+
+
+class LowPassFilter:
+    """Copy of carla_control/functions.py's LowPassFilter -- unchanged math."""
+
+    def __init__(self, tau, dt, initial=0.0):
+        self.alpha = dt / (tau + dt)
+        self.state = initial
+
+    def step(self, x):
+        self.state += self.alpha * (x - self.state)
+        return self.state
+
+
+class LongitudinalLUT:
+    """Runtime (gear, v_x, a_x) -> pedal-command lookup. Copy of carla_control/longitudinal_lookup/
+    longitudinal_lut.py's LongitudinalLUT -- unchanged math; see that file's own docstring (loads
+    the .npz build_lut.py produced from collect_lut_data.py's real CARLA sweep, accurate to ~0.4
+    m/s^2 inside its calibrated envelope). npz_path defaults to a file of the same name sitting
+    next to this one -- deploy note in module docstring point 5: copy longitudinal_lut.npz into
+    team_code/ alongside this file and vad_b2d_agent.py, all three together."""
+
+    def __init__(self, npz_path):
+        data = np.load(npz_path)
+        self.gears = [int(g) for g in data["gears"]]
+        self._interp = {}
+        self._bounds = {}
+        self.speed_range = {}
+        for gear in self.gears:
+            v_grid = data[f"g{gear}_v"]
+            a_grid = data[f"g{gear}_a"]
+            u_table = data[f"g{gear}_u"]
+            self._interp[gear] = RegularGridInterpolator(
+                (v_grid, a_grid), u_table, bounds_error=False, fill_value=None
+            )
+            self._bounds[gear] = (v_grid.min(), v_grid.max(), a_grid.min(), a_grid.max())
+            key = f"g{gear}_vrange"
+            self.speed_range[gear] = (tuple(float(x) for x in data[key]) if key in data
+                                      else (float(v_grid.min()), float(v_grid.max())))
+
+    def lookup(self, gear, v_x, a_x):
+        if gear not in self._interp:
+            raise ValueError(f"No calibration data for gear {gear}; available: {self.gears}")
+        v_min, v_max, a_min, a_max = self._bounds[gear]
+        v_q = min(max(v_x, v_min), v_max)
+        a_q = min(max(a_x, a_min), a_max)
+        u = float(self._interp[gear]([[v_q, a_q]])[0])
+        return max(-1.0, min(1.0, u))
+
+    def gears_for_speed(self, v_x):
+        lo_hi = lambda g: self.speed_range.get(g)
+        return [g for g in self.gears if lo_hi(g) is not None and lo_hi(g)[0] <= v_x <= lo_hi(g)[1]]
+
+
+class LookupController:
+    """LUT feedforward + PID feedback -> pedal command u in [-1, 1]. Copy of carla_control/
+    longitudinal_lookup/lookup_controller.py's LookupController -- unchanged math; see that file's
+    own docstring for why a_meas must be a real IMU reading (no differentiate-v_x fallback) and why
+    kd defaults to 0 (a single kp/ki that stays stable across gears beat a higher-kd tune that only
+    damped some operating points)."""
+
+    def __init__(self, lut, kp, ki, kd=0.0, dt=0.05, use_feedforward=True):
+        self.lut = lut
+        self.kp, self.ki, self.kd, self.dt = kp, ki, kd, dt
+        self.use_feedforward = use_feedforward
+        self.reset()
+
+    def reset(self):
+        self.pid = PID(self.kp, self.ki, self.kd, self.dt)
+        self.last_gear = None
+        self.saturated = False
+
+    def feedforward(self, gear, v_x, a_cmd):
+        if gear == 0 or gear not in self.lut.gears:
+            if self.last_gear is not None:
+                gear = self.last_gear
+            else:
+                candidates = self.lut.gears_for_speed(v_x)
+                gear = candidates[-1] if candidates else self.lut.gears[0]
+        else:
+            self.last_gear = gear
+        return self.lut.lookup(gear, v_x, a_cmd)
+
+    def step(self, gear, v_x, a_cmd, a_meas):
+        error = a_cmd - a_meas
+        ff = self.feedforward(gear, v_x, a_cmd) if self.use_feedforward else 0.0
+        u = ff + self.pid.step(error)
+        clipped = max(-1.0, min(1.0, u))
+        self.saturated = clipped != u
+        return clipped
 
 
 # ----------------------------------------------------------------------------- the drop-in controller
@@ -562,6 +754,19 @@ class MpcKfController:
     PIDController and passing tick_data['angular_velocity'][2] / tick_data['acceleration'][1] as
     the two extra args (r_meas, ay_meas) -- already unpacked into local variables for the can_bus
     feature every tick, no new sensor wiring needed.
+
+    Method is named control_mpc(), deliberately not control_pid(): this controller is MPC-based
+    (LateralMPC + SpeedMPC), and only the LUT+PID pedal layer underneath them (module docstring
+    point 5) is actually PID -- keeping the upstream method name would misleadingly suggest the
+    whole thing is a PID controller. Same reason the call site's own attribute should be
+    self.controller, not self.pidcontroller (see vad_b2d_agent.py).
+
+    gear/a_meas/longitudinal_lut.npz are required, not optional -- no no-telemetry fallback pedal
+    tracker exists in this class (an earlier version had one; removed on purpose, see module
+    docstring point 5). A caller with no live vehicle actor to read gear/a_meas from (e.g. a
+    from-scratch offline script) has to supply its own stand-in values; validate_mpc_solve.py/
+    inspect_one_sample.py do exactly that -- see their own comments for why a placeholder gear is
+    fine there.
 
     No synthetic measurement noise is added anywhere in this file (unlike kalman_filter.py's
     offline replay or mpc_mpc_KF.py's closed-loop comparison harness, which both inject Gaussian
@@ -576,36 +781,59 @@ class MpcKfController:
                 w_ey=4000.0, w_epsi=100.0, w_ay=0.0, w_r=0.0, w_rdot=0.0,
                 w_delta=1.0, w_ddelta=30.0, delta_max_deg=30.0, ddelta_max_deg=70.0,
                 kf_q_vy=1e-8, kf_q_r=1e-8, kf_r_dpsi=1e-5, kf_r_ay=1e-5,
-                speed_kp=1.0, speed_ki=0.3, speed_kd=0.0, max_throttle=0.75,
-                brake_speed=0.4, brake_ratio=1.1, clip_delta=0.25,
-                w_v=10.0, w_a=1.0, w_j=30.0, a_min=-4.05, a_max=2.4, jerk_max=4.13):
-        self.dt, self.n_p = dt, n_p
+                max_throttle=0.75,
+                n_p_speed=40, n_c_speed=40, w_v=10.0, w_a=1.0, w_j=30.0,
+                a_min=-4.05, a_max=2.4, jerk_max=4.13,
+                lut_path=None, pedal_kp=0.15, pedal_ki=0.6, pedal_kd=0.0, pedal_u_tau=0.02):
+        self.dt, self.n_p, self.n_p_speed = dt, n_p, n_p_speed
         self.lateral_mpc = LateralMPC(
             dt=dt, n_p=n_p, n_c=n_c, mass=VEHICLE_MASS, Iz=VEHICLE_IZ, lf=VEHICLE_LF, lr=VEHICLE_LR,
             Cf=VEHICLE_CF, Cr=VEHICLE_CR, w_ey=w_ey, w_epsi=w_epsi, w_ay=w_ay, w_r=w_r, w_rdot=w_rdot,
             w_delta=w_delta, w_ddelta=w_ddelta,
             delta_max=math.radians(delta_max_deg), ddelta_max=math.radians(ddelta_max_deg) * dt,
             vx_floor=VX_FLOOR)
-        # Same n_p/n_c as lateral_mpc on purpose: both QPs are handed the SAME vx_preview (see
-        # control_pid()) -- one call to preview_from_splines() feeds both, rather than building two
-        # previews of different lengths off the same vx_spline.
-        self.speed_mpc = SpeedMPC(dt=dt, n_p=n_p, n_c=n_c, w_v=w_v, w_a=w_a, w_j=w_j,
+        # n_p_speed/n_c_speed default to mpc_mpc_comparison.py's own --np/--nc (40), decoupled from
+        # LateralMPC's n_p (still 20) -- see module docstring point 5 for how one preview walk still
+        # feeds both.
+        self.speed_mpc = SpeedMPC(dt=dt, n_p=n_p_speed, n_c=n_c_speed, w_v=w_v, w_a=w_a, w_j=w_j,
                                   a_min=a_min, a_max=a_max, jerk_max=jerk_max)
         self.kf = VyKalmanFilter(dt=dt, mass=VEHICLE_MASS, Iz=VEHICLE_IZ, lf=VEHICLE_LF, lr=VEHICLE_LR,
                                  Cf=VEHICLE_CF, Cr=VEHICLE_CR, Q=np.diag([kf_q_vy, kf_q_r]),
                                  R=np.diag([kf_r_dpsi, kf_r_ay]), vx_floor=VX_FLOOR,
                                  x0=[0.0, 0.0], P0=np.eye(2))
-        self.speed_pid = SimplePID(speed_kp, speed_ki, speed_kd)
-        self.max_throttle, self.brake_speed, self.brake_ratio, self.clip_delta = (
-            max_throttle, brake_speed, brake_ratio, clip_delta)
+        self.max_throttle = max_throttle
+
+        # Longitudinal pedal layer -- carla_control's own MpcLongitudinal (module docstring point
+        # 5), required. Deliberately NOT wrapped in a try/except that degrades to some fallback --
+        # a missing/corrupt longitudinal_lut.npz should fail loudly at construction (deploy-time),
+        # not silently produce a different (worse, untested-in-this-form) control law mid-drive.
+        lut_path = lut_path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "longitudinal_lut.npz")
+        self.pedal_ctrl = LookupController(LongitudinalLUT(lut_path), kp=pedal_kp, ki=pedal_ki,
+                                           kd=pedal_kd, dt=dt)
+        self.u_filter = LowPassFilter(tau=pedal_u_tau, dt=dt, initial=0.0)
+
         self.prev_delta = 0.0
 
-    def control_pid(self, waypoints, speed, r_meas, ay_meas):
+    def control_mpc(self, waypoints, speed, r_meas, ay_meas, gear, a_meas, physics=None):
         """waypoints: VAD's own [lateral, forward] convention, unconverted. speed:
         tick_data['speed'] (m/s). r_meas: yaw rate (rad/s, tick_data['angular_velocity'][2]).
-        ay_meas: lateral accel (m/s^2, tick_data['acceleration'][1]). Returns (steer, throttle,
-        brake, metadata), same shape PIDController.control_pid() returns (this one just never
-        takes target/local_command_xy -- see module docstring point 1)."""
+        ay_meas: lateral accel (m/s^2, tick_data['acceleration'][1]). gear: vehicle.get_control().
+        gear (int; 0 is CARLA's own "between gears" value -- LookupController.feedforward() already
+        falls back to the last engaged gear or a speed-based guess for that case, same as
+        carla_control's own LookupController does, see that class's own comment). a_meas: a real
+        IMU longitudinal-accel reading (m/s^2, tick_data['acceleration'][0]) -- LookupController
+        drives throttle/brake off SpeedMPC's own a_cmd through the LUT+PID pedal layer (module
+        docstring point 5); there's no fallback if this or the LUT is unavailable, see class
+        docstring. physics: optional vehicle.get_physics_control() (fetched once by the caller via
+        CarlaDataProvider, see module docstring point 2) -- when given, steer_from_delta_physics()
+        applies the real Ackermann + steering_curve correction; when None (e.g. offline
+        validate_mpc_solve.py/inspect_one_sample.py samples with no live vehicle actor), falls back
+        to the flat steer_from_delta() scale -- this fallback is steering-only, unaffected by
+        gear/a_meas being required now. Returns (steer, throttle, brake, metadata), same shape
+        PIDController.control_pid() returns (this one just never takes target/local_command_xy --
+        see module docstring point 1). Named control_mpc(), not control_pid(), since this class is
+        MPC-based -- see class docstring."""
         speed = float(speed)
         vx = speed
 
@@ -618,33 +846,38 @@ class MpcKfController:
         r = r_meas
 
         path, vx_spline, s_max_wp = build_trajectory_splines(waypoints, speed)
-        vx_preview, kappa_preview = preview_from_splines(path, vx_spline, s_max_wp, self.n_p, self.dt)
+        # One station-walk feeds both MPCs, evaluated at the longer of the two horizons -- module
+        # docstring point 5 -- LateralMPC then takes the matching-length PREFIX of the same array
+        # rather than a second, independently-walked preview (n_p_speed=40 > n_p=20 by default, so
+        # in practice this walks 40 steps and lateral uses steps 0-19 of it).
+        n_p_preview = max(self.n_p, self.n_p_speed)
+        vx_preview_full, kappa_preview_full = preview_from_splines(
+            path, vx_spline, s_max_wp, n_p_preview, self.dt)
+        vx_preview_lat, kappa_preview_lat = vx_preview_full[:self.n_p], kappa_preview_full[:self.n_p]
+        vx_preview_speed = vx_preview_full[:self.n_p_speed]
 
         x0 = [v_y, r, 0.0, float(path.yaw(0.0))]
-        delta = self.lateral_mpc.solve(x0, vx_preview, kappa_preview)
+        delta = self.lateral_mpc.solve(x0, vx_preview_lat, kappa_preview_lat)
         self.prev_delta = delta
-        steer = steer_from_delta(delta)
+        steer = (steer_from_delta_physics(delta, physics, vx) if physics is not None
+                else steer_from_delta(delta))
 
         # Longitudinal: SpeedMPC (same QP carla_control/longitudinal_mpc.py's own SpeedMPC solves)
-        # plans a_cmd against the SAME vx_preview the lateral side just used -- no LUT+PID pedal
-        # layer here (that stack needs longitudinal_lookup/'s calibration file, which has no reason
-        # to ship inside the .sif, see module docstring point 3's reasoning for the same call on
-        # steer_from_delta()); instead a_cmd is turned into a one-step-ahead desired_speed
-        # (speed + a_cmd*dt, consistent with SpeedMPC's own x_{k+1}=x_k+T*a_k plant equation) and
-        # handed to the same speed-error SimplePID pedal tracker this file always used -- so the QP
-        # actually decides the acceleration plan, but the pedal-tracking loop underneath it is
-        # unchanged from before SpeedMPC existed.
-        a_cmd = self.speed_mpc.solve(speed, vx_preview)
-        desired_speed = float(np.clip(speed + a_cmd * self.dt, 0.0, None))
-        brake = bool(desired_speed < self.brake_speed
-                    or (speed / desired_speed if desired_speed > 1e-6 else float("inf")) > self.brake_ratio)
-        speed_error = float(np.clip(desired_speed - speed, 0.0, self.clip_delta))
-        throttle = float(np.clip(self.speed_pid.step(speed_error), 0.0, self.max_throttle))
-        throttle = throttle if not brake else 0.0
+        # plans a_cmd against its own vx_preview_speed, then carla_control's own MpcLongitudinal
+        # pedal layer (LUT feedforward + PID + low-pass filter, module docstring point 5) drives
+        # it to throttle/brake -- the QP decides the acceleration plan, this layer is what actually
+        # tracks it against the real vehicle's (gear, v_x) -> pedal response.
+        a_cmd = self.speed_mpc.solve(speed, vx_preview_speed)
+        u_raw = self.pedal_ctrl.step(int(gear), speed, a_cmd, a_meas=float(a_meas))
+        u = self.u_filter.step(u_raw)
+        throttle = float(np.clip(max(u, 0.0), 0.0, self.max_throttle))
+        brake = float(np.clip(max(-u, 0.0), 0.0, 1.0))
 
         metadata = {
-            'speed': speed, 'steer': steer, 'throttle': throttle, 'brake': float(brake),
-            'v_y_hat': v_y, 'delta_rad': delta, 'desired_speed': desired_speed, 'a_cmd': a_cmd,
+            'speed': speed, 'steer': steer, 'throttle': throttle, 'brake': brake,
+            'v_y_hat': v_y, 'delta_rad': delta, 'a_cmd': a_cmd, 'u_raw': u_raw, 'u_filtered': u,
+            'pedal_saturated': self.pedal_ctrl.saturated, 'gear': int(gear),
+            'steer_physics_corrected': physics is not None,
             'kf_status': self.lateral_mpc.last_status, 'speed_mpc_status': self.speed_mpc.last_status,
         }
         return steer, throttle, brake, metadata
