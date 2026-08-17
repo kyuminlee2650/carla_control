@@ -75,7 +75,12 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from PIL import Image
 
-FRAME_DT_S = 0.5   # approximate, see module docstring -- for axis labels only, not asserted exact
+# One simulator tick, exactly: CARLA's fixed_delta_seconds and the agent's own sensor_tick both
+# run this loop at 20 Hz (mpc_kf_controller.DT). Dumped filenames are RAW TICK INDICES, so a
+# frame's timestamp is simply index * TICK_DT_S -- correct whatever cadence the agent dumped at,
+# which the old fixed FRAME_DT_S=0.5 was not (it hard-coded the agent's own step//10 cadence, and
+# silently mislabelled every axis once that cadence changed).
+TICK_DT_S = 0.05
 
 COLOR_BLUE = "#2a78d6"
 COLOR_ORANGE = "#eb6834"
@@ -89,6 +94,21 @@ COLOR_INK = "#0b0b0b"
 
 ANGLE_THRESH = 0.3   # PIDController defaults (team_code/pid_controller.py), used to recompute
 DIST_THRESH = 10     # use_target_to_aim below -- see module docstring
+
+# vad_b2d_agent.py's own lidar2img['CAM_FRONT'], copied verbatim -- used to draw VAD's predicted
+# trajectory onto the front camera the same way Bench2Drive's own
+# vad_b2d_agent_visualize.draw_traj() does. That function feeds the plan's two columns straight in
+# as lidar (x, y) with a fixed ground height and prepends the bonnet pixel; both conventions are
+# copied rather than re-derived, so this overlay lines up with B2D's own visualization.
+LIDAR2IMG_CAM_FRONT = np.array([
+    [1.14251841e+03, 8.00000000e+02, 0.00000000e+00, -9.52000000e+02],
+    [0.00000000e+00, 4.50000000e+02, -1.14251841e+03, -8.09704417e+02],
+    [0.00000000e+00, 1.00000000e+00, 0.00000000e+00, -1.19000000e+00],
+    [0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+CAM_CANVAS = (900, 1600)     # (h, w) of the dumped rgb_front images
+CAM_GROUND_Z = -1.84         # b2d's own ground height, see vad_demo_video/README.md
+CAM_BONNET_PX = (800, 900)   # draw_traj()'s own ego start pixel (lidar origin projects behind the
+                             # front camera in b2d's calibration, so it cannot be projected)
 
 
 # --------------------------------------------------------------------------------------- loading
@@ -120,6 +140,27 @@ def load_run(log_dir):
         angle_final=get("angle_final"), delta=get("delta"),
         command=get("command", -1).astype(int),
     )
+
+    # Which controller wrote this run. mpc_kf_controller.MpcKfController's metadata carries
+    # delta_rad/a_cmd/kf_status; team_code/pid_controller.py's carries angle/aim/target/
+    # desired_speed. The two share only speed/steer/throttle/brake/plan/all_plan/command, so the
+    # panels that read anything else have to branch -- and a run must never be silently rendered
+    # with the other controller's panels all NaN.
+    data["is_mpc"] = bool(records) and "delta_rad" in records[0]
+
+    if data["is_mpc"]:
+        data.update(
+            delta_rad=get("delta_rad"), a_cmd=get("a_cmd"), v_y_hat=get("v_y_hat"),
+            u_raw=get("u_raw"), u_filtered=get("u_filtered"), gear=get("gear", 0),
+            lat_status=[r.get("kf_status", "?") for r in records],
+            spd_status=[r.get("speed_mpc_status", "?") for r in records],
+        )
+        # LateralMPC.solve() falls back to a held/decayed command on anything outside these two --
+        # see mpc_kf_controller._OK_STATUSES. Tracked so the summary can show WHERE that happened.
+        data["lat_ok"] = np.asarray([s in ("solved", "solved inaccurate")
+                                     for s in data["lat_status"]])
+        data["use_target_to_aim"] = np.zeros(len(idx), dtype=bool)   # PID-only concept
+        return data
 
     # use_target_to_aim: pid_controller.py's own exact formula, recomputed from what got saved --
     # see module docstring for why this isn't just read off a saved key.
@@ -169,11 +210,27 @@ def build_summary_figure(data, out_path, title):
     fig.patch.set_facecolor(COLOR_BG)
     fig.suptitle(title, fontsize=15, fontweight="bold", color=COLOR_INK)
 
+    is_mpc = data.get("is_mpc", False)
+
     ax = axes[0, 0]
     _brake_shading(ax, idx, data["brake"])
     ax.plot(idx, data["speed"], color=COLOR_BLUE, linewidth=1.5, label="speed")
-    ax.plot(idx, data["desired_speed"], color=COLOR_ORANGE, linewidth=1.2, linestyle="--", label="desired_speed")
-    ax.set_ylabel("m/s"); _title(ax, "speed vs desired_speed  (red band = braking)"); ax.legend(frameon=False, fontsize=9)
+    if is_mpc:
+        # MpcKfController has no "desired_speed" -- SpeedMPC emits an ACCELERATION command, and the
+        # LUT+PID pedal layer tracks that directly (see mpc_kf_controller module docstring pt 5).
+        # a_cmd is plotted on a twin axis rather than dropped, since it is the actual longitudinal
+        # setpoint this controller works to.
+        ax2 = ax.twinx()
+        ax2.plot(idx, data["a_cmd"], color=COLOR_ORANGE, linewidth=1.2, linestyle="--", label="a_cmd")
+        ax2.set_ylabel("m/s^2", color=COLOR_ORANGE, fontsize=9)
+        ax2.tick_params(axis="y", colors=COLOR_ORANGE, labelsize=8)
+        ax2.spines["top"].set_visible(False)
+        _title(ax, "speed & SpeedMPC a_cmd  (red band = braking)")
+    else:
+        ax.plot(idx, data["desired_speed"], color=COLOR_ORANGE, linewidth=1.2, linestyle="--",
+                label="desired_speed")
+        _title(ax, "speed vs desired_speed  (red band = braking)")
+    ax.set_ylabel("m/s"); ax.legend(frameon=False, fontsize=9, loc="upper left")
     _style_axes(ax)
 
     ax = axes[0, 1]
@@ -196,13 +253,27 @@ def build_summary_figure(data, out_path, title):
 
     ax = axes[1, 1]
     _brake_shading(ax, idx, data["brake"])
-    ax.plot(idx, data["angle"], color=COLOR_MUTED, linewidth=1.0, linestyle="--", label="angle (traj aim)")
-    ax.plot(idx, data["angle_target"], color=COLOR_AQUA, linewidth=1.0, linestyle="--", label="angle_target (route aim)")
-    ax.plot(idx, data["angle_final"], color=COLOR_BLUE, linewidth=1.8, label="angle_final (picked)")
-    switch = np.flatnonzero(np.diff(data["use_target_to_aim"].astype(int)) != 0) + 1
-    for s in switch:
-        ax.axvline(idx[s], color=COLOR_PURPLE, linewidth=0.8, linestyle=":", alpha=0.7)
-    ax.set_ylabel("normalized angle"); _title(ax, "steering aim source  (dotted = use_target_to_aim flips)")
+    if is_mpc:
+        # LateralMPC's own wheel-angle command, plus the ticks where its QP did NOT solve and the
+        # controller was therefore running on a held/decayed command instead of a fresh optimum.
+        # Those ticks are the ones worth scrubbing to in the video.
+        ax.plot(idx, np.degrees(data["delta_rad"]), color=COLOR_BLUE, linewidth=1.5,
+                label="delta (LateralMPC)")
+        bad = ~data["lat_ok"]
+        if bad.any():
+            ax.plot(idx[bad], np.degrees(data["delta_rad"])[bad], linestyle="none", marker="x",
+                    color=COLOR_RED, markersize=5, label="QP not solved (held/decayed)")
+        ax.plot(idx, np.degrees(data["v_y_hat"]) * 0 + np.nan, alpha=0)   # keep legend order stable
+        ax.set_ylabel("deg"); _title(ax, "LateralMPC steer angle & QP failures")
+        switch = np.flatnonzero(np.diff(bad.astype(int)) != 0) + 1
+    else:
+        ax.plot(idx, data["angle"], color=COLOR_MUTED, linewidth=1.0, linestyle="--", label="angle (traj aim)")
+        ax.plot(idx, data["angle_target"], color=COLOR_AQUA, linewidth=1.0, linestyle="--", label="angle_target (route aim)")
+        ax.plot(idx, data["angle_final"], color=COLOR_BLUE, linewidth=1.8, label="angle_final (picked)")
+        switch = np.flatnonzero(np.diff(data["use_target_to_aim"].astype(int)) != 0) + 1
+        for s in switch:
+            ax.axvline(idx[s], color=COLOR_PURPLE, linewidth=0.8, linestyle=":", alpha=0.7)
+        ax.set_ylabel("normalized angle"); _title(ax, "steering aim source  (dotted = use_target_to_aim flips)")
     ax.legend(frameon=False, fontsize=8)
     _style_axes(ax)
 
@@ -219,13 +290,23 @@ def build_summary_figure(data, out_path, title):
     n = len(idx)
     n_brake = int((data["brake"] > 0.5).sum())
     lines = [
-        f"frames: {n}  (~{n * FRAME_DT_S:.0f}s at ~{FRAME_DT_S:g}s/frame, approximate)",
+        f"controller: {'MpcKfController (LateralMPC + SpeedMPC + KF)' if is_mpc else 'PIDController (stock)'}",
+        f"frames: {n}  ({idx[-1] * TICK_DT_S:.1f}s of driving, "
+        f"1 frame per {int(np.median(np.diff(idx))) if n > 1 else 1} tick(s))",
         f"braking: {n_brake} frames ({100*n_brake/n:.0f}%)",
         f"command switches: {len(cswitch)}  at frames {list(idx[cswitch])[:10]}",
-        f"aim-source flips: {len(switch)}  at frames {list(idx[switch])[:10]}",
         f"largest steer jumps at frames: {sorted(jump_idx.tolist())}",
         f"max |steer|: {np.nanmax(np.abs(data['steer'])):.3f}   max throttle: {np.nanmax(data['throttle']):.3f}",
     ]
+    if is_mpc:
+        from collections import Counter
+        nbad = int((~data["lat_ok"]).sum())
+        lines.insert(4, f"LateralMPC QP not solved: {nbad}/{n} frames ({100*nbad/n:.0f}%)"
+                        f"  -> {dict(Counter(data['lat_status']))}")
+        lines.append(f"max |delta|: {np.nanmax(np.abs(np.degrees(data['delta_rad']))):.2f} deg"
+                     f"   a_cmd range: [{np.nanmin(data['a_cmd']):+.2f}, {np.nanmax(data['a_cmd']):+.2f}] m/s^2")
+    else:
+        lines.insert(4, f"aim-source flips: {len(switch)}  at frames {list(idx[switch])[:10]}")
     ax.text(0.0, 0.95, "\n\n".join(lines), transform=ax.transAxes, va="top", ha="left",
            fontsize=10.5, color=COLOR_INK, family="monospace")
 
@@ -244,6 +325,60 @@ def _fig_to_rgb(fig):
     canvas.draw()
     buf = np.asarray(canvas.buffer_rgba())
     return np.ascontiguousarray(buf[:, :, :3])
+
+
+def overlay_plan_on_cam(img, plan, cmap_name="winter", width=7):
+    """Draw VAD's predicted trajectory onto the front-camera image, following
+    Bench2Drive's own vad_b2d_agent_visualize.draw_traj(): project the plan's two columns as lidar
+    (x, y) at a fixed ground height, drop points outside the canvas, prepend the bonnet pixel, then
+    spline-smooth and stroke with a colour gradient.
+
+    Two deliberate differences from that function, neither of which changes the geometry:
+      * drawn with PIL instead of cv2 -- cv2 is not installed in the control-only .venv this script
+        is meant to run in (see module docstring), and nothing else here needs it.
+      * gradient comes from a matplotlib colormap. Default 'winter' is what VAD's own
+        visualization uses for the PLANNING trajectory specifically (see vad_demo_video/README.md);
+        draw_traj()'s hue_start/hue_end HSV ramp is the b2d equivalent of the same idea.
+    img is a PIL Image (already at CAM_CANVAS size); returns a new PIL Image."""
+    from PIL import ImageDraw
+    from scipy.interpolate import splprep, splev
+
+    plan = np.asarray(plan, dtype=float)
+    if plan.ndim != 2 or len(plan) < 2:
+        return img
+
+    h, w = CAM_CANVAS
+    pts_4d = np.stack([plan[:, 0], plan[:, 1],
+                       np.full(len(plan), CAM_GROUND_Z), np.ones(len(plan))])
+    pts_2d = (LIDAR2IMG_CAM_FRONT @ pts_4d).T
+    depth = pts_2d[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pts_2d[:, 0] /= depth
+        pts_2d[:, 1] /= depth
+    # depth > 0 keeps points actually IN FRONT of the camera -- without it a point behind the image
+    # plane projects to a mirrored pixel that can still land inside the canvas bounds.
+    mask = ((depth > 0) & (pts_2d[:, 0] > 0) & (pts_2d[:, 0] < w)
+            & (pts_2d[:, 1] > 0) & (pts_2d[:, 1] < h))
+    if not mask.any():
+        return img
+    xy = np.concatenate([np.array([CAM_BONNET_PX], dtype=float), pts_2d[mask, 0:2]], axis=0)
+
+    # splprep needs strictly increasing parameterization; duplicate pixels (a stopped car predicting
+    # a near-zero plan) make it raise, so fall back to the polyline in that case.
+    try:
+        tck, _ = splprep([xy[:, 0], xy[:, 1]], s=0)
+        smooth = np.stack(splev(np.linspace(0, 1, 100), tck)).T
+    except Exception:
+        smooth = xy
+
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    cmap = plt.get_cmap(cmap_name)
+    n = len(smooth)
+    for i in range(n - 1):
+        c = tuple(int(255 * v) for v in cmap(i / max(n - 1, 1))[:3])
+        draw.line([tuple(smooth[i]), tuple(smooth[i + 1])], fill=c, width=width)
+    return out
 
 
 def _trajectory_panel(record, w_px, h_px, dpi=100):
@@ -303,10 +438,26 @@ def _gauge_panel(record, frame_idx, w_px, h_px, dpi=100):
     brake = record.get("brake", 0.0)
     command = record.get("command", -1)
 
-    header = f"frame {frame_idx:04d}   ~{frame_idx * FRAME_DT_S:5.1f}s   cmd {command}"
+    header = f"frame {frame_idx:04d}   {frame_idx * TICK_DT_S:5.1f}s   cmd {command}"
     ax.text(0.03, 0.92, header, fontsize=12, fontweight="bold", color=COLOR_INK, family="monospace")
     ax.text(0.03, 0.78, f"speed        {speed:5.2f} m/s", fontsize=11, color=COLOR_INK, family="monospace")
-    ax.text(0.03, 0.68, f"desired      {desired:5.2f} m/s", fontsize=11, color=COLOR_MUTED, family="monospace")
+
+    if "delta_rad" in record:
+        # MpcKfController readout -- the PID's desired_speed line has no counterpart here (see
+        # build_summary_figure); a_cmd + the wheel angle + the QP status are the equivalents.
+        ax.text(0.03, 0.68, f"a_cmd      {record.get('a_cmd', float('nan')):+6.2f} m/s^2",
+                fontsize=11, color=COLOR_MUTED, family="monospace")
+        ax.text(0.03, 0.60, f"delta      {np.degrees(record['delta_rad']):+6.2f} deg   "
+                            f"gear {int(record.get('gear', 0))}",
+                fontsize=10, color=COLOR_MUTED, family="monospace")
+        st = record.get("kf_status", "?")
+        ok = st in ("solved", "solved inaccurate")
+        ax.text(0.03, 0.02, f"lat QP: {st}", fontsize=10, family="monospace",
+                fontweight="bold" if not ok else "normal",
+                color=COLOR_INK if ok else COLOR_RED)
+    else:
+        ax.text(0.03, 0.68, f"desired      {desired:5.2f} m/s", fontsize=11, color=COLOR_MUTED,
+                family="monospace")
 
     def _bar(y, label, value, lo, hi, color):
         ax.text(0.03, y, f"{label:9s}{value:+.3f}", fontsize=11, color=COLOR_INK, family="monospace")
@@ -332,12 +483,24 @@ def _gauge_panel(record, frame_idx, w_px, h_px, dpi=100):
 # --------------------------------------------------------------------------------------- video
 
 def build_video(log_dir, data, out_path, fps=4.0, start=0, end=None,
-                cam_w=1280, cam_h=720, bev_px=300, gauge_w=480):
+                cam_w=1280, cam_h=720, bev_px=300, gauge_w=480, overlay_traj=True):
     import imageio_ffmpeg
 
     idx, records = data["idx"], data["records"]
     end = len(idx) if end is None else min(end, len(idx))
     sel = range(start, end)
+
+    # Three dump layouts are in circulation: upstream's rgb_front/*.png + bev/, the vaddump
+    # variant's CAM_FRONT/*.jpg with no bev/ at all, and the current agent's CAM_FRONT/*.jpg +
+    # bev/*.jpg (it moved to the CAM_*/ naming so one dump also feeds render_vad_style_ctrl.py).
+    # Detect rather than assume, and treat bev as optional -- otherwise a whole run silently
+    # renders zero frames (the per-frame existence check just `continue`s), which reads as "the
+    # script broke" rather than "this dump has no BEV".
+    cam_subdir = next((d for d in ("rgb_front", "CAM_FRONT")
+                       if os.path.isdir(os.path.join(log_dir, d))), None)
+    if cam_subdir is None:
+        raise FileNotFoundError(
+            f"no front-camera folder under {log_dir!r} (looked for rgb_front/ and CAM_FRONT/)")
 
     traj_w = cam_w - bev_px - gauge_w
     if traj_w <= 0:
@@ -353,17 +516,27 @@ def build_video(log_dir, data, out_path, fps=4.0, start=0, end=None,
     try:
         for i in sel:
             frame_idx = int(idx[i])
-            name = f"{frame_idx:04d}.png"
-            cam_path = os.path.join(log_dir, "rgb_front", name)
-            bev_path = os.path.join(log_dir, "bev", name)
-            if not (os.path.exists(cam_path) and os.path.exists(bev_path)):
+            # stock save() writes .png, the vaddump variant writes .jpg -- try both rather than
+            # hard-coding either, or a whole run silently yields zero frames.
+            cam_path = next((c for c in (os.path.join(log_dir, cam_subdir, f"{frame_idx:04d}{e}")
+                                         for e in (".png", ".jpg")) if os.path.exists(c)), None)
+            if cam_path is None:
                 continue   # a frame missing its images (e.g. B2D_SAVE_IMAGES was off) is skipped
+            bev_path = next((c for c in (os.path.join(log_dir, "bev", f"{frame_idx:04d}{e}")
+                                         for e in (".png", ".jpg")) if os.path.exists(c)), None)
+            has_bev = bev_path is not None
 
             canvas = Image.new("RGB", (canvas_w, canvas_h), (252, 252, 251))
-            cam = Image.open(cam_path).convert("RGB").resize((cam_w, cam_h))
+            cam = Image.open(cam_path).convert("RGB")
+            if overlay_traj:
+                # Overlay BEFORE the resize, so the projection runs at the calibration's own
+                # CAM_CANVAS resolution that LIDAR2IMG_CAM_FRONT is expressed in.
+                cam = overlay_plan_on_cam(cam, records[i].get("plan", []))
+            cam = cam.resize((cam_w, cam_h))
             canvas.paste(cam, (0, 0))
-            bev = Image.open(bev_path).convert("RGB").resize((bev_px, bev_px))
-            canvas.paste(bev, (0, cam_h))
+            if has_bev:
+                bev = Image.open(bev_path).convert("RGB").resize((bev_px, bev_px))
+                canvas.paste(bev, (0, cam_h))
 
             traj_arr = _trajectory_panel(records[i], traj_w, bev_px)
             canvas.paste(Image.fromarray(traj_arr).resize((traj_w, bev_px)), (bev_px, cam_h))
@@ -386,7 +559,9 @@ def main():
     parser.add_argument("--out-dir", default=None, help="default: '<log-dir>_analysis' next to --log-dir")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=None)
-    parser.add_argument("--fps", type=float, default=4.0)
+    parser.add_argument("--fps", type=float, default=None,
+                        help="default: real time, derived from the dump cadence "
+                             "(1 / (ticks-between-frames * 0.05s)) -- pass a number to override")
     parser.add_argument("--skip-video", action="store_true", help="only write summary.png (fast)")
     args = parser.parse_args()
 
@@ -402,16 +577,32 @@ def main():
     summary_path = os.path.join(out_dir, "summary.png")
     stats = build_summary_figure(data, summary_path, title)
     print(f"Summary figure -> {summary_path}")
+    print(f"  controller: {'MpcKfController' if data['is_mpc'] else 'PIDController (stock)'}")
     print(f"  braking frames: {stats['n_brake']}")
     print(f"  command switches at frames: {stats['command_switches']}")
-    print(f"  aim-source flips at frames: {stats['aim_switches']}")
+    if data["is_mpc"]:
+        # aim-source flips are a PIDController concept (its two candidate steering aims); the
+        # equivalent "go look here" pointer for the MPC is where its QP stopped solving and the
+        # controller fell back to a held/decayed command.
+        bad = np.flatnonzero(~data["lat_ok"])
+        print(f"  LateralMPC QP not solved: {len(bad)}/{len(data['idx'])} frames"
+              f"  at {list(data['idx'][bad])[:15]}")
+    else:
+        print(f"  aim-source flips at frames: {stats['aim_switches']}")
     print(f"  largest steer jumps at frames: {stats['steer_jumps']}")
 
     if not args.skip_video:
         video_path = os.path.join(out_dir, "review.mp4")
-        print(f"Rendering video (fps={args.fps}) ...")
-        n = build_video(log_dir, data, video_path, fps=args.fps, start=args.start, end=args.end)
-        print(f"Video -> {video_path} ({n} frames)")
+        # Real-time playback by default: the dump cadence is whatever the agent used (every tick
+        # now, every 10th before), and the two are not comparable side by side unless the video
+        # fps compensates. Reading it off the data means a PID dump and an MPC dump of the same
+        # route play back at the same wall-clock speed without anyone passing --fps by hand.
+        idx = data["idx"]
+        stride = int(np.median(np.diff(idx))) if len(idx) > 1 else 1
+        fps = args.fps if args.fps is not None else 1.0 / max(stride, 1) / TICK_DT_S
+        print(f"Rendering video (fps={fps:g}{'' if args.fps is not None else ', real time'}) ...")
+        n = build_video(log_dir, data, video_path, fps=fps, start=args.start, end=args.end)
+        print(f"Video -> {video_path} ({n} frames, {n * max(stride,1) * TICK_DT_S:.1f}s of driving)")
 
 
 if __name__ == "__main__":

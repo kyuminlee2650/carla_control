@@ -30,8 +30,9 @@ mpc_kf_controller.MpcKfController's own class docstring for why):
      run_step() is ever called).
   5. self._hero (the actor itself, not just its physics) is cached the same lazy way as (4); its
      gear (hero.get_control().gear -- read FRESH every tick, unlike physics, since gear actually
-     changes tick to tick) plus a_meas (tick_data['acceleration'][0], the raw IMU longitudinal
-     reading -- same signal can_bus[10]/ego_lcf_feat[2] are already built from) are passed as
+     changes tick to tick) plus a_meas (the IMU longitudinal reading, taken as
+     ImuAcceleration.a_x_raw rather than straight off tick_data['acceleration'][0] -- see the
+     run_step() call site: the raw channel spikes to ~-378,000 m/s^2 on the spawn tick) are passed as
      control_mpc()'s now-required gear=/a_meas= args, driving MpcKfController's LUT+PID
      longitudinal pedal layer -- see mpc_kf_controller.py module docstring point 5 (there is no
      fallback control law anymore; a missing longitudinal_lut.npz fails at MpcKfController()
@@ -58,7 +59,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms as T
 from Bench2DriveZoo.team_code.planner import RoutePlanner
-from Bench2DriveZoo.team_code.mpc_kf_controller import MpcKfController
+from Bench2DriveZoo.team_code.mpc_kf_controller import MpcKfController, ImuAcceleration
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from leaderboard.autoagents import autonomous_agent
 from mmcv import Config
@@ -73,6 +74,20 @@ from pyquaternion import Quaternion
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 
+# Dump cadence, in simulator ticks (the loop runs at 20 Hz -- CARLA's fixed_delta_seconds and this
+# agent's own sensor_tick, see mpc_kf_controller.DT). Upstream save() indexed every stream by
+# `self.step // 10`, so ten consecutive ticks all wrote the same filename and only the last
+# survived: a 35 s run left 71 frames, and analyze_run_log.py's review video played back at 2 fps
+# to stay real-time, which is visibly choppy. Everything is dumped EVERY tick now, indexed by the
+# RAW TICK NUMBER -- the same key metric_info.json uses, so frame index == tick index everywhere.
+#
+# Cost is held down by format, not by cadence: the cameras go out as JPEG q90 (upstream wrote PNG),
+# which is what makes ~707 ticks x 6 cameras affordable at all -- about 0.55 GB for a full route
+# run, against the ~2.7 GB the same cadence would cost in PNG.
+DUMP_EVERY = 1
+DUMP_CAMS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+             'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+
 
 def get_entry_point():
     return 'VadAgent'
@@ -86,6 +101,12 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.last_moving_step = -1
         self.last_steer = 0
         self.controller = MpcKfController()
+        # functions.ImuAcceleration's settle+low-pass post-processing for the accelerometer,
+        # which every carla_control driving script applies before handing a_y to the Kalman
+        # filter and a_x_raw to the pedal layer -- see the call site in run_step() for why
+        # feeding the raw channel straight through is wrong (spawn-tick spike of ~-378,000
+        # m/s^2). dt matches the controller's own DT / CARLA's fixed_delta_seconds.
+        self._accel = ImuAcceleration(dt=0.05)
         # Fetched lazily in run_step() (hero actor may not be registered into CarlaDataProvider
         # yet at this exact point) and cached thereafter -- steering_curve/wheel geometry are
         # static for a fixed vehicle blueprint, see mpc_kf_controller.py module docstring point 2.
@@ -146,12 +167,12 @@ class VadAgent(autonomous_agent.AutonomousAgent):
             string += self.save_name
             self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
             self.save_path.mkdir(parents=True, exist_ok=False)
-            (self.save_path / 'rgb_front').mkdir()
-            (self.save_path / 'rgb_front_right').mkdir()
-            (self.save_path / 'rgb_front_left').mkdir()
-            (self.save_path / 'rgb_back').mkdir()
-            (self.save_path / 'rgb_back_right').mkdir()
-            (self.save_path / 'rgb_back_left').mkdir()
+            # CAM_*/ (not upstream's rgb_front/, rgb_back_left/, ...) and pred/: this is the
+            # layout render_vad_style.py consumes, so the same dump feeds both the control-review
+            # video and the VAD-style panel without a second closed-loop run. See save().
+            for _cam in DUMP_CAMS:
+                (self.save_path / _cam).mkdir()
+            (self.save_path / 'pred').mkdir()
             (self.save_path / 'meta').mkdir()
             (self.save_path / 'bev').mkdir()
 
@@ -444,9 +465,28 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         # local_command_xy (see mpc_kf_controller.MpcKfController's own docstring point 1).
         # r_meas/ay_meas already exist every tick as tick_data['angular_velocity'][2] /
         # tick_data['acceleration'][1], same values can_bus[13:16]/can_bus[10:13] above are built from.
-        r_meas = float(tick_data['angular_velocity'][2])
-        ay_meas = float(tick_data['acceleration'][1])
-        a_meas = float(tick_data['acceleration'][0])   # longitudinal (forward) IMU accel -- LUT+PID's own
+        #
+        # These are already in the convention the controller wants -- NO unit conversion and NO
+        # sign flip. input_data['IMU'] is the sensor.other.imu reading, so angular_velocity[2] is
+        # imu_data.gyroscope.z (rad/s) and acceleration[0:2] is imu_data.accelerometer.x/.y, which
+        # is exactly what carla_control's own mpc_mpc_KF.py feeds its LateralMPC/VyKalmanFilter
+        # (`r = imu_data.gyroscope.z` used raw; `r_meas = r + noise`; `ay_meas = a_y + noise`).
+        # (Do NOT calibrate these against metric_info.json: that file is built from
+        # hero_actor.get_angular_velocity() -- DEGREES/s -- and get_acceleration() -- WORLD frame --
+        # which are different signals from the IMU sensor entirely. Comparing the two produces a
+        # spurious 57.3x scale and spurious sign flips.)
+        #
+        # What DOES have to happen here is functions.ImuAcceleration's post-processing, which every
+        # carla_control driving script applies and which this agent was missing: the accelerometer
+        # reports about -378,000 m/s^2 on the first tick after spawn, so the first settle_ticks
+        # samples are dropped entirely (never entering the filter state), and a_y is causally
+        # low-pass filtered (tau=0.15 s) before the Kalman filter sees it. The pedal layer instead
+        # takes a_x_RAW on purpose -- see longitudinal_mpc.py's own note: filtering only that side
+        # would have LookupController compare a_cmd against a lagged a_meas.
+        self._accel.step_xy(float(tick_data['acceleration'][0]), float(tick_data['acceleration'][1]))
+        r_meas = float(tick_data['angular_velocity'][2])   # imu gyroscope.z, rad/s, as-is
+        ay_meas = self._accel.a_y                          # low-pass filtered  (KF measurement)
+        a_meas = self._accel.a_x_raw                       # raw, settle-gated  (LUT+PID pedal layer)
         # physics is None on every tick before the hero actor first shows up in CarlaDataProvider --
         # control_mpc() falls back to the flat steer_from_delta() scale for those ticks (steering
         # only, see module docstring point 2), then switches to steer_from_delta_physics() from
@@ -473,7 +513,15 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.pid_metadata = metadata_traj
         self.pid_metadata['agent'] = 'only_traj'
         control.steer = np.clip(float(steer_traj), -1, 1)
-        control.throttle = np.clip(float(throttle_traj), 0, 0.75)
+        # Upstream clipped throttle to 0.75 here, matching its own PIDController(max_throttle=0.75).
+        # Raised to CARLA's actual limit -- see mpc_kf_controller.control_mpc()'s note at the
+        # `throttle = clip(max(u, 0), 0, self.max_throttle)` line for why the 0.75 was actively
+        # harmful to THIS controller (it sat outside the LUT+PID loop, whose anti-windup and
+        # saturation flag are both defined against +-1). The leaderboard imposes no throttle limit
+        # of its own, so this is the only remaining cap. Kept as an explicit clip rather than
+        # deleted: control_mpc() already bounds u, and this is the last line of defence on the
+        # value CARLA actually receives.
+        control.throttle = np.clip(float(throttle_traj), 0, 1.0)
         control.brake = np.clip(float(brake_traj), 0, 1)
         self.pid_metadata['steer'] = control.steer
         self.pid_metadata['throttle'] = control.throttle
@@ -488,7 +536,7 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         metric_info = self.get_metric_info()
         self.metric_info[self.step] = metric_info
         if SAVE_PATH is not None and self.step % 1 == 0:
-            self.save(tick_data)
+            self.save(tick_data, output_data_batch)
         self.prev_control = control
 
         if len(self.prev_control_cache)==10:
@@ -497,16 +545,48 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         return control
 
 
-    def save(self, tick_data):
-        frame = self.step // 10
+    def save(self, tick_data, output_data_batch):
+        r"""Dump one tick. Two consumers, one dump:
 
-        Image.fromarray(tick_data['imgs']['CAM_FRONT']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_FRONT_LEFT']).save(self.save_path / 'rgb_front_left' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_FRONT_RIGHT']).save(self.save_path / 'rgb_front_right' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_BACK']).save(self.save_path / 'rgb_back' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_BACK_LEFT']).save(self.save_path / 'rgb_back_left' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_BACK_RIGHT']).save(self.save_path / 'rgb_back_right' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
+          * analyze_run_log.py / compare_runs.py read meta/ (+ CAM_FRONT/ and bev/ for the video)
+          * render_vad_style_ctrl.py reads CAM_*/ and pred/ to rebuild VAD's own BEV panel offline
+
+        pred/ holds the raw VAD head outputs (detections, motion forecasts, online map vectors and
+        all six planning modes) rather than a rendered picture, so the panel can be re-tuned
+        without paying for another closed-loop run -- the same reasoning, and the same field list,
+        as vad_b2d_agent_vaddump.py's save(). That is why this needs output_data_batch at all.
+        """
+        if self.step % DUMP_EVERY != 0:
+            return
+        frame = self.step   # raw tick index -- see DUMP_EVERY at module scope
+
+        for cam in DUMP_CAMS:
+            Image.fromarray(tick_data['imgs'][cam]).save(
+                self.save_path / cam / ('%04d.jpg' % frame), quality=90)
+        Image.fromarray(tick_data['bev']).save(
+            self.save_path / 'bev' / ('%04d.jpg' % frame), quality=90)
+
+        pts = output_data_batch[0]['pts_bbox']
+        boxes = pts['boxes_3d']
+        np.savez_compressed(
+            self.save_path / 'pred' / ('%04d.npz' % frame),
+            # agent detection (LiDAR frame), fed to output_to_nusc_box offline
+            gravity_center=boxes.gravity_center.numpy().astype(np.float32),
+            dims=boxes.dims.numpy().astype(np.float32),
+            yaw=boxes.yaw.numpy().astype(np.float32),
+            velocity=boxes.tensor[:, 7:9].numpy().astype(np.float32),
+            scores_3d=pts['scores_3d'].numpy().astype(np.float32),
+            labels_3d=pts['labels_3d'].numpy().astype(np.int32),
+            trajs_3d=pts['trajs_3d'].numpy().astype(np.float32),
+            # online map vectors
+            map_scores_3d=pts['map_scores_3d'].numpy().astype(np.float32),
+            map_labels_3d=pts['map_labels_3d'].numpy().astype(np.int32),
+            map_pts_3d=pts['map_pts_3d'].numpy().astype(np.float32),
+            # planning: all 6 command modes, per-step offsets (not cumsum'ed)
+            ego_fut_preds=pts['ego_fut_preds'].numpy().astype(np.float32),
+            command=np.int32(self.pid_metadata['command']),
+            speed=np.float32(tick_data['speed']),
+        )
 
         outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
         json.dump(self.pid_metadata, outfile, indent=4)

@@ -15,7 +15,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mpc_kf_controller import DT, VX_FLOOR, build_trajectory_splines, preview_from_splines
+from mpc_kf_controller import DT, VX_EPS, build_trajectory_splines, preview_from_splines
 
 
 def check_one(record, n_p=20, dt=DT):
@@ -39,9 +39,12 @@ def check_one(record, n_p=20, dt=DT):
     if not np.all(np.isfinite(kappa_preview)):
         out["ok"] = False
         out["reasons"].append("kappa_preview has NaN/Inf")
-    if np.any(vx_preview < VX_FLOOR - 1e-6):
+    # Was VX_FLOOR (0.5) -- that floor is gone; preview_from_splines now only guards against a
+    # zero previewed speed stalling its own station cursor, at VX_EPS. See the VX_EPS block in
+    # mpc_kf_controller.py for why the 0.5 m/s modelling floor was removable.
+    if np.any(vx_preview < VX_EPS - 1e-9):
         out["ok"] = False
-        out["reasons"].append(f"vx_preview below VX_FLOOR ({vx_preview.min():.3f})")
+        out["reasons"].append(f"vx_preview below VX_EPS ({vx_preview.min():.6f})")
     # A B2D car isn't going to be doing 40 m/s in a 6-waypoint/3s VAD horizon; a spline blowing
     # past this is a fit-quality problem (over-fit tail, extrapolation runaway), not real driving.
     if np.any(vx_preview > 40.0):
