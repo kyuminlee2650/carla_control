@@ -609,8 +609,13 @@ class PathSpline:
         # which propagates out of run_step() and kills the agent mid-drive. There is no meaningful
         # path to fit from one point, so degrade to "straight ahead, zero curvature" and let the
         # longitudinal side (which sees vx_ref ~ 0 from the same collapsed plan) do the stopping.
-        # Note len(s) == 2 needs no special case: k = 1 and scipy already returns 0 for the 2nd
-        # derivative, so kappa() is 0 there rather than an error (verified, not assumed).
+        # A short-but-not-single plan is a SECOND degenerate case, handled in kappa() rather than
+        # here. k = min(3, len(s) - 1) drops to 1 when only two points survive, and scipy's splev
+        # refuses a 2nd derivative above the spline degree ("0<=der=2<=k=1 must hold") instead of
+        # returning 0 -- verified against scipy 1.10 in this env. That killed the agent 2.4 s into
+        # routes 2416 and 3144 of the ability-10 set (both "Failed - Agent crashed", DS 0). A
+        # degree-1 fit is a straight segment, so its curvature IS identically zero; kappa() now
+        # returns that instead of asking splev for a derivative it cannot give.
         self.degenerate = len(s) < 2
         if self.degenerate:
             self.s_min = self.s_max = 0.0
@@ -619,6 +624,7 @@ class PathSpline:
 
         self.s_min, self.s_max = float(s[0]), float(s[-1])
         k = min(3, len(s) - 1)   # UnivariateSpline needs k < number of points; degrade gracefully
+        self._k = k
         self._sx = UnivariateSpline(s, px, k=k, s=smoothing)
         self._sy = UnivariateSpline(s, py, k=k, s=smoothing)
 
@@ -634,7 +640,9 @@ class PathSpline:
         return np.arctan2(self._sy(s, 1), self._sx(s, 1))
 
     def kappa(self, s):
-        if self.degenerate:
+        # self._k < 2 -> the fit is a straight segment (see the degenerate-plan guard): curvature
+        # is exactly zero, and splev would raise rather than say so.
+        if self.degenerate or self._k < 2:
             return np.zeros_like(np.asarray(s, dtype=float))
         dx, dy = self._sx(s, 1), self._sy(s, 1)
         ddx, ddy = self._sx(s, 2), self._sy(s, 2)
@@ -692,7 +700,159 @@ def build_trajectory_splines(waypoints, speed, dt_wp=VAD_WP_DT, smoothing_xy=0.0
     return path, vx_spline, float(s_wp[-1])
 
 
-def preview_from_splines(path, vx_spline, s_max_wp, n_p, dt, vx_eps=VX_EPS, ay_max=None):
+def _wrap_pi(a):
+    """Wrap an angle to (-pi, pi]. e_psi is a heading DIFFERENCE, and without this a path heading
+    of +179 deg against an ego heading of -179 deg reads as a 358 deg error instead of 2 deg --
+    which would saturate the steering the wrong way at exactly the moment the two agree."""
+    return (float(a) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def route_override_decision(waypoints, target, aim_dist=4.0, angle_thresh=0.3, dist_thresh=10.0):
+    r"""Stock PIDController.control_pid()'s own `use_target_to_aim` test, ported verbatim.
+
+    Reference: Bench2DriveZoo/team_code/pid_controller.py:52-82. Same aim_dist/angle_thresh/
+    dist_thresh defaults, same two conditions, same normalized angle units (1.0 == 90 deg):
+
+        use = |angle_target| < |angle_aim|                       # the route point is straighter
+           or (|angle_target - angle_last| > angle_thresh        # ...or a sudden turn command
+               and target[1] < dist_thresh)                      #    that is already close
+
+    The first condition is the one that fires constantly (measured over the ability-10 set: 34.3%
+    of all ticks) and is almost always a no-op -- median disagreement 0.1-0.9 deg, i.e. pure noise
+    suppression on straight roads. The second is the one that matters: on route 27582 the pair
+    fired on 72.7% of ticks with a MEDIAN disagreement of 10.0 deg, and that is the one route where
+    this controller drove off the drivable surface while stock PID completed at DS 100.
+
+    waypoints/target are both in VAD's own [lateral, forward] ego frame (index 0 sideways, index 1
+    ahead) -- the convention control_mpc() already receives. Note the useful identity
+
+        degrees(pi/2 - atan2(fwd, lat)) / 90 * 90deg  ==  PathSpline.yaw  (radians, this file's
+                                                          own (forward, lateral) fit)
+
+    because pi/2 - atan2(y, x) == atan2(x, y) exactly. So these normalized angles are the SAME
+    quantity the lateral plant's e_psi is built from -- no unit conversion and no sign flip is
+    needed to move between the two, which is why the port is literal.
+
+    Returns (use_target, angle_aim, angle_target, angle_last), the last three in stock's own
+    normalized units so they can be logged and compared against a stock PID dump directly.
+    """
+    wps = np.asarray(waypoints, dtype=float)
+    if wps.ndim != 2 or len(wps) < 2 or target is None:
+        return False, 0.0, 0.0, 0.0
+    tgt = np.asarray(target, dtype=float).reshape(-1)
+
+    # aim point: the waypoint whose midpoint-norm is closest to aim_dist (stock's own loop).
+    best_norm = 1e5
+    aim = wps[0]
+    for i in range(len(wps) - 1):
+        norm = float(np.linalg.norm((wps[i + 1] + wps[i]) / 2.0))
+        if abs(aim_dist - best_norm) > abs(aim_dist - norm):
+            aim, best_norm = wps[i], norm
+    aim_last = wps[-1] - wps[-2]
+
+    def _ang(v):
+        return math.degrees(math.pi / 2 - math.atan2(float(v[1]), float(v[0]))) / 90.0
+
+    angle = _ang(aim)
+    angle_last = _ang(aim_last)
+    angle_target = _ang(tgt)
+    use = (abs(angle_target) < abs(angle)) or \
+          (abs(angle_target - angle_last) > angle_thresh and float(tgt[1]) < dist_thresh)
+    return bool(use), angle, angle_target, angle_last
+
+
+class GlobalPath:
+    r"""The route itself as an arc-length-parameterized reference, in CARLA WORLD coordinates.
+
+    This is the reference the lateral plant was designed for and has never had. VAD's own plan is
+    re-anchored to the ego every tick, so x0's e_y is 0 by construction -- one of the four states
+    carries no measurement at all and the controller is a heading regulator, not a path follower.
+    Projecting onto a fixed world-frame route makes e_y a real signed quantity for the first time.
+
+    Frame: CARLA's world is left-handed with x forward and y to the RIGHT of a yaw-0 heading
+    (Transform.get_right_vector() at yaw 0 is (0, 1, 0)), so the right normal at heading psi is
+    (-sin psi, cos psi) and e_y is POSITIVE WHEN THE EGO IS RIGHT OF THE PATH. That matches this
+    file's existing ego-frame convention: VAD's out_truck index 0 (+lateral) is also right --
+    verified on 3317 real ticks, corr(path.yaw(0), steer) = +0.40 with CARLA steer +1 = right.
+    e_psi keeps the same definition as the VAD-frame path (psi_ego - psi_path), so the two
+    reference sources are interchangeable in x0 without touching the plant.
+
+    Build it ONCE per route: the route is static, so the spline fit is a one-time cost (0.5-8 ms
+    for 500-5000 m). Per tick only project() runs, measured at 0.043-0.059 ms -- about 1% of the
+    lateral QP's own 5.52 ms.
+
+    smoothing_per_point scales UnivariateSpline's total-residual bound with the point count, since
+    that bound is a SUM over points and a route can be any length; 1e-3 m^2/point is an RMS
+    residual near 3 cm, enough to take the centimetre-level jitter out of the second derivative
+    without cutting corners at junctions.
+    """
+
+    def __init__(self, xy_world, smoothing_per_point=1e-3, min_spacing=0.05):
+        P = np.asarray(xy_world, dtype=float).reshape(-1, 2)
+        if len(P) >= 2:
+            keep = np.concatenate([[True], np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1])) > min_spacing])
+            P = P[keep]
+        if len(P) < 4:
+            raise ValueError("GlobalPath needs at least 4 distinct points, got %d" % len(P))
+        self.P = P
+        self.s_nodes = _chord_length_station(P[:, 0], P[:, 1])
+        self.path = PathSpline(P[:, 0], P[:, 1],
+                               smoothing=smoothing_per_point * len(P), min_spacing=min_spacing)
+        self.s_max = float(self.path.s_max)
+
+    def kappa(self, s):
+        return self.path.kappa(np.clip(s, 0.0, self.s_max))
+
+    def project(self, ego_xy, s_hint=None, back=6.0, ahead=40.0):
+        """(s_star, e_y, psi_path) for the ego's current world position.
+
+        s_hint restricts the search to [s_hint - back, s_hint + ahead]. That window is not an
+        optimisation -- it is required for correctness. Routes double back on themselves (a
+        U-turn, or two legs of a loop running one lane apart), and a global argmin there snaps to
+        whichever leg happens to be nearer, which teleports the station cursor and the whole
+        curvature preview to a different part of the map. With a hint the cursor can only advance.
+        """
+        ego = np.asarray(ego_xy, dtype=float).reshape(2)
+        if s_hint is None:
+            lo, hi = 0, len(self.P)
+        else:
+            lo = int(np.searchsorted(self.s_nodes, float(s_hint) - back))
+            hi = int(np.searchsorted(self.s_nodes, float(s_hint) + ahead)) + 1
+            lo = max(0, min(lo, len(self.P) - 2))
+            hi = max(lo + 2, min(hi, len(self.P)))
+        d = self.P[lo:hi] - ego
+        i = lo + int(np.argmin(np.einsum("ij,ij->i", d, d)))
+
+        # Refine off the node onto whichever adjacent segment the ego actually falls on, so s_star
+        # is continuous rather than quantised to the 1 m node spacing (a quantised station makes
+        # the curvature preview step instead of slide, and the MPC sees that as a disturbance).
+        s_star = float(self.s_nodes[i])
+        best = float("inf")
+        for j in (i - 1, i):
+            if j < 0 or j + 1 >= len(self.P):
+                continue
+            a, b = self.P[j], self.P[j + 1]
+            ab = b - a
+            L2 = float(ab @ ab)
+            if L2 <= 1e-12:
+                continue
+            t = float(np.clip((ego - a) @ ab / L2, 0.0, 1.0))
+            proj = a + t * ab
+            dist = float(np.hypot(*(ego - proj)))
+            if dist < best:
+                best = dist
+                s_star = float(self.s_nodes[j] + t * (self.s_nodes[j + 1] - self.s_nodes[j]))
+
+        s_star = float(np.clip(s_star, 0.0, self.s_max))
+        psi = float(self.path.yaw(s_star))
+        px, py = self.path.xy(s_star)
+        # signed offset onto the path's RIGHT normal (-sin psi, cos psi)
+        e_y = float(-(ego[0] - float(px)) * math.sin(psi) + (ego[1] - float(py)) * math.cos(psi))
+        return s_star, e_y, psi
+
+
+def preview_from_splines(path, vx_spline, s_max_wp, n_p, dt, vx_eps=VX_EPS, ay_max=None,
+                         kappa_path=None, kappa_s0=0.0):
     """Walk a station cursor forward by vx(s_cursor)*dt each step (same technique
     mpc_mpc_KF.py's curvature_preview() uses, extended to also sample vx(s) instead of taking it
     as a given input) -- produces (vx_preview, kappa_preview), both length n_p, off the SAME
@@ -707,14 +867,27 @@ def preview_from_splines(path, vx_spline, s_max_wp, n_p, dt, vx_eps=VX_EPS, ay_m
     different stations than kappa_preview -- exactly the consistency this function's own docstring
     exists to guarantee. Capping in-loop keeps one cursor and one parameterization, and the
     self-consistency refine_speed_preview()'s docstring asks for (slowing now means arriving at a
-    later station later) falls out of the same walk."""
+    later station later) falls out of the same walk.
+
+    kappa_path/kappa_s0 (None keeps the old behaviour exactly): take CURVATURE from a different
+    reference than the one vx comes from, starting at station kappa_s0 on it. This is what the
+    route-override branch needs -- geometry from the global route, speed profile still from VAD's
+    own plan (VAD is the only thing that knows about the red light, the pedestrian and the lead
+    car, and the override test says nothing at all about speed). The single cursor stays valid
+    across the two because it is a DISTANCE TRAVELLED and both references are arc-length
+    parameterized: after ds metres the ego is at s=ds on VAD's plan and s=kappa_s0+ds on the
+    route. The two curves do diverge, so ds along one is not exactly ds along the other, but the
+    override only engages when they disagree by a heading, not a length, and over a 25-step
+    horizon the difference is far below the spacing of either fit."""
     s_cursor = 0.0
+    kpath = kappa_path if kappa_path is not None else path
+    ks0 = float(kappa_s0) if kappa_path is not None else 0.0
     vx_preview = np.zeros(n_p)
     kappa_preview = np.zeros(n_p)
     for j in range(n_p):
-        s_kappa = min(s_cursor, path.s_max)
+        s_kappa = min(ks0 + s_cursor, kpath.s_max)
         s_v = min(s_cursor, s_max_wp)
-        kappa = float(path.kappa(s_kappa))
+        kappa = float(kpath.kappa(s_kappa))
         kappa_preview[j] = kappa
         v = max(float(vx_spline(s_v)), vx_eps)
         if ay_max is not None and abs(kappa) > 1e-6:
@@ -986,7 +1159,7 @@ class MpcKfController:
     """
 
     def __init__(self, dt=DT, n_p=25, n_c=25,
-                w_ey=10.0, w_epsi=10.0, w_ay=1.0, w_r=3.0, w_rdot=120.0,
+                w_ey=10.0, w_epsi=10.0, w_ay=1.0, w_r=3.0, w_rdot=30.0,
                 w_delta=1.0, w_ddelta=30.0, delta_max_deg=30.0, ddelta_max_deg=70.0,
                 kf_q_vy=1e-8, kf_q_r=1e-8, kf_r_dpsi=1e-5, kf_r_ay=1e-5,
                 max_throttle=1.0,
@@ -1001,6 +1174,19 @@ class MpcKfController:
         # 1, and --ay-max's help says 4.15 was chosen but the default is 4.9. The DEFAULTS are what
         # is used here, since those are what the tuning search actually left in place; flip w_ay to
         # 0.0 / ay_max to 4.15 here if the prose is the intended config instead.
+        #
+        # w_rdot: 120 -> 30. That default is not the yaw-comfort term it looks like. r_dot is an
+        # OUTPUT with a direct feedthrough from delta (D = lf*Cf/Iz = 33.33 rad/s^2 per rad), so
+        # weighting it puts an effective w_rdot * 33.33^2 = 133,316 penalty on steering itself --
+        # against w_delta = 1 and w_epsi = 10. Measured consequence on route 27582's junction: at
+        # the tick needing 21.2 deg of steer the QP commanded 12.3, and its own horizon predicted
+        # e_psi diverging to -25.4 deg while it accepted that plan, because shedding heading error
+        # (10 * 0.44^2 ~ 2 per step) is far cheaper than steering for it (~3000 per step). At
+        # w_rdot = 12 the same solve predicts -16.0 deg instead, and the planned ramp goes from
+        # 0.29 to 0.53 deg/tick. 30 is the conservative middle: it keeps real yaw-acceleration
+        # damping (the Comfortness channels this weight does also serve) while cutting the
+        # steering penalty ~4x. w_r and w_ddelta were measured to have no effect here and are
+        # deliberately left alone so this change stays a single variable.
         self.dt, self.n_p, self.n_p_speed = dt, n_p, n_p_speed
         self.ay_max = ay_max
         self.lateral_mpc = LateralMPC(
@@ -1032,7 +1218,15 @@ class MpcKfController:
 
         self.prev_delta = 0.0
 
-    def control_mpc(self, waypoints, speed, r_meas, ay_meas, gear, a_meas, physics=None):
+        # Route-override state (see control_mpc()'s `target`/`global_path` arguments).
+        # _route_s carries the station cursor forward so project() can search a window instead of
+        # the whole route; _override_hold implements the release delay described below.
+        self._route_s = None
+        self._override_hold = 0
+        self.override_hold_ticks = 5      # 0.25 s at 20 Hz
+
+    def control_mpc(self, waypoints, speed, r_meas, ay_meas, gear, a_meas, physics=None,
+                    target=None, ego_xy=None, ego_yaw=None, global_path=None):
         """waypoints: VAD's own [lateral, forward] convention, unconverted. speed:
         tick_data['speed'] (m/s). r_meas: yaw rate (rad/s, tick_data['angular_velocity'][2]).
         ay_meas: lateral accel (m/s^2, tick_data['acceleration'][1]). gear: vehicle.get_control().
@@ -1047,10 +1241,25 @@ class MpcKfController:
         applies the real Ackermann + steering_curve correction; when None (e.g. offline
         validate_mpc_solve.py/inspect_one_sample.py samples with no live vehicle actor), falls back
         to the flat steer_from_delta() scale -- this fallback is steering-only, unaffected by
-        gear/a_meas being required now. Returns (steer, throttle, brake, metadata), same shape
-        PIDController.control_pid() returns (this one just never takes target/local_command_xy --
-        see module docstring point 1). Named control_mpc(), not control_pid(), since this class is
-        MPC-based -- see class docstring."""
+        gear/a_meas being required now.
+
+        target/ego_xy/ego_yaw/global_path (all optional, all four needed together) enable the
+        ROUTE OVERRIDE. target is local_command_xy, the route planner's next command point in
+        VAD's own [lateral, forward] ego frame. ego_xy/ego_yaw are the ego's CARLA WORLD pose
+        (metres, radians) -- read them straight off the hero actor's transform, not off the
+        compass/GPS pair, so they land in the same frame as global_path with no convention to get
+        wrong. global_path is a GlobalPath built once per route.
+
+        When route_override_decision() fires, the LATERAL reference (e_y, e_psi, curvature
+        preview) switches from VAD's plan to the route; the SPEED preview never does. See that
+        function and GlobalPath for why, and preview_from_splines()'s kappa_path argument for how
+        the two parameterizations share one station cursor. With any of the four missing this is
+        exactly the old VAD-only controller -- which is also the deliberate fallback for the ticks
+        before the hero actor exists.
+
+        Returns (steer, throttle, brake, metadata), same shape PIDController.control_pid()
+        returns. Named control_mpc(), not control_pid(), since this class is MPC-based -- see
+        class docstring."""
         speed = float(speed)
         vx = speed
 
@@ -1063,6 +1272,44 @@ class MpcKfController:
         r = r_meas
 
         path, vx_spline, s_max_wp = build_trajectory_splines(waypoints, speed)
+
+        # ------------------------------------------------------------------ route override
+        # Project onto the route on EVERY tick when one is available, not only while overriding:
+        # the station cursor has to keep advancing or its search window goes stale, and having e_y
+        # logged even in VAD mode is what makes it possible to tell afterwards whether the ego was
+        # drifting off the route before the override ever fired.
+        route_s, route_e_y, route_psi = None, None, None
+        if global_path is not None and ego_xy is not None:
+            try:
+                route_s, route_e_y, route_psi = global_path.project(ego_xy, self._route_s)
+                self._route_s = route_s
+            except Exception:
+                route_s, route_e_y, route_psi = None, None, None
+
+        fired, ang_aim, ang_target, ang_last = route_override_decision(waypoints, target)
+        # Release delay, not a symmetric hysteresis band: the trigger is a disagreement between two
+        # angles that both move every tick, so it chatters on and off around the threshold. Latching
+        # for a few ticks after it last fired keeps the reference from alternating at 20 Hz, which
+        # the plant would see as a disturbance rather than a command. Engaging is instant -- the
+        # case this exists for is a sudden turn command, and delaying that defeats the point.
+        if fired:
+            self._override_hold = self.override_hold_ticks
+        elif self._override_hold > 0:
+            self._override_hold -= 1
+        use_route = (self._override_hold > 0 and route_s is not None and ego_yaw is not None)
+
+        if use_route:
+            e_y0 = route_e_y
+            e_psi0 = _wrap_pi(float(ego_yaw) - route_psi)
+            kappa_path, kappa_s0, ref_source = global_path, route_s, "global"
+        else:
+            # VAD reference: the fit passes through the ego by construction (the origin is its
+            # first point), so e_y is 0 -- measured, not assumed: the smoothing spline's offset at
+            # s=0 is median 1.3 mm / max 5.3 cm over 2729 real ticks.
+            e_y0 = 0.0
+            e_psi0 = -float(path.yaw(0.0))
+            kappa_path, kappa_s0, ref_source = None, 0.0, "vad"
+
         # One station-walk feeds both MPCs, evaluated at the longer of the two horizons -- module
         # docstring point 5 -- LateralMPC then takes the matching-length PREFIX of the same array
         # rather than a second, independently-walked preview (n_p_speed=40 > n_p=25 by default, so
@@ -1071,7 +1318,8 @@ class MpcKfController:
         # knows about upcoming curvature, and the lateral prefix stays consistent with it.
         n_p_preview = max(self.n_p, self.n_p_speed)
         vx_preview_full, kappa_preview_full = preview_from_splines(
-            path, vx_spline, s_max_wp, n_p_preview, self.dt, ay_max=self.ay_max)
+            path, vx_spline, s_max_wp, n_p_preview, self.dt, ay_max=self.ay_max,
+            kappa_path=kappa_path, kappa_s0=kappa_s0)
         vx_preview_lat, kappa_preview_lat = vx_preview_full[:self.n_p], kappa_preview_full[:self.n_p]
         vx_preview_speed = vx_preview_full[:self.n_p_speed]
 
@@ -1085,7 +1333,11 @@ class MpcKfController:
         # why this only showed up once VAD's plan had a real heading offset at s=0.
         # This is what drove route 28154 off the road: at the frame before impact VAD's plan started
         # +3.7 deg to the right and the controller answered with -7.26 deg of left steer.
-        x0 = [v_y, r, 0.0, -float(path.yaw(0.0))]
+        # e_y0/e_psi0 come from whichever reference won above. Both definitions agree by
+        # construction: e_psi is psi_ego - psi_path in either frame (the VAD fit is written in an
+        # ego frame where psi_ego == 0, hence the bare negation there), and e_y is the offset onto
+        # the path's right normal, which is 0 when the path is defined to pass through the ego.
+        x0 = [v_y, r, e_y0, e_psi0]
         delta = self.lateral_mpc.solve(x0, vx_preview_lat, kappa_preview_lat)
         self.prev_delta = delta
         steer = (steer_from_delta_physics(delta, physics, vx) if physics is not None
@@ -1124,5 +1376,14 @@ class MpcKfController:
             'pedal_saturated': self.pedal_ctrl.saturated, 'gear': int(gear),
             'steer_physics_corrected': physics is not None,
             'kf_status': self.lateral_mpc.last_status, 'speed_mpc_status': self.speed_mpc.last_status,
+            # Route-override diagnostics. ref_source is the one field that says which geometry the
+            # steering actually came from on this tick -- without it a run cannot be attributed
+            # after the fact, since the override leaves no other trace in the control signal.
+            'ref_source': ref_source, 'e_y': float(e_y0), 'e_psi': float(e_psi0),
+            'override_fired': bool(fired), 'override_hold': int(self._override_hold),
+            'route_s': (None if route_s is None else float(route_s)),
+            'route_e_y': (None if route_e_y is None else float(route_e_y)),
+            'angle_aim': float(ang_aim), 'angle_target': float(ang_target),
+            'angle_last': float(ang_last),
         }
         return steer, throttle, brake, metadata

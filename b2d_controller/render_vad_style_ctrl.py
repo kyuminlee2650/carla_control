@@ -56,6 +56,7 @@ FFMPEG_CANDIDATES = ("/home/ailab/miniconda3/envs/pdm/bin/ffmpeg", "ffmpeg")
 
 # Same house palette analyze_run_log.py/viz_utils use, in BGR for cv2 and hex for matplotlib.
 INK, MUTED, BLUE, AQUA, RED, ORANGE = "#0b0b0b", "#898781", "#2a78d6", "#1baf7a", "#e34948", "#eb6834"
+PURPLE = "#8b5cf6"     # route-reference shading; kept off ORANGE, which means a violation here
 
 _RVS = None      # render_vad_style module, loaded once per process (see _load_rvs)
 _HIST = None     # whole-run series for the rolling plot, set in the Pool initializer
@@ -72,6 +73,50 @@ def _load_rvs(path):
 
 # --------------------------------------------------------------------------- run series
 
+def route_mode(meta):
+    """(active, label, kind) -- whether the steering was driven off the GLOBAL ROUTE this tick.
+
+    One label for both controllers ("GLOBAL ROUTE" / "VAD PLAN"), because the question the label
+    answers is the same for both: is the steering being informed by the map route right now, or
+    only by VAD's local plan? What differs is HOW MUCH route information is used, and that is
+    carried by `kind` -> colour instead of by wording:
+
+      MpcKfController  writes ref_source directly. "global" means the whole lateral reference --
+                       e_y, e_psi and the 25-step curvature preview -- came from the reconstructed
+                       route instead of VAD's plan.
+      stock PID        has no such mode. Its `use_target_to_aim` branch swaps ONE scalar aim angle
+                       for that tick and never follows a route. It leaves no flag either, so the
+                       state is reconstructed from the angles it does record: angle_final is
+                       whichever of angle / angle_target it picked, so the branch was taken when
+                       angle_final equals angle_target AND that differed from the VAD aim (equal
+                       values mean the branch changed nothing and is not worth marking).
+    """
+    if "ref_source" in meta:
+        on = meta.get("ref_source") == "global"
+        return on, ("GLOBAL ROUTE" if on else "VAD PLAN"), "mpc"
+    if "angle_final" in meta:
+        a, at, af = meta.get("angle"), meta.get("angle_target"), meta.get("angle_final")
+        if a is None or at is None or af is None:
+            return None, None, None
+        on = abs(af - at) < 1e-12 and abs(a - at) > 1e-12
+        return on, ("GLOBAL ROUTE" if on else "VAD PLAN"), "pid"
+    return None, None, None
+
+
+def _true_spans(flags, t):
+    """Contiguous [t_start, t_end] ranges where flags is True -- for axvspan shading."""
+    spans, start = [], None
+    for i, f in enumerate(flags):
+        if f and start is None:
+            start = i
+        elif not f and start is not None:
+            spans.append((t[start], t[i]))
+            start = None
+    if start is not None:
+        spans.append((t[start], t[-1]))
+    return spans
+
+
 def load_history(dump_dir):
     """Every meta/*.json as arrays, for the rolling strip chart at the bottom of the panel.
 
@@ -85,9 +130,13 @@ def load_history(dump_dir):
             recs.append(json.load(f))
         idx.append(int(fp[:-5]))
     get = lambda k: np.asarray([r.get(k, np.nan) for r in recs], dtype=float)
+    modes = [route_mode(r)[0] for r in recs]
+    kind = next((route_mode(r)[2] for r in recs if route_mode(r)[2]), None)
     return dict(idx=np.asarray(idx), t=np.asarray(idx) * TICK_DT_S,
                 speed=get("speed"), throttle=get("throttle"), brake=get("brake"),
                 steer=get("steer"), a_cmd=get("a_cmd"),
+                route_on=np.asarray([bool(m) for m in modes]),
+                route_known=any(m is not None for m in modes), route_kind=kind,
                 is_mpc=bool(recs) and "delta_rad" in recs[0])
 
 
@@ -126,6 +175,15 @@ def _strip_chart(hist, t_now, width, height, dpi=100):
         a.tick_params(labelsize=7, colors=MUTED)
         a.axvline(t_now, color=RED, linewidth=1.4, zorder=5)
 
+    # Shade the stretches where the route reference was engaged, on BOTH axes, so the badge above
+    # has a whole-run context: you can see at a glance whether this tick sits inside a long
+    # engagement or a brief one, and how the speed trace behaves across the boundary.
+    if hist.get("route_known"):
+        for a in (ax, ax2):
+            for t0, t1 in _true_spans(hist["route_on"], hist["t"]):
+                a.axvspan(t0, t1, color=(PURPLE if hist.get("route_kind") == "mpc" else MUTED),
+                          alpha=0.16, linewidth=0, zorder=0)
+
     ax.plot(hist["t"], hist["speed"], color=BLUE, linewidth=1.2)
     ax.set_ylabel("v (m/s)", fontsize=8, color=MUTED)
     plt.setp(ax.get_xticklabels(), visible=False)
@@ -155,6 +213,25 @@ def control_panel(meta, frame_idx, hist):
     speed = float(meta.get("speed", float("nan")))
     cv2.putText(img, f"{speed:5.2f}", (24, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (20, 20, 20), 3, cv2.LINE_AA)
     cv2.putText(img, "m/s", (185, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 120, 120), 2, cv2.LINE_AA)
+
+    # Which reference the steering is following, as a badge -- the override leaves no trace in the
+    # control signal itself, so without this the video cannot be attributed tick by tick.
+    on, label, kind = route_mode(meta)
+    if label is not None:
+        x0, y0, x1, y1 = 286, 96, PANEL_W - 24, 144
+        # Colour carries WHICH intervention, not just whether one is active: purple = the MPC's
+        # full lateral-reference switch, grey = stock PID's one-angle swap. They were the same
+        # purple at first, which read as "these two do the same thing" -- they do not.
+        fill = ((246, 92, 139) if kind == "mpc" else (150, 148, 140)) if on else (222, 222, 220)
+        cv2.rectangle(img, (x0, y0), (x1, y1), fill, -1)
+        cv2.rectangle(img, (x0, y0), (x1, y1), (190, 190, 188), 1)
+        cv2.putText(img, "lateral ref", (x0 + 12, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (255, 255, 255) if on else (130, 130, 130), 1, cv2.LINE_AA)
+        cv2.putText(img, label, (x0 + 12, y0 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.66,
+                    (255, 255, 255) if on else (90, 90, 90), 2, cv2.LINE_AA)
+        if on and meta.get("route_e_y") is not None:
+            cv2.putText(img, f"e_y {float(meta['route_e_y']):+.2f} m", (x0 + 12, y0 + 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
     _bar(img, 190, "throttle", float(meta.get("throttle", 0.0)), 0.0, 1.0, (122, 175, 27))   # AQUA
     _bar(img, 226, "brake", float(meta.get("brake", 0.0)), 0.0, 1.0, (72, 73, 227))          # RED

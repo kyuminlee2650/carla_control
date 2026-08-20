@@ -3,9 +3,9 @@ the identical LateralMPC/MpcLongitudinal control law, once with x0's v_y taken f
 ground truth ("mpc") and once with it taken from the Kalman filter's own online estimate ("mpc-kf"),
 then compare the two runs (trajectory overlay, 8-metric comparison, each trial's own lateral/
 longitudinal pair) via viz_utils.plot_comparison(). Structurally this file IS mpc_mpc_comparison.py
-(LateralMPC/MpcLongitudinal/run_trial/main all copied from it) with its "vad-pid" baseline swapped
-for "mpc-kf" -- see mpc_mpc_comparison.py's own docstring for the shared Step 1-4 design (route
-spline, longitudinal SpeedMPC, the LateralMPC QP itself, wiring order).
+(LateralMPC/MpcLongitudinal/run_trial/main all copied from it) with "mpc-kf" added alongside its
+"vad-pid" baseline -- see mpc_mpc_comparison.py's own docstring for the shared Step 1-4 design
+(route spline, longitudinal SpeedMPC, the LateralMPC QP itself, wiring order).
 
 Step 5 (the one addition): "mpc-kf" runs one VyKalmanFilter per trial (constructed in run_trial(),
 not main() -- OSQP/Kalman state is per-vehicle, same reason a fresh LateralMPC is built per trial).
@@ -22,14 +22,36 @@ every tick regardless of controller, so the "mpc-kf" run's own v_y_hat can be ch
 after a real drive, not just against the offline-replayed one -- see viz_utils.plot_lateral()'s
 v_y panel (ref_key="v_y_hat") and print_error_summary()'s "v_y estimate" row.
 
-Usage (Ubuntu):
-    cd carla_control
+"vad-pid" is a third pick for --controller, carried over unchanged from mpc_mpc_comparison.py
+(_vad_waypoints_and_target + VadPidController, same adapter and same reasoning) so this file can
+score the Kalman-filtered stack against the real Bench2DriveZoo/VAD baseline as well as against its
+own ground-truth twin -- any two or three of "mpc"/"mpc-kf"/"vad-pid" can be run in one command and
+land in the same comparison figures.
+
+Usage (Ubuntu -- verified on this lab machine):
+    # 1) the simulator, in its own terminal. This box's CARLA is NOT the ~/carla/CARLA_0.9.15 path
+    #    hardcoded above/in $CARLA_ROOT (that one no longer exists here) -- functions.py finds the
+    #    real tree by probing, see resolve_carla_root():
+    #      /home/ailab/2026intern/carla/CarlaUE4.sh
+    # 2) the controller, from this repo's own venv. The venv interpreter is spelled out on every
+    #    line below on purpose, so any one of them can be copied and run on its own: the system
+    #    python3 has neither carla nor osqp installed, so a bare `python3 mpc_mpc_KF.py` fails
+    #    unless the venv happens to be active. `source .venv/bin/activate` once and then using
+    #    plain `python3` is equivalent.
+    cd ~/carla_control
     # ground-truth baseline alone (3 figures, same as mpc_mpc.py)
-    python3 mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --controller mpc
+    .venv/bin/python mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --controller mpc
     # closed-loop KF verification: both runs + comparison figures
-    python3 mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --controller mpc mpc-kf
-    # with Q/R found by `python3 kalman_filter.py --tune`
-    python3 mpc_mpc_KF.py --controller mpc mpc-kf --save-plot \
+    .venv/bin/python mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --controller mpc mpc-kf
+    # against the real VAD/Bench2Drive PID baseline (any subset, in any order)
+    .venv/bin/python mpc_mpc_KF.py --profile step --initial-speed 10 --save-plot --controller mpc-kf vad-pid --record
+    .venv/bin/python mpc_mpc_KF.py --profile constant --initial-speed 5 --save-plot --record \
+        --controller mpc mpc-kf vad-pid
+    # emergency stop at t=10s, held 5s, then straight back up to --initial-speed (see --profile step)
+    .venv/bin/python mpc_mpc_KF.py --profile step --initial-speed 10 --step-time 10 --step-size -10 \
+        --step-duration 5 --save-plot --controller mpc mpc-kf vad-pid
+    # with Q/R found by `.venv/bin/python kalman_filter.py --tune`
+    .venv/bin/python mpc_mpc_KF.py --controller mpc mpc-kf --save-plot \
         --kf-q-vy 1e-3 --kf-q-r 1e-3 --kf-r-dpsi 1e-5 --kf-r-ay 4e-2
 """
 
@@ -45,6 +67,13 @@ from types import SimpleNamespace
 import numpy as np
 import osqp
 from scipy import sparse
+from scipy.linalg import expm
+
+# vx 하한. forward Euler 였을 때 이 값(0.5)은 안정성 장치였다 -- 이산 A 가 저속에서 단위원을
+# 벗어나므로 모델을 그 아래에서 못 쓰게 막아야 했다. 정확한 ZOH 는 전 속도에서 수축하므로 그
+# 역할이 사라지고, 남는 것은 1/vx 의 0 나눗셈 방어뿐이다. 그래서 수치가 여전히 움직이는 어떤
+# 속도보다도 훨씬 아래로 내린다 (b2d_controller/mpc_kf_controller.py 의 VX_EPS 와 같은 값).
+VX_EPS = 1e-3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,8 +93,9 @@ from kalman_filter.kalman_filter import VyKalmanFilter
 from longitudinal_lut import LongitudinalLUT
 from lookup_controller import LookupController
 from longitudinal_mpc import SpeedMPC
+from vad_pid_controller import PIDController as VadPIDController
 from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_comparison, plot_kf_run,
-                       plot_results, print_error_summary, run_name)
+                       plot_results, print_error_summary, run_name, stack_videos_side_by_side)
 
 # Fixed on purpose, same as stanley_mpc.py: the route (build_path()'s default origin/dest spawn
 # indices) is a property of this specific map, not something to rediscover via CLI flags.
@@ -194,7 +224,7 @@ class LateralMPC:
 
     def __init__(self, dt, n_p, n_c, mass, Iz, lf, lr, Cf, Cr,
                 w_ey, w_epsi, w_ay, w_r, w_rdot, w_delta, w_ddelta,
-                delta_max, ddelta_max, vx_floor=0.5):
+                delta_max, ddelta_max, vx_floor=VX_EPS):
         if not (0 < n_c <= n_p):
             raise ValueError(f"need 0 < n_c <= n_p, got n_c={n_c}, n_p={n_p}")
         if not (delta_max > 0 and ddelta_max > 0):
@@ -205,7 +235,9 @@ class LateralMPC:
         self.delta_max, self.ddelta_max, self.vx_floor = delta_max, ddelta_max, vx_floor
 
         self.B_cont = np.array([[Cf / mass], [lf * Cf / Iz], [0.0], [0.0]])
-        self.B_disc = dt * self.B_cont   # forward-Euler: Bd = dt*B, same scaling _discretize() gives Ed
+        # Bd is no longer a constant: under exact ZOH it is
+        # integral_0^dt expm(A s) ds * B, and A depends on vx, so _discretize() returns one Bd per
+        # previewed step. Kept here only because _continuous()/B_cont callers still read B_cont.
         self.D = np.array([[0.0], [0.0], [Cf / mass], [0.0], [lf * Cf / Iz]])
 
         self.M_c = self._build_hold_matrix(n_p, n_c)
@@ -266,16 +298,40 @@ class LateralMPC:
         return A, E, C
 
     def _discretize(self, vx_preview):
-        Ad, Ed, Ck = [], [], []
-        eye = np.eye(self.N_X)
+        """Exact zero-order-hold discretization of (A, B, E) at each previewed speed, via
+
+            expm([[A, B, E],
+                  [0, 0, 0],
+                  [0, 0, 0]] * dt)  =  [[Ad, Bd, Ed],
+                                        [ 0,  1,  0],
+                                        [ 0,  0,  1]]
+
+        The augmented-matrix identity is used rather than the usual Bd = A^-1 (Ad - I) B because A
+        is SINGULAR here -- the e_y and e_psi rows are pure integrators, so A has two zero
+        eigenvalues at every speed and the inverse does not exist.
+
+        This replaces forward Euler (Ad = I + dt*A). Euler is only accurate while dt*|lambda| << 1,
+        and the bicycle model's lateral eigenvalues scale as 1/vx, so at low speed the discrete A
+        left the unit circle and the prediction diverged. Exact ZOH is contractive at every speed.
+        Cost is one expm of a 6x6 per previewed step, ~72 us measured, i.e. ~1.8 ms for a 25-step
+        horizon against a 50 ms control period.
+        """
+        Ad, Bd, Ed, Ck = [], [], [], []
+        n = self.N_X
         for vx in vx_preview:
             A, E, C = self._continuous(vx)
-            Ad.append(eye + self.dt * A)
-            Ed.append(self.dt * E)
+            aug = np.zeros((n + 2, n + 2))
+            aug[:n, :n] = A
+            aug[:n, n:n + 1] = self.B_cont
+            aug[:n, n + 1:n + 2] = E
+            M = expm(aug * self.dt)
+            Ad.append(M[:n, :n])
+            Bd.append(M[:n, n:n + 1])
+            Ed.append(M[:n, n + 1:n + 2])
             Ck.append(C)
-        return Ad, Ed, Ck
+        return Ad, Bd, Ed, Ck
 
-    def _condense(self, Ad, Ed, Ck):
+    def _condense(self, Ad, Bd, Ed, Ck):
         n_p, n_x, n_y = self.n_p, self.N_X, self.N_Y
         A_bar = np.zeros((n_p * n_x, n_x))
         B_full = np.zeros((n_p * n_x, n_p))
@@ -287,7 +343,7 @@ class LateralMPC:
             A_bar[k * n_x:(k + 1) * n_x, :] = prod
 
         for j in range(n_p):
-            col_b = self.B_disc.copy()
+            col_b = Bd[j].copy()      # per-step now, see _discretize's docstring
             col_e = Ed[j].copy()
             B_full[j * n_x:(j + 1) * n_x, j:j + 1] = col_b
             E_bar[j * n_x:(j + 1) * n_x, j:j + 1] = col_e
@@ -314,8 +370,8 @@ class LateralMPC:
         kappa_preview = np.asarray(kappa_preview, dtype=float)
         x0 = np.asarray(x0, dtype=float).reshape(-1, 1)
 
-        Ad, Ed, Ck = self._discretize(vx_preview)
-        A_bar, B_bar, E_bar, C_bar, D_bar = self._condense(Ad, Ed, Ck)
+        Ad, Bd, Ed, Ck = self._discretize(vx_preview)
+        A_bar, B_bar, E_bar, C_bar, D_bar = self._condense(Ad, Bd, Ed, Ck)
 
         K = kappa_preview.reshape(-1, 1)
         y_ref = np.zeros((self.n_p * self.N_Y, 1))
@@ -400,6 +456,96 @@ def vx_preview_for_lateral(ctx, n_p_lat):
     return np.concatenate([raw, np.full(n_p_lat - len(raw), raw[-1])])
 
 
+# ----------------------------------------------------------------------------- VAD/Bench2Drive PID baseline
+# Copied verbatim from mpc_mpc_comparison.py (adapter + wrapper), not imported: that file is a
+# sibling script rather than a library, and importing it would drag its whole argparse/main and a
+# second copy of LateralMPC in with it. Keep the two in sync by hand if either is edited.
+
+def _vad_waypoints_and_target(path, last_s, ego_x, ego_y, yaw, target_speed,
+                              n_wp=6, dt_wp=0.5, target_lookahead_m=10.0):
+    """Synthesize VAD's two control_pid() inputs from this repo's own reference PathSpline, since
+    this repo has neither a learned trajectory predictor nor CARLA's discrete route commands:
+
+      waypoints: n_wp points spaced dt_wp seconds apart AT THE FLAT target_speed (never
+                 curvature-refined -- the baseline doesn't get that feature, per instruction),
+                 matching VAD's own 6-step/0.5s prediction cadence, each rotated into the ego frame
+                 in VAD's own [lateral, forward] axis order (this repo's usual convention elsewhere
+                 is [forward, lateral] -- confirmed opposite by reading control_pid()'s own
+                 angle = degrees(pi/2 - atan2(aim[1], aim[0])) formula: that only zeroes out on a
+                 straight-ahead point if index 0 is lateral and index 1 is forward).
+      target:    one further point (target_lookahead_m ahead), standing in for VAD's coarse
+                 route-command waypoint -- this repo has no discrete turn commands to draw one from,
+                 so a fixed lookahead is the practical substitute.
+
+    Sign of "lateral" here was only reasoned from the source, not confirmed by driving -- flip it in
+    the rotation below if a live CARLA check shows the car steering the wrong way.
+
+    Past path.s_max, points are extrapolated straight along the route's own final tangent rather
+    than clamped to s_max: clamping made every waypoint within one dt_wp*target_speed of the goal
+    collapse onto the exact same point (s_max), so control_pid()'s desired_speed -- the norm of
+    consecutive waypoint differences -- read as 0 and its brake<desired_speed<brake_speed check
+    slammed the brake on ~7.5 m (at 15 m/s) short of the goal, well outside run_trial()'s own
+    "reached end" band (last_s >= path.s_max - 0.1) -- the trial then never finishes early and just
+    sits there until --max-duration. Extrapolating keeps the preview's own forward speed nonzero
+    all the way through the actual finish line instead.
+
+    target_speed = 0 (the --profile step stop window, see functions.speed_reference) collapses every
+    waypoint onto the single point at last_s on purpose: control_pid() then reads desired_speed = 0
+    and brakes, which is exactly the commanded behaviour. Steering does NOT degenerate with it --
+    target above is a fixed GEOMETRIC lookahead, independent of target_speed, and control_pid()'s
+    own use_target_to_aim test (|angle_target| < |angle|) switches to it precisely when the collapsed
+    waypoints make its own aim angle meaningless.
+    """
+    def _ego_frame(s):
+        if s <= path.s_max:
+            wx, wy = path.xy(s)
+        else:
+            x_end, y_end = path.xy(path.s_max)
+            yaw_end = float(path.yaw(path.s_max))
+            overshoot = s - path.s_max
+            wx = x_end + overshoot * math.cos(yaw_end)
+            wy = y_end + overshoot * math.sin(yaw_end)
+        dx, dy = wx - ego_x, wy - ego_y
+        forward = dx * math.cos(yaw) + dy * math.sin(yaw)
+        lateral = -dx * math.sin(yaw) + dy * math.cos(yaw)
+        return lateral, forward
+
+    waypoints = []
+    s = last_s
+    for _ in range(n_wp):
+        s = s + max(target_speed, 0.0) * dt_wp
+        waypoints.append(_ego_frame(s))
+    waypoints = np.array(waypoints, dtype=float)
+
+    target = np.array(_ego_frame(last_s + target_lookahead_m), dtype=float)
+    return waypoints, target
+
+
+class VadPidController:
+    """Wraps vad_pid_controller.PIDController -- VAD/Bench2Drive's real baseline, doing lateral AND
+    longitudinal control in one combined call (unlike this file's split LateralMPC/MpcLongitudinal
+    pair). Speed target is ctx.v_ref, the flat/un-refined reference -- never run through
+    refine_speed_preview(), per instruction: the curvature-aware speed cap is specific to the stack
+    being evaluated, not the baseline it's compared against.
+
+    No Kalman filter is involved on this branch either way: control_pid() never uses v_y, so there
+    is nothing for a v_y estimate to feed -- "vad-pid" is a baseline for the whole stack, not a
+    third v_y source."""
+    label = "VAD-PID"
+
+    def __init__(self, args):
+        self.pid = VadPIDController()
+
+    def reset(self, u=None):
+        pass   # no warm-up state of its own to drop (unlike MpcLongitudinal's PID pedal layer)
+
+    def step(self, ctx):
+        waypoints, target = _vad_waypoints_and_target(
+            ctx.path, ctx.last_s, ctx.ego_x, ctx.ego_y, ctx.yaw, ctx.v_ref)
+        steer, throttle, brake, _ = self.pid.control_pid(waypoints, ctx.v_x, target)
+        return float(steer), float(throttle), bool(brake)
+
+
 # ----------------------------------------------------------------------------- one trial
 
 def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, controller,
@@ -422,7 +568,9 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
     LateralMPC (lateral) pair -- they differ in exactly one thing, what feeds x0's v_y slot each
     tick. "mpc" uses CARLA's own ground truth (vehicle.get_velocity(), body frame); "mpc-kf" runs a
     VyKalmanFilter (constructed below, per-trial like lateral_mpc) and uses its v_y_hat instead --
-    see the module docstring's "Step 5" for the causality/noise details.
+    see the module docstring's "Step 5" for the causality/noise details. "vad-pid" takes neither
+    branch: it runs `controller` (a VadPidController) as one combined lateral+longitudinal call, so
+    neither LateralMPC nor the filter is built for it at all.
 
     video_suffix: appended to the recorded filename (run_name()'s own suffix mechanism) so two
     controllers recorded in the same process (--controller a b --record) don't overwrite each
@@ -440,7 +588,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
     """
     vehicle = world.spawn_actor(blueprint, spawn_transform)
     physics = vehicle.get_physics_control()
-    _, lf, lr, _ = get_vehicle_geometry(vehicle, spawn_transform)
+    _, lf, lr, max_steer = get_vehicle_geometry(vehicle, spawn_transform)
 
     # delta_max capped well under max_steer (the wheel's own physical limit, ~70 deg): Cf/Cr were
     # calibrated over an ~8-16 deg range (estimate_cornering_stiffness.py), so the linear tire model
@@ -449,12 +597,14 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
     # smaller angle than the inner wheel for the same turn. --delta-max-deg picks a value inside
     # both limits rather than deriving the (still oversized, relative to the tire model) Ackermann
     # bound.
-    lateral_mpc = LateralMPC(
-        dt=args.dt, n_p=args.lat_n_p, n_c=args.lat_n_c,
-        mass=args.mass, Iz=args.iz, lf=lf, lr=lr, Cf=args.cf, Cr=args.cr,
-        w_ey=args.w_ey, w_epsi=args.w_epsi, w_ay=args.w_ay, w_r=args.w_r, w_rdot=args.w_rdot,
-        w_delta=args.w_delta, w_ddelta=args.w_ddelta,
-        delta_max=math.radians(args.delta_max_deg), ddelta_max=math.radians(args.ddelta_max_deg) * args.dt)
+    lateral_mpc = None
+    if controller_key in ("mpc", "mpc-kf"):
+        lateral_mpc = LateralMPC(
+            dt=args.dt, n_p=args.lat_n_p, n_c=args.lat_n_c,
+            mass=args.mass, Iz=args.iz, lf=lf, lr=lr, Cf=args.cf, Cr=args.cr,
+            w_ey=args.w_ey, w_epsi=args.w_epsi, w_ay=args.w_ay, w_r=args.w_r, w_rdot=args.w_rdot,
+            w_delta=args.w_delta, w_ddelta=args.w_ddelta,
+            delta_max=math.radians(args.delta_max_deg), ddelta_max=math.radians(args.ddelta_max_deg) * args.dt)
 
     # v_y estimator for "mpc-kf" -- one filter per trial, same reason lateral_mpc above is built
     # fresh per trial rather than shared. prev_delta_for_kf carries the steering angle actually
@@ -467,7 +617,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
             Q=np.diag([args.kf_q_vy, args.kf_q_r]),
             R=np.diag([args.kf_r_dpsi if args.kf_r_dpsi is not None else math.radians(args.kf_gyro_std) ** 2,
                       args.kf_r_ay if args.kf_r_ay is not None else args.kf_accel_std ** 2]),
-            vx_floor=0.5, x0=[0.0, 0.0], P0=np.eye(2))
+            vx_floor=VX_EPS, x0=[0.0, 0.0], P0=np.eye(2))
         kf_rng = np.random.default_rng(args.kf_seed)
 
     accel = ImuAcceleration(dt=args.dt)
@@ -479,11 +629,11 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
 
     # matches plot_results()'s expectations (viz_utils.plot_lateral/plot_longitudinal/plot_trajectory).
     # v_y_hat/dpsi_noisy/ay_noisy only ever get appended to for "mpc-kf" below -- stay empty for
-    # "mpc", which viz_utils._get() treats the same as "never recorded" (see plot_lateral's
+    # "mpc"/"vad-pid", which viz_utils._get() treats the same as "never recorded" (see plot_lateral's
     # ref_key="v_y_hat", print_error_summary's "v_y estimate" row, and main()'s extra
     # plot_kf_run() figure for the "mpc-kf" trial only).
     hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_y_hat": [], "dpsi_noisy": [],
-            "ay_noisy": [], "v_des": [], "a_x": [],
+            "ay_noisy": [], "v_des": [], "v_des_curve": [], "a_x": [], "a_x_raw": [], "a_y_raw": [],
             "jerk": [], "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "steer_deg": [],
             "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [], "e_theta": [],
             "a_cmd": []}
@@ -500,6 +650,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
 
     imu = None
     recorder = None
+    video_meta = None   # 녹화했을 때만 채워진다 (run_trial 의 반환값 2번째)
     try:
         world.tick()
 
@@ -522,6 +673,10 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
         steps = int((args.max_duration + warm_start_timeout) / args.dt)
         for i in range(steps):
             step_start = time.time()
+            # 녹화 중이면 인코더가 밀린 만큼 여기서 기다린다 (프레임 유실 -> 영상 끊김 방지).
+            # 카메라는 tick 당 한 장을 내므로 다음 tick 을 미루는 것이 곧 역압이다.
+            if recorder is not None:
+                recorder.throttle()
             world.tick()
             # 10s, not 2s: right after a fresh client.load_world(), the server is still streaming
             # map assets/compiling shaders, so the first several ticks can take much longer than a
@@ -539,6 +694,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
 
             accel.step(imu_data)
             a_x, a_x_raw, a_y = accel.a_x, accel.a_x_raw, accel.a_y
+            a_y_raw = accel.a_y_raw
             jerk, jerk_total = accel.jerk, accel.jerk_total
 
             yaw_acc = yaw_acc_filter.step(
@@ -551,39 +707,56 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
                                   gear=vehicle.get_control().gear, warmed_up=warmed_up,
                                   path=path, last_s=last_s, ego_x=ego_x, ego_y=ego_y, yaw=yaw)
 
-            # v_y source for x0, computed BEFORE x0 itself: "mpc-kf" needs its filter's predict()+
-            # update() to have already run this tick (using vx measured just above and
-            # prev_delta_for_kf -- last tick's delta, since this tick's doesn't exist until
-            # lateral_mpc.solve() below computes it) -- see module docstring's Step 5. x0's r stays
-            # the real gyro reading either way, only v_y is swapped.
-            if controller_key == "mpc-kf":
-                r_meas = r + kf_rng.normal(0.0, math.radians(args.kf_gyro_std))
-                ay_meas = a_y + kf_rng.normal(0.0, args.kf_accel_std)
-                kf.step(v_x, prev_delta_for_kf, [r_meas, ay_meas])
-                v_y_for_x0 = kf.v_y
-            else:
-                v_y_for_x0 = v_y   # "mpc" -- ground truth
+            if controller_key in ("mpc", "mpc-kf"):
+                # v_y source for x0, computed BEFORE x0 itself: "mpc-kf" needs its filter's predict()+
+                # update() to have already run this tick (using vx measured just above and
+                # prev_delta_for_kf -- last tick's delta, since this tick's doesn't exist until
+                # lateral_mpc.solve() below computes it) -- see module docstring's Step 5. x0's r stays
+                # the real gyro reading either way, only v_y is swapped.
+                if controller_key == "mpc-kf":
+                    r_meas = r + kf_rng.normal(0.0, math.radians(args.kf_gyro_std))
+                    ay_meas = a_y + kf_rng.normal(0.0, args.kf_accel_std)
+                    kf.step(v_x, prev_delta_for_kf, [r_meas, ay_meas])
+                    v_y_for_x0 = kf.v_y
+                else:
+                    v_y_for_x0 = v_y   # "mpc" -- ground truth
 
-            # longitudinal (MPC) runs first so ctx.v_x_preview is ready for the lateral schedule
-            # below (see the "which speed plan" discussion in mpc_mpc_comparison.py's module
-            # docstring)
-            u = controller.step(ctx)
+                # longitudinal (MPC) runs first so ctx.v_x_preview is ready for the lateral schedule
+                # below (see the "which speed plan" discussion in mpc_mpc_comparison.py's module
+                # docstring)
+                u = controller.step(ctx)
 
-            last_s, raw_e_y = lateral_error(ego_x, ego_y, path, last_s)
-            yaw_s = float(path.yaw(last_s))
-            road_heading = rh_unwrapper.step(yaw_s)
-            e_theta = normalize_angle(yaw_s - yaw)
-            vx_preview = vx_preview_for_lateral(ctx, lateral_mpc.n_p)
-            kappa_preview = curvature_preview(path, last_s, vx_preview, args.dt)
-            x0 = [v_y_for_x0, r, raw_e_y, -e_theta]
-            delta = lateral_mpc.solve(x0, vx_preview, kappa_preview)
-            prev_delta_for_kf = delta   # this tick's delta becomes next tick's "already applied"
+                last_s, raw_e_y = lateral_error(ego_x, ego_y, path, last_s)
+                yaw_s = float(path.yaw(last_s))
+                road_heading = rh_unwrapper.step(yaw_s)
+                e_theta = normalize_angle(yaw_s - yaw)
+                vx_preview = vx_preview_for_lateral(ctx, lateral_mpc.n_p)
+                kappa_preview = curvature_preview(path, last_s, vx_preview, args.dt)
+                x0 = [v_y_for_x0, r, raw_e_y, -e_theta]
+                delta = lateral_mpc.solve(x0, vx_preview, kappa_preview)
+                prev_delta_for_kf = delta   # this tick's delta becomes next tick's "already applied"
 
-            control = control_input(u, delta, v_x, vehicle, physics)
-            steer_deg = math.degrees(delta)
-            throttle_log, brake_log = control.throttle, control.brake
-            a_cmd_log, v_des_log = ctx.a_cmd, ctx.v_ref_curve
-            reset_arg = u
+                control = control_input(u, delta, v_x, vehicle, physics)
+                steer_deg = math.degrees(delta)
+                throttle_log, brake_log = control.throttle, control.brake
+                a_cmd_log, v_des_log = ctx.a_cmd, ctx.v_ref
+                v_des_curve_log = ctx.v_ref_curve
+                reset_arg = u
+            else:   # "vad-pid" -- single combined lateral+longitudinal call, see VadPidController
+                last_s, raw_e_y = lateral_error(ego_x, ego_y, path, last_s)
+                yaw_s = float(path.yaw(last_s))
+                road_heading = rh_unwrapper.step(yaw_s)
+                e_theta = normalize_angle(yaw_s - yaw)
+
+                steer, throttle, brake = controller.step(ctx)
+                vehicle.apply_control(carla.VehicleControl(
+                    steer=steer, throttle=throttle, brake=1.0 if brake else 0.0))
+                steer_deg = steer * math.degrees(max_steer)
+                throttle_log, brake_log = throttle, (1.0 if brake else 0.0)
+                a_cmd_log = float("nan")   # no scalar accel command in this controller -- see hist schema
+                v_des_log = ctx.v_ref      # flat/un-refined -- the baseline gets no curvature speed cap
+                v_des_curve_log = float("nan")   # 곡률 보정 자체가 없는 제어기
+                reset_arg = None
 
             follow_with_spectator(world, vehicle)
 
@@ -624,7 +797,16 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
                 hist["dpsi_noisy"].append(math.degrees(r_meas))   # same unit as hist["yaw_rate"]
                 hist["ay_noisy"].append(ay_meas)                  # same unit as hist["a_y"]
             hist["v_des"].append(v_des_log)
+            # 곡률 보정된 목표속도는 따로 보관: "v_des"(그래프/속도 RMSE 기준)는 이제 --profile 이
+            # 준 목표속도 그 자체이고, refine_speed_preview()가 커브 앞에서 깎아낸 값은 진단용으로만
+            # 남는다. "mpc"/"mpc-kf" 만 이 값을 가진다 ("vad-pid" 는 애초에 곡률 보정을 안 받음).
+            hist["v_des_curve"].append(v_des_curve_log)
             hist["a_x"].append(a_x)
+            # 필터 통과 전 원시 IMU 값 -- 공식 B2D comfortness 가 자기 Savitzky-Golay 를 직접
+            # 걸기 때문에, 여기서 이미 저역통과된 a_x/a_y 를 넘기면 이중 평활이 되어 점수가
+            # 실제보다 좋게 나온다 (viz_utils.b2d_comfortness 참고).
+            hist["a_x_raw"].append(a_x_raw)
+            hist["a_y_raw"].append(a_y_raw)
             hist["jerk"].append(jerk)
             hist["a_y"].append(a_y)
             hist["yaw_rate"].append(yaw_rate_deg)
@@ -655,12 +837,15 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
     finally:
         if recorder is not None:
             recorder.close()  # before vehicle.destroy(): the camera is attached to it
+            # 합치기(viz_utils.stack_videos_side_by_side)에 필요한 정보. frames 는 실제로 쓰인
+            # 프레임 수 -- 두 주행의 길이가 다를 때 짧은 쪽을 얼마나 늘릴지 계산하는 데 쓴다.
+            video_meta = {"path": recorder.out_path, "frames": recorder.frames}
         if imu is not None and imu.is_alive:
             imu.stop()
             imu.destroy()
         vehicle.destroy()
 
-    return hist
+    return hist, video_meta
 
 
 def main():
@@ -670,9 +855,9 @@ def main():
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
-    parser.add_argument("--times-run", type=float, default=20.0, help="how times for simulation running?")
+    parser.add_argument("--times-run", type=float, default=5.0, help="how times for simulation running?")
     parser.add_argument("--max-duration", type=float, default=100.0, help="scored run length (s)")
-    parser.add_argument("--spawn-x", type=float, default=-120.0,
+    parser.add_argument("--spawn-x", type=float, default=-90.0,
                         help="m -- vehicle spawns at the road waypoint nearest this raw map (x, y) "
                              "(see functions.spawn_at), NOT the route's own start; the scored route "
                              "itself (path_x/path_y, from build_path()'s own origin/dest indices) is "
@@ -686,7 +871,11 @@ def main():
     # ---- speed profile ---- #
     parser.add_argument("--profile", default="constant", choices=("constant", "sine", "step"),
                         help="speed reference shape: flat initial-speed, a sine wave around it, or "
-                             "a step change at --step-time")
+                             "a step change at --step-time held for --step-duration and then "
+                             "released back to --initial-speed. The step window is what makes an "
+                             "emergency-stop-and-restart run: --step-size -<initial speed> "
+                             "--step-duration <seconds> brakes to a standstill and then demands the "
+                             "original speed again in one step (see functions.speed_reference)")
     parser.add_argument("--initial-speed", type=float, default=10.0,
                         help="m/s -- kept modest by default: the route's sharpest corners "
                              "(~10-13m radius, idx~90-150) demand a_y=v^2/r that outgrows what "
@@ -694,8 +883,23 @@ def main():
                              "notes above LateralMPC's argparse group)")
     parser.add_argument("--sine-amplitude", type=float, default=3.0, help="sine profile peak deviation (m/s)")
     parser.add_argument("--sine-period", type=float, default=5.0, help="sine profile period (s)")
-    parser.add_argument("--step-size", type=float, default=3.0, help="step profile speed change (m/s)")
-    parser.add_argument("--step-time", type=float, default=10.0, help="step profile: when it happens (s)")
+    parser.add_argument("--step-size", type=float, default=-10.0,
+                        help="step profile speed change (m/s), signed. Negative decelerates; the "
+                             "result is clamped at 0, so anything <= -(initial speed) is a full stop")
+    parser.add_argument("--step-time", type=float, default=10.0,
+                        help="step profile: when it happens (s). Both step edges land here in the "
+                             "REFERENCE, not in the response: the longitudinal MPC sees them "
+                             "--np*--dt (2s by default) early through its own preview and starts "
+                             "braking/accelerating before the edge, while 'vad-pid' -- which has no "
+                             "preview at all -- only reacts once the edge has passed. That gap is a "
+                             "real difference between the two stacks, not a profile artifact")
+    parser.add_argument("--step-duration", type=float, default=5,
+                        help="step profile: how long the stepped speed is held (s) before the "
+                             "reference returns to --initial-speed. Default (unset) holds it for "
+                             "the rest of the run, the permanent step this profile used to be. "
+                             "Both edges are steps, so a stop window here is a hard decel followed "
+                             "by a hard re-accel -- how hard each one actually gets is bounded by "
+                             "--a-min/--a-max (the longitudinal MPC), not by this profile")
 
     # ---- longitudinal MPC ---- #
     mpc = parser.add_argument_group("longitudinal MPC")
@@ -737,7 +941,11 @@ def main():
                           "feedforward fights e_y/e_psi's own targets in a curve and was measured "
                           "to cost ~2m of steady cross-track offset before this was found)")
     lat.add_argument("--w-r", type=float, default=3, help="yaw rate tracking weight (see --w-ay)")
-    lat.add_argument("--w-rdot", type=float, default=120, help="yaw acceleration tracking weight (see --w-ay)")
+    lat.add_argument("--w-rdot", type=float, default=30,
+                     help="yaw acceleration tracking weight (see --w-ay). Lowered from 120: rdot is "
+                          "formed as D*delta with D = lf*Cf/Iz = 33.3, so the effective penalty on "
+                          "the input is w_rdot*D^2 -- 120 gave 1.3e5 against w_delta = 1, which "
+                          "throttled the steering response enough to cost route completion.")
     lat.add_argument("--w-delta", type=float, default=1, help="steer magnitude weight")
     lat.add_argument("--w-ddelta", type=float, default=30,
                      help="steer rate weight -- raised from 1 in the same B2D-penalty search that "
@@ -755,7 +963,7 @@ def main():
 
     # ---- controller selection ---- #
     parser.add_argument("--controller", nargs="+", default=["mpc"],
-                        choices=("mpc", "mpc-kf"),
+                        choices=("mpc", "mpc-kf", "vad-pid"),
                         help="which controller(s) to run this route with. One controller (default): "
                              "unchanged single-trial output (3 figures). Two or more: each runs its "
                              "own trial and results are compared instead (trajectory overlay + "
@@ -763,7 +971,10 @@ def main():
                              "'mpc' and 'mpc-kf' run the identical LateralMPC/MpcLongitudinal pair -- "
                              "'mpc' feeds x0 CARLA's own ground-truth v_y, 'mpc-kf' feeds it "
                              "VyKalmanFilter's online estimate instead (kalman_filter.py); running both "
-                             "is the closed-loop verification this file exists for -- see module docstring.")
+                             "is the closed-loop verification this file exists for -- see module docstring. "
+                             "'vad-pid' is the real Bench2DriveZoo/VAD baseline (PIDController.control_pid, "
+                             "see vad_pid_controller.py) -- combined lateral+longitudinal PID, binary "
+                             "brake, flat/un-refined speed target (no curvature-aware speed cap).")
 
     # ---- Kalman filter (v_y estimation, --controller mpc-kf) ---- #
     kfg = parser.add_argument_group("Kalman filter (--controller mpc-kf)")
@@ -836,23 +1047,39 @@ def main():
     blueprint = world.get_blueprint_library().filter("vehicle.lincoln.mkz_2020")[0]
     imu_bp = world.get_blueprint_library().find("sensor.other.imu")
 
-    controller_labels = {"mpc": "MPC", "mpc-kf": "MPC-KF"}
+    controller_labels = {"mpc": "MPC", "mpc-kf": "MPC-KF", "vad-pid": "VAD-PID"}
     multi = len(args.controller) > 1
     results = {}
+    videos = []   # [(label, mp4 경로, 프레임 수)] -- --controller 순서 유지
     try:
         for key in args.controller:
-            controller = MpcLongitudinal(args)   # both "mpc" and "mpc-kf" drive through this
+            # "mpc" and "mpc-kf" both drive through MpcLongitudinal; "vad-pid" replaces the whole
+            # split pair with its own combined controller instead.
+            controller = VadPidController(args) if key == "vad-pid" else MpcLongitudinal(args)
             print(f"\n=== running controller: {controller_labels[key]} ===")
-            hist = run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp,
-                             controller, key, args, spawn_to_start_m=spawn_to_start_m,
-                             video_suffix=key if multi else "")
+            hist, video_meta = run_trial(world, spawn_transform, path_x, path_y, path, blueprint,
+                                         imu_bp, controller, key, args,
+                                         spawn_to_start_m=spawn_to_start_m,
+                                         video_suffix=key if multi else "")
             if hist and hist["t"]:
                 results[controller_labels[key]] = hist
+            # --controller 에 적은 순서 그대로 쌓는다 -- 그 순서가 곧 합친 영상의 좌->우 배치다.
+            if video_meta is not None:
+                videos.append((controller_labels[key], video_meta["path"], video_meta["frames"]))
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
         world.apply_settings(original_settings)
         print("Cleaned up: world settings restored.")
+
+    # 제어기를 둘 이상 녹화했으면 좌우로 합쳐 하나만 남긴다. 순서는 --controller 인자 순서.
+    if len(videos) >= 2:
+        if args.record == "auto":
+            combined = os.path.join(args.video_dir, run_name("combined") + ".mp4")
+        else:
+            base, ext = os.path.splitext(args.record)
+            combined = f"{base}_combined{ext}"
+        stack_videos_side_by_side(videos, combined, fps=1.0 / args.dt)
 
     if len(results) == 1:
         (label, hist), = results.items()

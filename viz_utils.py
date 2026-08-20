@@ -31,6 +31,7 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -206,7 +207,7 @@ class VideoRecorder:
     """
 
     def __init__(self, world, vehicle, out_path, fps=20.0, width=1280, height=720,
-                 view="chase", fov=90.0, quality=6):
+                 view="chase", fov=90.0, quality=6, preset="veryfast"):
         if view not in VIEWS:
             raise ValueError(f"unknown view {view!r}; pick one of {sorted(VIEWS)}")
         out_path = os.path.abspath(out_path)
@@ -233,28 +234,58 @@ class VideoRecorder:
                                         attach_to=vehicle,
                                         attachment_type=carla.AttachmentType.Rigid)
 
-        # bounded so a slow encoder throttles into dropped frames instead of eating all the RAM
-        self._queue = queue.Queue(maxsize=240)
-        self._writer_thread = threading.Thread(target=self._write_loop, args=(fps, quality),
+        # 큐가 차면 프레임을 버리지 않고 센서 콜백을 그 자리에서 막는다 (queue_wait 까지). 버리면
+        # 영상이 그 지점에서 시간이 압축되어 툭툭 끊겨 보이는데, 인코더는 어차피 고정 fps 로 쓰기
+        # 때문에 유실분만큼 화면이 순간이동한다. 막으면 시뮬 루프가 인코더 속도에 맞춰 느려질 뿐
+        # 영상은 온전하다 -- --times-run 20 처럼 20배속으로 돌릴 때 720p 인코딩이 못 따라와서
+        # 생기던 문제(측정: 873프레임 중 173장 유실)의 실제 원인.
+        self._queue = queue.Queue(maxsize=600)
+        self._writer_thread = threading.Thread(target=self._write_loop, args=(fps, quality, preset),
                                                daemon=True)
         self._writer_thread.start()
         self.camera.listen(self._on_image)
         print(f"Recording to {out_path} ({width}x{height} @ {fps:.0f}fps, {view} view)")
 
     def _on_image(self, image):
-        """Runs on CARLA's listener thread -- convert and hand off, nothing slow here."""
+        """Runs on CARLA's listener thread -- convert and hand off, nothing slow here.
+
+        여기서 절대 블로킹하지 않는다. 한 번 blocking put 으로 바꿔봤다가 클라이언트가 통째로
+        멎는 걸 확인했다 -- 이 콜백은 CARLA 자신의 리스너 스레드에서 돌기 때문에, 여기서 멈추면
+        world.tick() 응답까지 함께 막혀 서버 타임아웃(TimeoutException)으로 죽는다. 역압은
+        throttle() 로 메인 루프에서 건다.
+        """
         bgra = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((image.height, image.width, 4))
         try:
             self._queue.put_nowait(bgra[:, :, [2, 1, 0]].tobytes())  # BGRA -> RGB24
         except queue.Full:
             self._dropped += 1
 
-    def _write_loop(self, fps, quality):
+    def throttle(self, max_wait=30.0, high_water=0.5):
+        """큐가 절반 넘게 차 있으면 빠질 때까지 메인 루프를 잡아둔다 -- 프레임 유실 방지의 핵심.
+
+        매 world.tick() 마다 카메라가 정확히 한 장을 만들므로, 여기서 잠깐 멈춰 다음 tick 을
+        미루면 인코더가 밀린 만큼 따라잡는다. 즉 시뮬이 인코더 속도까지만 빨라지고 영상은 온전히
+        남는다 (--times-run 20 처럼 20배속으로 돌릴 때 720p 인코딩이 못 따라와 생기던 뚝뚝 끊김의
+        해법). 이 대기는 반드시 메인 루프에서 해야 한다 -- _on_image 쪽 설명 참고.
+        """
+        if self.camera is None:
+            return 0.0
+        limit = max(1, int(self._queue.maxsize * high_water))
+        start = time.time()
+        while self._queue.qsize() > limit and time.time() - start < max_wait:
+            time.sleep(0.005)
+        return time.time() - start
+
+    def _write_loop(self, fps, quality, preset):
         import imageio_ffmpeg
 
+        # -preset 은 libx264 의 속도/압축률 손잡이다. imageio 기본값(medium)은 720p 를 실시간
+        # 남짓으로밖에 못 뽑아서, 20배속 주행에서 큐가 차는 주된 이유였다. veryfast 는 파일이 조금
+        # 커지는 대신 인코딩이 몇 배 빨라져 역압이 걸리는 구간 자체를 없앤다.
         writer = imageio_ffmpeg.write_frames(
             self.out_path, size=(self.width, self.height), fps=fps, quality=quality,
             macro_block_size=1, ffmpeg_log_level="error",
+            output_params=["-preset", preset],
         )
         writer.send(None)  # seed the generator; this is what launches ffmpeg
         try:
@@ -275,9 +306,99 @@ class VideoRecorder:
         self._queue.put(None)          # sentinel: drains whatever is still queued, then closes ffmpeg
         self._writer_thread.join(timeout=60.0)
         if self._dropped:
-            print(f"  warning: encoder fell behind, {self._dropped} frames dropped")
+            print(f"  warning: 인코더가 계속 밀려 {self._dropped} 프레임을 버렸습니다 "
+                  f"(영상이 그 지점에서 끊깁니다) -- throttle() 호출이 빠졌거나 max_wait 초과")
         print(f"Recording done: {self.out_path} ({self.frames} frames)")
         return self.out_path
+
+
+def _drawtext_font():
+    """drawtext 가 쓸 TTF 경로. matplotlib 이 자기 폰트를 venv 안에 함께 깔기 때문에 시스템에
+    폰트가 없어도 항상 하나는 있다. 못 찾으면 None -- 그때는 라벨 없이 합치기만 한다."""
+    try:
+        import matplotlib
+        path = os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans.ttf")
+        return path if os.path.exists(path) else None
+    except Exception:
+        return None
+
+
+def stack_videos_side_by_side(entries, out_path, fps, delete_inputs=True):
+    """여러 주행 영상을 좌우로 이어붙여 하나의 mp4 로 만든다. 성공하면 out_path, 실패하면 None.
+
+    entries: [(label, path, frames), ...] -- 왼쪽부터의 순서 그대로. 호출자가 --controller 에
+    적은 순서로 넘겨주므로, 명령줄에 쓴 순서가 곧 화면 배치 순서가 된다.
+
+    제어기들은 순차로 주행하므로 동시 녹화가 불가능하다. 그래서 각 시행을 따로 녹화해 두고
+    여기서 합친다 -- 같은 시각의 두 주행이 아니라 "각자의 t=0 부터"를 나란히 놓은 것이라는 뜻
+    이며, 두 주행의 길이가 다르면(한쪽이 먼저 완주하면) 짧은 쪽 마지막 프레임을 정지 화면으로
+    늘려 끝을 맞춘다 (tpad=stop_mode=clone). 그냥 hstack 하면 짧은 쪽이 끝나는 순간 영상이
+    통째로 끝나 긴 쪽의 남은 주행을 볼 수 없다.
+
+    각 패널 상단에 제어기 이름을 얹는다 (drawtext). 폰트를 못 찾으면 라벨만 생략한다.
+    """
+    entries = [(lbl, path, fr) for lbl, path, fr in entries
+               if path and os.path.exists(path) and fr > 0]
+    if len(entries) < 2:
+        return None
+
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        print(f"  ! 영상 합치기 실패: ffmpeg 를 찾지 못했습니다 ({exc})")
+        return None
+
+    font = _drawtext_font()
+    longest = max(fr for _, _, fr in entries)
+
+    cmd = [exe, "-y", "-hide_banner", "-loglevel", "error"]
+    for _, path, _ in entries:
+        cmd += ["-i", path]
+
+    chains = []
+    for i, (label, _, frames) in enumerate(entries):
+        steps = []
+        pad = (longest - frames) / float(fps)
+        if pad > 1e-3:
+            steps.append(f"tpad=stop_mode=clone:stop_duration={pad:.3f}")
+        if font:
+            # 텍스트 안의 ' 와 : 는 필터 문법과 충돌하므로 미리 없앤다 (제어기 이름엔 없지만,
+            # 임의의 label 이 들어와도 필터 그래프가 깨지지 않도록).
+            safe = str(label).replace("'", "").replace(":", " ")
+            steps.append(
+                f"drawtext=fontfile='{font}':text='{safe}':fontcolor=white:fontsize=40"
+                f":box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=24")
+        steps.append("setsar=1")
+        chains.append(f"[{i}:v]" + ",".join(steps) + f"[v{i}]")
+
+    inputs = "".join(f"[v{i}]" for i in range(len(entries)))
+    graph = ";".join(chains) + f";{inputs}hstack=inputs={len(entries)}[out]"
+    cmd += ["-filter_complex", graph, "-map", "[out]",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", out_path]
+
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
+    except Exception as exc:
+        print(f"  ! 영상 합치기 실패 ({exc})")
+        return None
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        print(f"  ! 영상 합치기 실패 (ffmpeg exit {proc.returncode})")
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        if err:
+            print("    " + err.splitlines()[-1])
+        return None
+
+    order = " | ".join(lbl for lbl, _, _ in entries)
+    print(f"영상 합치기 완료: {out_path}  (좌->우: {order})")
+    if delete_inputs:
+        for _, path, _ in entries:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        print(f"  개별 영상 {len(entries)}개는 삭제했습니다 (합쳐진 파일 하나만 남깁니다)")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +649,69 @@ def b2d_comfort_penalty(hist):
     return terms
 
 
+# Bench2Drive 의 채점 모듈이 있는 디렉터리. b2d_controller/b2d_metrics.py 가 --tools-dir 기본값으로
+# 쓰는 바로 그 경로이며, 두 곳이 같은 파일(md5 0c650615...)을 가리키도록 일부러 하드코딩 대신 여기
+# 한 곳에 모아둔다. $B2D_TOOLS_DIR 로 덮어쓸 수 있다 -- 다른 머신/체크아웃에서 돌릴 때를 위한 것.
+B2D_TOOLS_DIR = os.environ.get(
+    "B2D_TOOLS_DIR", "/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools")
+
+
+def b2d_comfortness(hist, tools_dir=None):
+    """연구실 채점 방식 그대로의 Comfortness 점수 하나 (0~1, 높을수록 좋음). 못 구하면 None.
+
+    계산을 여기서 다시 구현하지 않고 Bench2Drive 의 채점 모듈(efficiency_smoothness_benchmark.py)
+    에서 seg_compute_comfort_metric 을 그대로 import 한다 -- b2d_controller/b2d_metrics.py 가
+    쓰는 것과 같은 파일이라, 대시보드가 보고하는 숫자와 여기 숫자가 갈라질 수 없다. 정의는 20틱
+    (1초) 고정 구간으로 잘라 여섯 채널(lon/lat 가속도, |jerk|, lon jerk, yaw 가속도, yaw rate)이
+    전부 한계 안에 있는 구간의 비율이며, 채널별 감점을 더하던 이 파일의 예전 b2d_comfort_penalty()
+    와는 다른 값이다 (그쪽은 연속적인 자체 지표였고, 이쪽은 실제 점수).
+
+    hist 는 CARLA 의 metric_info.json 이 아니므로 그 함수가 받는 모양으로 맞춰 넣는다:
+
+      acceleration  월드 프레임 (N,3). 차체 프레임 (a_x, a_y) 를 forward/right 벡터로 되돌린다.
+                    채점 함수는 다시 forward/right 에 투영하므로 lon_acc/lat_acc 는 정확히
+                    a_x/a_y 로 복원되고, |acc| 는 프레임과 무관하다 -- CARLA 좌표계 손잡이
+                    규약에 의존하지 않는 유일한 구성이다.
+      angular_velocity  (N,3), [:,2] 만 쓰이고 단위는 deg/s -- hist["yaw_rate"] 가 이미 deg/s.
+      location/rotation 채점 함수가 첫 줄에서 버리는 인자. 길이만 맞춰 0 을 넣는다.
+
+    가속도는 hist["a_x_raw"]/["a_y_raw"](원시 IMU)를 우선 쓴다. 채점 함수가 자기 Savitzky-Golay
+    를 직접 걸기 때문에, 이미 저역통과된 hist["a_x"]/["a_y"] 를 넣으면 이중 평활이 되어 점수가
+    실제보다 후하게 나온다. 원시 채널이 없는 예전 hist 는 필터본으로 폴백하되 그 사실을 알린다.
+    """
+    tools_dir = tools_dir or B2D_TOOLS_DIR
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        from efficiency_smoothness_benchmark import seg_compute_comfort_metric
+    except Exception as exc:
+        print(f"  ! comfortness 계산 불가 -- {tools_dir} 에서 채점 모듈을 import 하지 못했습니다 ({exc})")
+        return None
+
+    yaw_deg = hist.get("yaw", [])
+    a_x = hist.get("a_x_raw") or hist.get("a_x", [])
+    a_y = hist.get("a_y_raw") or hist.get("a_y", [])
+    n = min(len(yaw_deg), len(a_x), len(a_y), len(hist.get("yaw_rate", [])))
+    if n < 2:
+        return None
+
+    yaw = np.radians(np.asarray(yaw_deg[:n], dtype=float))
+    fwd = np.stack([np.cos(yaw), np.sin(yaw), np.zeros(n)], axis=1)
+    right = np.stack([-np.sin(yaw), np.cos(yaw), np.zeros(n)], axis=1)
+    accel = (np.asarray(a_x[:n], dtype=float)[:, None] * fwd
+             + np.asarray(a_y[:n], dtype=float)[:, None] * right)
+    ang_vel = np.zeros((n, 3))
+    ang_vel[:, 2] = np.asarray(hist["yaw_rate"][:n], dtype=float)   # deg/s, 채점 함수가 직접 변환
+
+    try:
+        return float(seg_compute_comfort_metric(
+            acceleration=accel, angular_velocity=ang_vel, forward_vector=fwd,
+            right_vector=right, location=np.zeros((n, 3)), rotation=np.zeros((n, 3))))
+    except Exception as exc:
+        print(f"  ! comfortness 계산 실패 ({exc})")
+        return None
+
+
 def print_error_summary(hist, target_speed_ms):
     """RMSE / max / mean of each tracked error, plus mean/peak magnitude of the raw longitudinal
     and lateral dynamics signals, over the whole run.
@@ -577,15 +761,10 @@ def print_error_summary(hist, target_speed_ms):
             mean_abs, peak = stats
             print(f"  {name}  mean|.|={mean_abs:7.3f} {unit:<7}  peak|.|={peak:7.3f} {unit}")
 
-    penalty = b2d_comfort_penalty(hist)
-    if penalty["total"] is not None:
-        print("  -- B2D comfort penalty (0 = perfect, unbounded above) --")
-        for key, label in (("a_x", "long accel  "), ("a_y", "lat accel   "),
-                           ("yaw_rate", "yaw rate    "), ("yaw_acc", "yaw accel   "),
-                           ("jerk", "long jerk   "), ("jerk_total", "|jerk| total")):
-            if penalty[key] is not None:
-                print(f"    {label}  P={penalty[key]:.4f}")
-        print(f"    {'TOTAL':<12}  P={penalty['total']:.4f}")
+    comfort = b2d_comfortness(hist)
+    if comfort is not None:
+        print(f"  -- B2D Comfortness (연구실 채점 방식, 1.000 = 전 구간 편안) --")
+        print(f"    Comfortness   {comfort:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +854,7 @@ def _error_multi(ax, runs, colors, multi, ylabel, panel_title, unit, series_fn, 
 
 
 def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_color=None, ref_key=None,
-                    legend=True):
+                    legend=True, series_name="actual", ref_name="reference"):
     """One plain time-series panel (acceleration, jerk, yaw rate, ...), for a single run or
     several overlaid. Single run gets an optional fill; multiple runs get one colored line each
     plus a legend. "not recorded" if no run in `runs` logged `key` at all.
@@ -684,6 +863,11 @@ def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_colo
     its run, right on top of the measured one -- for stacks that never computed it (stanley_PID.py
     has no a_cmd concept at all), _get() just returns None and the dashed line is silently skipped,
     so the same panel code works whether or not a given controller has a reference to show.
+
+    series_name/ref_name: 범례에 붙는 역할 이름. ref_key 가 실제로 그려질 때만 쓰이며, 두 선이
+    각각 무엇인지 말로 적어주기 위한 것이다 -- 같은 색 실선/점선만으로는 어느 쪽이 측정이고 어느
+    쪽이 추정인지 알 수 없다. 기본값은 a_cmd 처럼 "명령/기준"을 겹쳐 그리는 패널용이고, 칼만
+    필터 v_y 패널은 ref_name="estimated" 를 넘겨 "actual" / "estimated" 로 읽히게 한다.
 
     legend=False skips this panel's own legend -- for callers (plot_comparison()) that build one
     shared legend for the whole figure instead of repeating it on every panel."""
@@ -700,7 +884,9 @@ def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_colo
         series_label = label if multi else None
         if ref is not None:
             has_ref = True
-            series_label = label if label else "actual"
+            # 겹쳐 그릴 때는 실측선에도 역할 이름을 붙인다 -- 예전에는 run 라벨만 있어서
+            # ("MPC-KF" vs "MPC-KF ref") 어느 쪽이 실제값인지 범례만 보고는 알 수 없었다.
+            series_label = f"{label} {series_name}" if label else series_name
         # When there's a ref line to overlay, swap to LINEWIDTH_THIN (series) / LINEWIDTH (ref,
         # thicker) instead of the plain multi/non-multi widths below -- a thin solid + thick dashed
         # pair reads clearly even when the two nearly overlap (v_y_hat tracking v_y closely, a_cmd
@@ -717,7 +903,7 @@ def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_colo
         if not multi and fill_color:
             ax.fill_between(t, series, 0, color=fill_color, alpha=0.15)
         if ref is not None:
-            ref_label = f"{label} ref" if label else "reference"
+            ref_label = f"{label} {ref_name}" if label else ref_name
             ax.plot(t, ref, color=COLOR_RED, linewidth=LINEWIDTH, linestyle="--", alpha=0.9,
                    label=ref_label)
     if not found:
@@ -789,7 +975,7 @@ def plot_lateral(hist, title="Lateral tracking performance"):
     # stack's own ground-truth "mpc" baseline run) just get _get()==None and the overlay is skipped,
     # so this is a no-op for every plot_lateral() caller that existed before mpc_mpc_KF.py.
     _dynamics_panel(ax_vy, runs, colors, False, "v_y", "$v_y$ (m/s)", "Lateral velocity (body frame)",
-                    ref_key="v_y_hat")
+                    ref_key="v_y_hat", ref_name="estimated")
     _dynamics_panel(ax_ay, runs, colors, False, "a_y", "$a_y$ (m/s$^2$)", "Lateral acceleration (body frame)")
     _b2d_limit_lines(ax_ay, *B2D_COMFORT_LIMITS["a_y"])
     ax_ay.set_xlabel("t (s)")
@@ -817,7 +1003,8 @@ def plot_kf_series(runs, key, ref_key, ylabel, title):
     fig.patch.set_facecolor(COLOR_BG)
     fig.suptitle(title, fontsize=FONTSIZE_TITLE, color=COLOR_INK, fontweight="bold")
     _style_axes(ax)
-    _dynamics_panel(ax, runs, colors, True, key, ylabel, "", ref_key=ref_key)
+    _dynamics_panel(ax, runs, colors, True, key, ylabel, "", ref_key=ref_key,
+                    ref_name="estimated" if ref_key == "v_y_hat" else "reference")
     ax.set_xlabel("t (s)")
     return fig
 
@@ -848,11 +1035,16 @@ def plot_kf_run(hist, title=""):
         _style_axes(ax)
 
     _dynamics_panel(ax_vy, runs, colors, False, "v_y", "$v_y$ (m/s)",
-                    "v_y estimate vs. ground truth", ref_key="v_y_hat")
+                    "v_y estimate vs. ground truth", ref_key="v_y_hat", ref_name="estimated")
+    # 이 두 패널은 추정/기준이 아니라 "센서 원신호 vs 노이즈 주입본" 비교이므로 범례도 그대로
+    # clean/noisy -- v_y 패널의 actual/estimated 와 같은 이유로, 같은 색 실선/점선만으로는
+    # 어느 쪽이 필터가 실제로 받은 신호인지 알 수 없다.
     _dynamics_panel(ax_dpsi, runs, colors, False, "yaw_rate", "dpsi (deg/s)",
-                    "dpsi: clean vs. noisy sensor", ref_key="dpsi_noisy")
+                    "dpsi: clean vs. noisy sensor", ref_key="dpsi_noisy",
+                    series_name="clean", ref_name="noisy")
     _dynamics_panel(ax_ay, runs, colors, False, "a_y", "$a_y$ (m/s$^2$)",
-                    "a_y: clean vs. noisy sensor", ref_key="ay_noisy")
+                    "a_y: clean vs. noisy sensor", ref_key="ay_noisy",
+                    series_name="clean", ref_name="noisy")
     ax_ay.set_xlabel("t (s)")
     return fig
 

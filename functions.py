@@ -509,13 +509,35 @@ def speed_reference(args, t):
     profile change (e.g. adding one) only has to happen in one place.
 
     "sine": args.initial_speed + args.sine_amplitude * sin(2*pi*t/args.sine_period)
-    "step": args.initial_speed, then + args.step_size once t >= args.step_time
+    "step": args.initial_speed, then + args.step_size over the window [args.step_time,
+            args.step_time + args.step_duration), then back to args.initial_speed
     anything else: flat args.initial_speed
+
+    The step is a WINDOW, not a permanent change: args.step_duration (seconds) says how long the
+    stepped value is held before the reference snaps back to args.initial_speed. That one parameter
+    is what turns this profile into an emergency-stop-and-restart test -- --step-size -<initial
+    speed> (or anything more negative, see the clamp below) drops the reference to 0 for
+    step_duration seconds and then demands the original speed again in a single step, so the run
+    covers a hard decel and a hard re-accel in one profile instead of only the decel.
+
+    Scripts that expose --step-time/--step-size but not --step-duration (mpc_mpc.py,
+    longitudinal_mpc.py, mpc_mpc_comparison.py) keep the old behaviour untouched: a missing
+    step_duration -- and an explicit None -- both mean "hold forever", the permanent step this
+    profile used to be.
+
+    The stepped value is clamped at 0 rather than allowed to go negative: below a full stop there is
+    nothing further to ask for (v_des is a speed, and every consumer -- SpeedMPC's tracking cost,
+    refine_speed_preview's forward walk, VAD's waypoint spacing -- reads it as one), so
+    --step-size -100 is simply "stop", not "drive backwards at 90 m/s".
     """
     if args.profile == "sine":
         return args.initial_speed + args.sine_amplitude * math.sin(2.0 * math.pi * t / args.sine_period)
     if args.profile == "step":
-        return args.initial_speed + (args.step_size if t >= args.step_time else 0.0)
+        duration = getattr(args, "step_duration", None)
+        stepping = t >= args.step_time and (duration is None or t < args.step_time + duration)
+        if stepping:
+            return max(0.0, args.initial_speed + args.step_size)
+        return args.initial_speed
     return args.initial_speed
 
 

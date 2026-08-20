@@ -79,12 +79,20 @@ def infer_xodr(dump_dir):
         print(f"  ! could not read a town from {name!r}; falling back to {DEFAULT_XODR}")
         return DEFAULT_XODR
     town = m.group(1)
-    path = os.path.join(os.path.dirname(DEFAULT_XODR), town + ".xodr")
-    if not os.path.exists(path):
-        print(f"  ! {town}.xodr not installed (large maps ship without a loose .xodr); "
-              f"fig 4 will have no lane geometry")
-        return path
-    return path
+    # Two layouts, both present in a stock 0.9.15 install with Additional Maps. The small towns
+    # sit flat in Maps/OpenDrive/; the large ones (Town11-15, which is where 9 of the ability-10
+    # routes run) ship theirs one level down in Maps/<Town>/OpenDrive/ instead. Only the flat one
+    # used to be searched, so every large-map route reported "not installed" and then crashed in
+    # criterion_flags -- the files were there the whole time.
+    flat = os.path.dirname(DEFAULT_XODR)                 # .../Maps/OpenDrive
+    maps = os.path.dirname(flat)                         # .../Maps
+    for path in (os.path.join(flat, town + ".xodr"),
+                 os.path.join(maps, town, "OpenDrive", town + ".xodr")):
+        if os.path.exists(path):
+            return path
+    print(f"  ! {town}.xodr not found under {maps}; fig 4 will have no lane geometry and the "
+          f"lane-departure diagnostic is skipped")
+    return None
 
 
 # --------------------------------------------------------------------------- B2D comfort limits
@@ -97,13 +105,23 @@ def b2d_limits(path=B2D_BENCHMARK):
         spec = importlib.util.spec_from_file_location("b2d_esb", path)
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
+        # The lab's corrected scoring module (2026-08-18) renamed these constants to upper case
+        # while keeping the same values; the pre-correction file used lower case. Read either, so
+        # this keeps working against both and cannot silently fall back to the hard-coded copy.
+        g = lambda *names: next(getattr(m, n) for n in names if hasattr(m, n))
         return {
-            "yaw_rate":   (-m.max_abs_yaw_rate,  m.max_abs_yaw_rate),
-            "yaw_acc":    (-m.max_abs_yaw_accel, m.max_abs_yaw_accel),
-            "a_x":        (m.min_lon_accel,      m.max_lon_accel),
-            "a_y":        (-m.max_abs_lat_accel, m.max_abs_lat_accel),
-            "lon_jerk":   (-m.max_abs_lon_jerk,  m.max_abs_lon_jerk),
-            "jerk_total": (-m.max_abs_mag_jerk,  m.max_abs_mag_jerk),
+            "yaw_rate":   (-g("MAX_ABS_YAW_RATE", "max_abs_yaw_rate"),
+                            g("MAX_ABS_YAW_RATE", "max_abs_yaw_rate")),
+            "yaw_acc":    (-g("MAX_ABS_YAW_ACCEL", "max_abs_yaw_accel"),
+                            g("MAX_ABS_YAW_ACCEL", "max_abs_yaw_accel")),
+            "a_x":        ( g("MIN_LON_ACCEL", "min_lon_accel"),
+                            g("MAX_LON_ACCEL", "max_lon_accel")),
+            "a_y":        (-g("MAX_ABS_LAT_ACCEL", "max_abs_lat_accel"),
+                            g("MAX_ABS_LAT_ACCEL", "max_abs_lat_accel")),
+            "lon_jerk":   (-g("MAX_ABS_LON_JERK", "max_abs_lon_jerk"),
+                            g("MAX_ABS_LON_JERK", "max_abs_lon_jerk")),
+            "jerk_total": (-g("MAX_ABS_MAG_JERK", "max_abs_mag_jerk"),
+                            g("MAX_ABS_MAG_JERK", "max_abs_mag_jerk")),
         }, path
     except Exception as exc:                                   # pragma: no cover - env dependent
         print(f"  ! could not read {path} ({exc}); falling back to viz_utils.B2D_COMFORT_LIMITS")
@@ -114,6 +132,36 @@ def b2d_limits(path=B2D_BENCHMARK):
 
 
 # --------------------------------------------------------------------------- loading
+
+def route_mode(meta):
+    """(active, label) for one meta record -- was the steering driven off the GLOBAL ROUTE?
+
+    One label for both controllers: the question is whether map-route information is steering the
+    car this tick, and for both the answer is yes or no. How much route information (a whole
+    reference vs one aim angle) is carried by the halo COLOUR in fig 4, not by the wording.
+
+    Returns (None, None) for dumps that predate the field, so "unknown" stays distinguishable
+    from "off" and an old run is simply not annotated instead of being drawn as never-engaged.
+
+    The two controllers are NOT doing the same thing when this is true, and the labels say so:
+
+      MpcKfController  ref_source == "global" -- e_y, e_psi and the whole 25-step curvature
+                       preview came from the reconstructed route rather than VAD's plan.
+      stock PID        has no mode. Its `use_target_to_aim` branch substitutes ONE scalar aim
+                       angle for that tick and never follows a route; it is reconstructed here
+                       from the angles it records (angle_final is whichever of angle /
+                       angle_target it chose). Ticks where the two agree are left unmarked --
+                       the branch fired but changed nothing.
+    """
+    if "ref_source" in meta:
+        return meta.get("ref_source") == "global", "GLOBAL ROUTE"
+    if "angle_final" in meta:
+        a, at, af = meta.get("angle"), meta.get("angle_target"), meta.get("angle_final")
+        if a is None or at is None or af is None:
+            return None, None
+        return (abs(af - at) < 1e-12 and abs(a - at) > 1e-12), "GLOBAL ROUTE"
+    return None, None
+
 
 def load_run(run_dir, label):
     """Read one dump into tick-aligned arrays.
@@ -138,6 +186,11 @@ def load_run(run_dir, label):
     run = dict(
         label=label, dir=run_dir, tick=ticks, t=ticks * TICK_DT_S,
         loc=np.array([r["location"][:2] for r in rec], dtype=float),
+        # z is kept separately (loc stays 2-D so every plotting path is unchanged). It is needed
+        # by criterion_flags: CARLA's get_waypoint measures in 3-D, and the large maps (Town11-13)
+        # run tens of metres above datum -- Town11's route sits at z = 58.5 m, so probing at
+        # z = 0 put every waypoint ~58 m "away" and reported 100% off-drivable on a clean run.
+        loc_z=np.array([r["location"][2] for r in rec], dtype=float),
         acc=np.array([r["acceleration"][:2] for r in rec], dtype=float),
         fwd=np.array([r["forward_vector"][:2] for r in rec], dtype=float),
         right=np.array([r["right_vector"][:2] for r in rec], dtype=float),
@@ -161,8 +214,12 @@ def load_run(run_dir, label):
     meta_tick = np.clip(meta_idx * stride, 0, ticks.max())
 
     # One pass over meta/, not one per column -- these dumps are ~800 files.
-    keys = ("speed", "steer", "throttle", "brake", "v_y_hat")
+    keys = ("speed", "steer", "throttle", "brake", "v_y_hat", "route_e_y")
     cols = {k: np.full(len(ticks), np.nan) for k in keys}
+    # Route-reference state per tick. Not a plain column because it is a tri-state (on / off /
+    # this dump predates the field), and "unknown" must not be drawn as "off".
+    route_on = np.zeros(len(ticks), dtype=bool)
+    route_known, route_label = False, None
     for p, tk in zip(meta_paths, meta_tick):
         with open(p) as f:
             d = json.load(f)
@@ -173,7 +230,16 @@ def load_run(run_dir, label):
             v = d.get(k)
             if v is not None and np.isscalar(v):
                 cols[k][i] = float(v)
+        on, lab = route_mode(d)
+        if on is not None:
+            route_known = True
+            route_on[i] = on
+            route_label = lab
     run.update(cols)
+    run["route_on"], run["route_known"] = route_on, route_known
+    # "GLOBAL ROUTE" only ever comes from an MpcKfController dump, "ROUTE AIM" only from a stock
+    # PID one, so the label doubles as the distinction between the two behaviours in the legend.
+    run["route_label"] = route_label
     run["meta_stride"] = stride
     run["is_mpc"] = np.isfinite(run["v_y_hat"]).any()
     print(f"  [{label}] {len(ticks)} ticks ({ticks.max()*TICK_DT_S:.2f}s), "
@@ -304,6 +370,9 @@ def lane_geometry(xodr_path, bbox, spacing=0.5, margin=25.0):
     Returns (edges, centres): centres is a list of (N, 2) polylines; edges is a list of
     (polyline, marking_class) pairs with marking_class one of "centre", "edge", "broken", "none".
     """
+    # No map -> nothing to draw. Figure 4 then shows the trajectories over a bare grid.
+    if not xodr_path or not os.path.exists(xodr_path):
+        return [], []
     with open(xodr_path) as f:
         cmap = carla.Map(os.path.splitext(os.path.basename(xodr_path))[0], f.read())
     x0, x1, y0, y1 = bbox
@@ -377,20 +446,36 @@ def criterion_flags(run, xodr_path):
     short answer to "is a lane departure only about the centre line": no -- but the centre line is
     the one that turns it into the `wrong` case.
     """
+    # No map -> no lane geometry to test against. Return the shape the callers expect with the
+    # distances zeroed, so a missing .xodr costs figure 4 its lane overlay and nothing else.
+    if not xodr_path or not os.path.exists(xodr_path):
+        n = len(run["loc"])
+        z = np.zeros(n, dtype=bool)
+        step = np.concatenate([[0.0], np.hypot(np.diff(run["loc"][:, 0]),
+                                               np.diff(run["loc"][:, 1]))])
+        return dict(outside=z, wrong=z, dist_total=float(step.sum()),
+                    dist_outside=0.0, dist_wrong=0.0, no_map=True)
     with open(xodr_path) as f:
         cmap = carla.Map(os.path.splitext(os.path.basename(xodr_path))[0], f.read())
     loc, yaw = run["loc"], run["yaw_deg"]
+    zs = run.get("loc_z")
+    if zs is None:
+        zs = np.zeros(len(loc))
     outside = np.zeros(len(loc), dtype=bool)
     wrong = np.zeros(len(loc), dtype=bool)
-    for i, (p, yw) in enumerate(zip(loc, yaw)):
-        here = carla.Location(x=float(p[0]), y=float(p[1]), z=0.0)
+    for i, (p, yw, z) in enumerate(zip(loc, yaw, zs)):
+        # Probe at the ego's REAL height, then measure the offset in the ground plane only. The
+        # test being reconstructed is a lateral one ("how far from the lane centre"), so folding
+        # the road's own grade or the waypoint's z into the distance only adds noise.
+        here = carla.Location(x=float(p[0]), y=float(p[1]), z=float(z))
         dwp = cmap.get_waypoint(here, lane_type=carla.LaneType.Driving)
         pwp = cmap.get_waypoint(here, lane_type=carla.LaneType.Parking)
         best_d, best_w = float("inf"), 3.5
         for wp in (dwp, pwp):
             if wp is None:
                 continue
-            d = here.distance(wp.transform.location)
+            wl = wp.transform.location
+            d = float(np.hypot(wl.x - float(p[0]), wl.y - float(p[1])))
             if d < best_d:
                 best_d, best_w = d, wp.lane_width
         outside[i] = best_d > best_w / 2.0 + 0.5
@@ -587,6 +672,30 @@ def fig_trajectory(runs, xodr_path, out_dir):
 
     for run, color in zip(runs, _colors(runs)):
         xy = run["loc"]
+        # Where the route reference was engaged, drawn as a wide halo UNDER the driven line rather
+        # than as a recolouring of it: the line's colour already identifies which controller this
+        # is, and overloading it would make the two questions ("whose line is this" / "what was it
+        # following") compete for the same channel. A halo adds the second without touching the
+        # first. Purple for the MPC's real reference switch, muted grey for stock PID's aim swap:
+        # the two are NOT the same intervention (a whole reference vs one scalar angle), and
+        # giving them one colour claimed an equivalence that does not hold. Neither is the orange
+        # used for "off the drivable surface" further down -- those overlays sit on the same line
+        # and mean opposite things (what it was following vs a violation), so no shared hue.
+        # Runs from before the field existed simply get no halo.
+        if run.get("route_known") and run["route_on"].any():
+            on = run["route_on"]
+            lab = f"{run['label']} — {run.get('route_label') or 'route reference'}"
+            edges_on = np.flatnonzero(np.diff(np.concatenate([[0], on.view(np.int8), [0]])))
+            for a, b in zip(edges_on[::2], edges_on[1::2]):
+                seg = xy[a:b]
+                if len(seg) < 2:
+                    continue
+                halo = V.COLOR_PURPLE if run.get("is_mpc") else V.COLOR_MUTED
+                ax.plot(seg[:, 0], seg[:, 1], color=halo, linewidth=8.0,
+                        alpha=0.35 if run.get("is_mpc") else 0.30,
+                        solid_capstyle="round", zorder=2.5,
+                        label=(lab if lab not in seen else None))
+                seen.add(lab)
         ax.plot(xy[:, 0], xy[:, 1], color=color, linewidth=2.2,
                 solid_capstyle="round", zorder=3, label=f"{run['label']} driven line")
         flags = run.get("flags")

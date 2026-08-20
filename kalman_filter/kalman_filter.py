@@ -45,6 +45,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.linalg import expm
 from scipy.optimize import minimize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,13 +105,16 @@ class VyKalmanFilter:
     N_X = 2   # [v_y, r]
     N_Z = 2   # [dpsi_meas, ay_meas]
 
-    def __init__(self, dt, mass, Iz, lf, lr, Cf, Cr, Q, R, vx_floor=0.5, x0=None, P0=None):
+    def __init__(self, dt, mass, Iz, lf, lr, Cf, Cr, Q, R, vx_floor=1e-3, x0=None, P0=None):
         self.dt = dt
         self.mass, self.Iz, self.lf, self.lr, self.Cf, self.Cr = mass, Iz, lf, lr, Cf, Cr
+        # 이제 1/vx 의 0 나눗셈 방어일 뿐이다. 저속 우회 게이트를 떠받치던 안정성
+        # 역할은 정확한 ZOH 로 옮겨갔다 (step() 참고).
         self.vx_floor = vx_floor
 
         self.B_cont = np.array([[Cf / mass], [lf * Cf / Iz]])
-        self.B_disc = self.dt * self.B_cont   # forward-Euler: Bd = dt*B, same as LateralMPC
+        # Bd is not a constant under exact ZOH (it is integral_0^dt expm(A s) ds * B and A depends
+        # on vx), so it is formed per call in _discrete(). B_cont is kept for that.
         self.D = np.array([[0.0], [Cf / mass]])
 
         self.Q = np.asarray(Q, dtype=float).reshape(self.N_X, self.N_X)
@@ -135,11 +139,27 @@ class VyKalmanFilter:
             [-(Cf + Cr) / (m * vx), (lr * Cr - lf * Cf) / (m * vx)],
         ])
 
+    def _discrete(self, vx):
+        """(Ad, Bd) by exact zero-order hold, via expm([[A, B], [0, 0]] * dt) = [[Ad, Bd], [0, 1]].
+
+        The augmented form is used rather than Bd = A^-1 (Ad - I) B because A is singular at the
+        speeds this has to survive. Replaces forward Euler (Ad = I + dt*A), which mattered more
+        here than in the MPC: the covariance recursion squares the transition, so P <- Ad P Ad^T + Q
+        amplified P by rho(Ad)^2 per tick -- 68x per tick at vx = 0.5 m/s under Euler. Exact ZOH is
+        contractive at every speed.
+        """
+        n = self.N_X
+        aug = np.zeros((n + 1, n + 1))
+        aug[:n, :n] = self._continuous_A(vx)
+        aug[:n, n:n + 1] = self.B_cont
+        M = expm(aug * self.dt)
+        return M[:n, :n], M[:n, n:n + 1]
+
     def predict(self, vx, delta_prev):
         """Advance x_{k-1} -> x_k over one dt, linearized at vx (the scheduling speed for this
         interval) and driven by delta_prev (the steering angle actually applied over it)."""
-        Ad = np.eye(self.N_X) + self.dt * self._continuous_A(vx)
-        self.x = Ad @ self.x + self.B_disc * delta_prev
+        Ad, Bd = self._discrete(vx)
+        self.x = Ad @ self.x + Bd * delta_prev
         self.P = Ad @ self.P @ Ad.T + self.Q
         return self.x.ravel()
 
@@ -158,22 +178,18 @@ class VyKalmanFilter:
         """predict() then update() for one tick -- the form a per-cycle replay/control loop
         actually calls. Returns the corrected [v_y, r].
 
-        Below vx_floor, skips the model entirely and asserts v_y = 0 / r = z[0] (the gyro's own
-        direct reading) instead. Not just a division-by-zero guard: B = [Cf/m, lf*Cf/Iz] has no vx
-        dependence at all, so even at true vx=0 a nonzero delta_prev injects the same fixed lateral-
-        velocity "prediction" every single tick, while the measurement update -- weakened by the
-        same low-vx H used elsewhere -- can't fully cancel it. Left to run, this settles into a
-        nonzero steady-state bias (observed: ~0.16 m/s, pinned, with a genuinely stationary,
-        zero-noise car) rather than correcting back to the obviously-correct v_y=0, because the
-        predict and update terms reach equilibrium with each other instead of with the truth. A
-        stopped or creeping car has no meaningful sideslip to begin with, so asserting v_y=0 here is
-        not a fallback of last resort, it's the physically correct answer the model itself cannot
-        reach in this regime -- and it keeps the state clean for when vx does cross the floor,
-        instead of resuming from whatever bias accumulated while stopped."""
-        if vx < self.vx_floor:
-            self.x = np.array([[0.0], [z[0]]])
-            self.P = np.diag([1e-6, self.R[0, 0]])
-            return self.x.ravel()
+        The `if vx < vx_floor: x = [0, z[0]]` bypass this used to open with is gone. It existed
+        because the forward-Euler predict step was divergent below ~2.3 m/s, so the only safe thing
+        there was to throw the model away and take the measured yaw rate neat. The old docstring
+        justified it by the model re-injecting a "phantom" lateral velocity that the low-vx-weakened
+        measurement update could not cancel -- which is a description of a divergent predict step,
+        i.e. of the forward-Euler problem, not of the physics. Exact ZOH is contractive at every
+        speed (rho(Ad) <= 1 down to the scheduling floor), so there is nothing to cancel, and v_y
+        keeps being estimated through low-speed stretches instead of being pinned to 0 -- which is
+        most of a junction approach.
+
+        vx_floor still applies inside _continuous_A()/_H() as a *scheduling* floor, so the 1/vx
+        terms stay finite. Only the hard bypass is removed."""
         self.predict(vx, delta_prev)
         return self.update(vx, delta_prev, z)
 
@@ -221,7 +237,7 @@ def inject_noise(hist, gyro_std_rad, accel_std, rng):
     return r_meas, ay_meas
 
 
-def replay(run, Q_diag, R_diag, gyro_std_rad, accel_std, seed, vx_floor=0.5):
+def replay(run, Q_diag, R_diag, gyro_std_rad, accel_std, seed, vx_floor=1e-3):
     """Run the filter tick-by-tick over one logged run -- see the module docstring for why this
     counts as "closed-loop": every step builds on the filter's own previous corrected estimate.
     v_y_hat[0] is the filter's initial guess (unfiltered, no measurement processed yet), not a real
@@ -250,7 +266,7 @@ def rmse(a, b):
     return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
 
 
-def score(run, Q_diag, R_diag, gyro_std_rad, accel_std, seeds, vx_floor=0.5):
+def score(run, Q_diag, R_diag, gyro_std_rad, accel_std, seeds, vx_floor=1e-3):
     """Mean v_y RMSE over several noise-seed draws (not just one), so tuning doesn't just fit Q/R
     to one particular random noise realization -- burn-in is the first 1s of the run, dropped so
     the filter's startup transient (x0 = [0, r_meas[0]] is a guess) doesn't dominate a run that's
@@ -271,7 +287,7 @@ def score(run, Q_diag, R_diag, gyro_std_rad, accel_std, seeds, vx_floor=0.5):
 LOG_BOUNDS = [(-8.0, 3.0)] * 2
 
 
-def tune(runs, gyro_std_rad, accel_std, seeds, R_diag, x0_q, vx_floor=0.5):
+def tune(runs, gyro_std_rad, accel_std, seeds, R_diag, x0_q, vx_floor=1e-3):
     """Nelder-Mead over log10([q_vy, q_r]) ONLY -- R is deliberately NOT searched here, and is
     fixed to R_diag (by default the actual injected noise variance, gyro_std_rad**2/accel_std**2 --
     see main()). That's not a simplification, it's the textbook division of labor: R describes the
