@@ -34,6 +34,10 @@ import os
 import re
 import sys
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+# viz_utils.B2D_TOOLS_DIR 와 같은 기본값 (그쪽 주석 참고) -- 두 곳이 같은 파일을 가리키도록 유지.
+DEFAULT_TOOLS_DIR = os.path.join(HERE, "comfort_metric")
+
 
 def _mean(vals):
     vals = [v for v in vals if v is not None]
@@ -68,13 +72,19 @@ def efficiency_of(rec):
 def comfort_of(run_dir, tools_dir):
     """Bench2Drive's own segment-wise comfort ratio for one route, or None without metric_info.
 
-    This imports the LAB'S SCORING MODULE, not a copy, so the number here is the number the
-    dashboard reports. That module was corrected on 2026-08-18 (md5 0c650615...) after this
-    project reported three defects in it: yaw values in deg/s were being checked against rad/s
-    bounds, the "yaw acceleration" channel was never differentiated, and jerks used a 0.1 s step
-    on 0.05 s data. All three are fixed upstream now, the bounds are unchanged, and this
-    project's own b2d_comfort_fixed.py -- written to score against while the fix was pending --
-    was verified to agree with it to 0.0000 on route 27582 before being retired.
+    On the lab's Ubuntu machine (--tools-dir pointed at the verified checkout), this imports the
+    LAB'S SCORING MODULE, not a copy, so the number is the number the dashboard reports. Off that
+    machine (the default --tools-dir, see DEFAULT_TOOLS_DIR above), it imports this repo's own
+    b2d_controller/comfort_metric/efficiency_smoothness_benchmark.py instead -- a local
+    reconstruction of the same fix, not verified byte-for-byte against the real file (see that
+    file's own docstring for exactly what that means and how to replace it with the real one).
+
+    The module (either copy) was corrected on 2026-08-18 (md5 0c650615... on the verified lab
+    checkout) after this project reported three defects in it: yaw values in deg/s were being
+    checked against rad/s bounds, the "yaw acceleration" channel was never differentiated, and
+    jerks used a 0.1 s step on 0.05 s data. All three are fixed upstream now, the bounds are
+    unchanged, and this project's own b2d_comfort_fixed.py -- written to score against while the
+    fix was pending -- was verified to agree with it to 0.0000 on route 27582 before being retired.
 
     One difference from that interim module is worth recording: the corrected official version
     does NOT phase-unwrap the yaw rate ("a rate is not an angle"), which is right, and which the
@@ -185,8 +195,12 @@ def main():
     ap.add_argument("--suffix", action="append", default=None,
                     help="run-directory suffix identifying one controller, e.g. _mpckf. "
                          "Repeat for several; default: _mpckf and _pidviz")
-    ap.add_argument("--tools-dir",
-                    default="/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools")
+    ap.add_argument("--tools-dir", default=DEFAULT_TOOLS_DIR,
+                    help="directory containing efficiency_smoothness_benchmark.py -- defaults to "
+                         "this repo's own local copy (b2d_controller/comfort_metric/, see its "
+                         "docstring); pass the lab machine's verified checkout "
+                         "(/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools) to use "
+                         "that instead")
     ap.add_argument("--json", default=None, help="also write the numbers here")
     args = ap.parse_args()
     suffixes = args.suffix or ["_mpckf", "_pidviz"]

@@ -107,12 +107,16 @@ from scipy.linalg import expm
 # MAX_STEER_ANGLE constant -- see module docstring point 2 for why this can't be read live here.
 MAX_STEER_ANGLE_RAD = math.radians(70.0)
 
-# carla_control/lateral_parameter/yaw_inertia.json's own measured values -- hardcoded per
-# instruction, see module docstring point 3.
+# carla_control/lateral_parameter's own measured values -- hardcoded per instruction, see module
+# docstring point 3. mass/Cf/Cr from cornering_stiffness_speed_report.json (collect_cornering_
+# data.py + estimate_cornering_stiffness.py), Iz from yaw_inertia_impulse.json (estimate_yaw_
+# inertia.py --method impulse) -- the old combined yaw_inertia.json (step-steer method) these were
+# originally copied from no longer exists; estimate_yaw_inertia.py only computes Iz the tire-free
+# impulse way now.
 VEHICLE_MASS = 1696.0
 VEHICLE_IZ = 2916
-VEHICLE_CF = 82941.0
-VEHICLE_CR = 54425.0
+VEHICLE_CF = 102824.0
+VEHICLE_CR = 67754.0
 VEHICLE_LF = 1.1718419429705567
 VEHICLE_LR = 1.6886329628368866
 

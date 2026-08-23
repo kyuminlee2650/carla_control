@@ -91,16 +91,24 @@ WARM_START_TIMEOUT = 15.0     # s -- safety cap in case initial_speed is unreach
 
 
 def _load_vehicle_defaults():
-    """lateral_parameter/yaw_inertia.json carries Cf/Cr/mass alongside Iz (the cornering-stiffness
-    trial's own output, re-saved when the inertia trial ran on top of it) -- one file, not two."""
-    path = os.path.join(HERE, "lateral_parameter", "yaw_inertia.json")
+    """mass/Cf/Cr come from lateral_parameter/cornering_stiffness_speed_report.json
+    (collect_cornering_data.py + estimate_cornering_stiffness.py's own --out), Iz from
+    lateral_parameter/yaw_inertia_impulse.json (estimate_yaw_inertia.py --method impulse's own
+    --out) -- two files, not the old combined yaw_inertia.json: that was the step-steer method's
+    output, and estimate_yaw_inertia.py no longer computes Iz that way (see its own docstring for
+    why only the tire-free impulse method survived)."""
+    cs_path = os.path.join(HERE, "lateral_parameter", "cornering_stiffness_speed_report.json")
+    iz_path = os.path.join(HERE, "lateral_parameter", "yaw_inertia_impulse.json")
     try:
-        with open(path) as f:
-            data = json.load(f)
-        return dict(mass=data["mass"], iz=data["Iz"], cf=data["Cf"], cr=data["Cr"])
+        with open(cs_path) as f:
+            cs = json.load(f)
+        with open(iz_path) as f:
+            iz = json.load(f)
+        return dict(mass=cs["mass"], iz=iz["Iz"], cf=cs["Cf"], cr=cs["Cr"])
     except (FileNotFoundError, KeyError) as exc:
-        print(f"Warning: could not load vehicle params from {path} ({exc}); using rough defaults.")
-        return dict(mass=1696.0, iz=2916, cf=82941, cr=54425)
+        print(f"Warning: could not load vehicle params from {cs_path}/{iz_path} ({exc}); "
+              f"using rough defaults.")
+        return dict(mass=1696.0, iz=2916, cf=102824, cr=67754)
 
 
 VEHICLE_DEFAULTS = _load_vehicle_defaults()

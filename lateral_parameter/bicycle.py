@@ -242,6 +242,33 @@ def steady_axle_forces(a_y, mass, lf, lr):
     return mass * a_y * lr / L, mass * a_y * lf / L
 
 
+def axle_forces_general(v_y_dot, v_x, r, r_dot, Iz, mass, lf, lr):
+    """Front/rear lateral tire force (N), from the FULL lateral force + yaw moment balance -- no
+    steady-state assumption, Iz required:
+
+        Fyf + Fyr        = m*(v_y_dot + v_x*r)      (lateral force balance, general)
+        lf*Fyf - lr*Fyr  = Iz*r_dot                  (yaw moment balance, general)
+
+    Solving that 2x2 linear system for Fyf, Fyr:
+
+        Fyf = [Iz*r_dot + lr*m*(v_y_dot + v_x*r)] / L
+        Fyr = [lf*m*(v_y_dot + v_x*r) - Iz*r_dot] / L
+
+    steady_axle_forces() is this function's r_dot = v_y_dot = 0 special case (substitute both in
+    and the Iz*r_dot term drops out, leaving exactly steady_axle_forces()'s a_y = v_x*r split).
+    The two agree wherever a window really is at steady state and diverge by exactly however much
+    Iz*r_dot (plus the v_y_dot term) that window still carried -- so fitting Cf/Cr both ways on the
+    identical (alpha_f, alpha_r) samples is a direct measurement of what the zero-yaw-moment
+    assumption costs, now that Iz is known independently (estimate_yaw_inertia.py, method=impulse)
+    rather than assumed away.
+    """
+    L = lf + lr
+    a_y = v_y_dot + v_x * r
+    Fyf = (Iz * r_dot + lr * mass * a_y) / L
+    Fyr = (lf * mass * a_y - Iz * r_dot) / L
+    return Fyf, Fyr
+
+
 def understeer_gradient(Cf, Cr, mass, lf, lr):
     """K = (m/L)*(lr/Cf - lf/Cr), rad per m/s^2. Steady-state steer is delta = L/R + K*a_y."""
     L = lf + lr
@@ -313,6 +340,49 @@ def bracket(y, x):
     reverse = float(np.sum(y * y)) / cross if abs(cross) > 0 else float("nan")
     geometric = math.sqrt(forward * reverse) if forward > 0 and reverse > 0 else float("nan")
     return forward, reverse, geometric
+
+
+def reject_outliers_by_residual(alpha, Fy, z_thresh=3.5, max_iter=5):
+    """Bool mask, same length as alpha/Fy, True for points to keep: iteratively fit Fy=C*alpha
+    through the origin, drop points whose residual is a MAD-based outlier, refit on the survivors,
+    repeat until the kept set stops shrinking or max_iter is hit.
+
+    Deliberately residual-based, not alpha- or ratio-based: screening on Fy/alpha directly
+    recreates exactly the small-alpha attenuation problem bracket() already has to work around
+    (see its own docstring) -- a legitimate low-alpha point's ratio swings wildly on its own,
+    nothing to do with being a genuine outlier. A point's distance from the FITTED line doesn't
+    have that problem: close to the line is fine no matter how small its alpha, far from it is
+    suspect no matter how large.
+
+    MAD (median absolute deviation) rather than plain std: a single wild point inflates std enough
+    to hide itself (and any point milder than it) from a std-based z-score, which is exactly
+    backwards for outlier detection. MAD's own median-based construction isn't dragged around by
+    the outlier it's trying to catch. 0.6745 is the standard MAD-to-sigma factor (the constant
+    that makes MAD*1.4826 a consistent estimator of sigma under a normal distribution, inverted
+    here since z = residual / (MAD*1.4826) = residual*0.6745/MAD).
+
+    Callers refit their own C (usually via bracket(), for its forward/reverse/geometric slopes)
+    from the masked survivors -- this function only decides who survives.
+    """
+    alpha = np.asarray(alpha, dtype=float)
+    Fy = np.asarray(Fy, dtype=float)
+    mask = np.ones(len(alpha), dtype=bool)
+    for _ in range(max_iter):
+        denom = float(np.sum(alpha[mask] ** 2))
+        if denom <= 0:
+            break
+        C = float(np.sum(Fy[mask] * alpha[mask]) / denom)
+        resid = Fy - C * alpha
+        med = np.median(resid[mask])
+        mad = np.median(np.abs(resid[mask] - med))
+        if mad <= 0:
+            break
+        z = 0.6745 * (resid - med) / mad
+        new_mask = np.abs(z) < z_thresh
+        if new_mask.sum() == mask.sum():
+            break
+        mask = new_mask
+    return mask
 
 
 def fit_stiffness(alpha, Fy):

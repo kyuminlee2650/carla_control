@@ -1,70 +1,49 @@
-r"""Yaw moment of inertia (Iz), measured two independent ways.
+r"""Yaw moment of inertia (Iz), measured tire-free by an airborne angular impulse.
 
-    --method step      (default)  transient step-steer response, through the tire model
-    --method impulse              airborne angular impulse, with no tire model at all
-    --report-only                 no simulator; just re-run the checks on the saved JSON
-
-Why both: the step-steer fit needs Cf/Cr to turn measured motion into a yaw moment, so any scale
-error in those lands entirely in Iz, and nothing inside that experiment can tell the two apart.
-The impulse method removes the tires from the problem completely, so the pair brackets the truth
-in a way neither does alone. Run impulse first -- it is the one that can falsify the other.
-
---------------------------------------------------------------------------------------------
-method = step
---------------------------------------------------------------------------------------------
-Loads Cf, Cr (and m, lf, lr) from estimate_cornering_stiffness.py's output. At steady state Iz
-drops out of the yaw moment balance entirely (r_dot = 0) -- which is exactly why that script can
-solve for Cf/Cr without knowing Iz, and equally why Iz is only identifiable from a transient:
-
-    Iz * r_dot = lf*Fyf - lr*Fyr = lf*Cf*alpha_f - lr*Cr*alpha_r
-
-With Cf, Cr known the right-hand side (call it M) is computable at every tick from
-(v_x, v_y, r, delta), leaving one unknown. The fit integrates rather than differentiates --
-integral(M dt) = Iz*(r - r0) -- because differentiating r forces a smoothing filter that cannot
-win: wide enough to control noise, it clips the peak of r_dot and inflates Iz. See
-bicycle.fit_inertia_integral() for the numbers behind that choice.
-
-Maneuver: cruise straight, then a constant open-loop step in steering, logged from just before the
-step through the rise into the new steady turn. Steer magnitude stays in the ~8-10 deg range
-estimate_cornering_stiffness.py calibrated over, so the borrowed linear tire model still applies.
-Run on Town06's long straight (spawn index 86, same spot longitudinal_PID.py uses): four lanes of
-room to drift sideways during the transient, and it starts straight.
-
-delta is the *measured* front wheel angle (bicycle.front_steer_angle), not `steer_cmd * max_steer`.
-A step in command is not a step at the wheel -- the actuator ramps over roughly the same timescale
-as the transient being fitted.
-
---------------------------------------------------------------------------------------------
-method = impulse
---------------------------------------------------------------------------------------------
 Drop the vehicle far above the map. With no wheel in contact the only external force is gravity,
 which acts at the centre of mass and so exerts no yaw moment whatsoever. Hit it with a known
 angular impulse about z and only the rigid-body relation is left:
 
     Iz = J_z / delta_r
 
-No Cf, no Cr, no slip angles, no bicycle model. CARLA's impulse units are not reliably documented,
-so the script calibrates instead of assuming: phase 1 applies a pure linear impulse and recovers
-the mass from P/dv, which pins the units to SI if it returns the blueprint's mass. The residual
-ambiguity -- whether angular impulse is taken in kg*m^2*rad/s or kg*m^2*deg/s -- is reported both
-ways; they differ by 57.3x, so only one can be a plausible car.
+No Cf, no Cr, no slip angles, no bicycle model, no steering at all -- this measurement never
+touches the tires. CARLA's impulse units are not reliably documented, so the script calibrates
+instead of assuming: phase 1 applies a pure linear impulse and recovers
+the mass from P/dv, which pins the units to SI if it returns the blueprint's mass. That does NOT
+carry over to the angular API, though -- add_angular_impulse lands about six orders of magnitude
+off a kg*m^2*rad/s reading. Phase 2 applies several arbitrary angular-impulse magnitudes J
+(--impulses), one per trial, and simply reads back whatever yaw rate r0 each one happened to
+produce -- nothing is chosen or back-solved from a target rate. Each (J, r0) pair gives its own
+Iz = J/r0 under all four unit conventions UE4's radian/degree variants crossed with its
+centimetre-scaled internals allow; only kg*cm^2*deg/s lands in the plausible range for a passenger
+car (the others are off by factors of 57.3 or 10,000): see ANGULAR_IMPULSE_UNITS below. The script
+uses that conversion directly for every trial's Iz, while still printing the other three candidates
+each run so the assumption stays auditable rather than silently baked in.
 
 Two systematic effects are handled rather than hoped away: UE4's angular damping (the spin decays,
 so r(t) = r0*exp(-t/tau) is fitted and r0 extrapolated back to the impulse), and cross-axis
 coupling (roll/pitch rates are logged, and a warning fires if a pure z impulse is not producing a
-pure z rotation). Sweeping several impulse magnitudes is the linearity check.
+pure z rotation). Sweeping several impulse magnitudes is the linearity check -- Iz is a rigid-body
+property and cannot depend on how hard it was hit, so the per-trial Iz column in the printed table
+should read flat across the whole sweep.
+
+--record (needs 2+ --impulses) also produces one combined mp4: every trial's clip, played back to
+back in the order applied, each labelled on-screen with the J that produced it (phase 3). The
+per-trial clips are deleted once the combined one exists.
+
+--report-only skips the simulator entirely and just reprints the table from the saved JSON.
 
 Usage (Ubuntu):
     cd ~/carla_control
-    python3 lateral_parameter/estimate_yaw_inertia.py --method impulse --save-plot
-    python3 lateral_parameter/estimate_yaw_inertia.py --save-plot
+    python3 lateral_parameter/estimate_yaw_inertia.py
+    python3 lateral_parameter/estimate_yaw_inertia.py --record
     python3 lateral_parameter/estimate_yaw_inertia.py --report-only
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
-    .venv\Scripts\python.exe lateral_parameter\estimate_yaw_inertia.py --method impulse --save-plot
     .venv\Scripts\python.exe lateral_parameter\estimate_yaw_inertia.py
-    .venv\Scripts\python.exe lateral_parameter\estimate_yaw_inertia.py --speeds 5,6,7,8 --steer-deg 9 --save-plot
+    .venv\Scripts\python.exe lateral_parameter\estimate_yaw_inertia.py --record
+    .venv\Scripts\python.exe lateral_parameter\estimate_yaw_inertia.py --impulses 1e8,3e8,6e8,1e9,2e9 --record
     .venv\Scripts\python.exe lateral_parameter\estimate_yaw_inertia.py --report-only
 """
 
@@ -74,7 +53,6 @@ import math
 import os
 import queue
 import sys
-import time
 
 import numpy as np
 
@@ -82,20 +60,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # functions.py, viz_utils.py live one level up, alongside the other controllers
 sys.path.append(os.path.dirname(HERE))
 
-# functions.py resolves CARLA_ROOT and puts the simulator's PythonAPI on sys.path, so it has to
-# be imported before carla's navigation helpers are reachable.
-from functions import PID, CollisionWatch, LowPassFilter, clipping, get_vehicle_geometry
+# functions.py resolves CARLA_ROOT and puts the simulator's PythonAPI on sys.path as a module-level
+# side effect, so it has to be imported before carla's navigation helpers are reachable -- even
+# though nothing here calls into it directly.
+import functions  # noqa: F401
 
 import carla
 
-from viz_utils import VIEWS, VideoRecorder, run_name
-
-from bicycle import (bracket, centered_integral_pair, fit_inertia_derivative, fit_inertia_integral,
-                     front_steer_angle, report, steady_yaw_rate, steer_convention_report,
-                     transient_span, zero_phase_derivative, yaw_mode)
+from viz_utils import VIEWS, VideoRecorder, concat_videos_sequential, run_name
 
 MAP_NAME = "Town06"
 ORIGIN_INDEX = 86
+
+# Empirically established (see the module docstring): sweeping impulse magnitude and checking all
+# four unit conventions UE4's radian/degree variants crossed with its centimetre-scaled internals
+# allow, only this one lands in the plausible range for a passenger car's yaw inertia.
+# method_impulse() uses it directly for every trial's Iz; the other three candidates are still
+# computed and printed each run as an audit trail, not re-derived from scratch.
+ANGULAR_IMPULSE_UNITS = "kg*cm^2*deg/s"
 
 
 def setup_world(args):
@@ -115,263 +97,6 @@ def setup_world(args):
     world.apply_settings(settings)
     return world, original_settings
 
-
-# ============================================================================================
-# method = step
-# ============================================================================================
-
-def run_step_trial(world, origin_transform, blueprint, imu_bp, max_steer, steer_cmd, target_speed,
-                   args):
-    """Cruise straight to target_speed, step the steering, log through the transient.
-
-    Logging starts `args.pre_step_time` before the step, not at it: the derivative cross-check is
-    centred and needs samples on both sides of every point it differentiates, and the most
-    important point of the run is the step instant itself.
-
-    Returns {"t", "v_x", "v_y", "r", "delta", "delta_cmd", "step_idx"} with t measured from the
-    step, r left raw. None if the car never reached cruise speed or hit something.
-    """
-    vehicle = world.spawn_actor(blueprint, origin_transform)
-    vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-    vehicle.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-    collision = CollisionWatch(world, vehicle)
-    collision.arm()
-
-    speed_pid = PID(kp=0.5, ki=0.2, kd=0.0, dt=args.dt)
-    # Causal, and deliberately so: this only drives the "has it settled" gate, where lag is
-    # harmless. It is NOT what the fit uses.
-    r_dot_gate = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_r = None
-
-    cruise_ticks = int(args.cruise_time / args.dt)
-    pre_ticks = int(args.pre_step_time / args.dt)
-    transient_ticks = int(args.transient_time / args.dt)
-    cruise_settled_ticks = 0
-    stepped = False
-    step_idx = None
-    window = {"t": [], "v_x": [], "v_y": [], "r": [], "delta": [], "delta_cmd": []}
-
-    imu = None
-    try:
-        world.tick()
-        imu_queue = queue.Queue()
-        imu = world.spawn_actor(imu_bp, carla.Transform(), attach_to=vehicle)
-        imu.listen(imu_queue.put)
-
-        for i in range(int(args.max_duration / args.dt)):
-            step_start = time.time()
-            world.tick()
-            imu_data = imu_queue.get(timeout=2.0)
-
-            transform = vehicle.get_transform()
-            yaw = math.radians(transform.rotation.yaw)
-            vel = vehicle.get_velocity()
-            v_x = vel.x * math.cos(yaw) + vel.y * math.sin(yaw)
-            v_y = -vel.x * math.sin(yaw) + vel.y * math.cos(yaw)
-            r = imu_data.gyroscope.z   # rad/s, body-frame yaw rate straight off the sensor
-            # Read before the new command is applied: the angle the physics engine actually held
-            # over the interval that produced the v_y and r just measured.
-            delta_meas = front_steer_angle(vehicle)
-
-            r_dot_gated = r_dot_gate.step(0.0 if prev_r is None else (r - prev_r) / args.dt)
-            prev_r = r
-
-            u = clipping(speed_pid.step(target_speed - v_x), 1.0, -1.0)
-            control = carla.VehicleControl()
-            control.throttle, control.brake = (u, 0.0) if u >= 0 else (0.0, -u)
-            control.steer = steer_cmd if stepped else 0.0
-            vehicle.apply_control(control)
-
-            if collision.hit:
-                print(f"    collision at t={i*args.dt:.1f}s -- aborting this trial")
-                return None
-
-            if not stepped:
-                settled = abs(v_x - target_speed) < args.speed_tol and abs(r_dot_gated) < 0.05
-                cruise_settled_ticks = cruise_settled_ticks + 1 if settled else 0
-                # rolling pre-step buffer, so the step lands with history already behind it
-                if settled:
-                    window["t"].append(0.0)   # rewritten once step_idx is known
-                    window["v_x"].append(v_x); window["v_y"].append(v_y); window["r"].append(r)
-                    window["delta"].append(delta_meas)
-                    window["delta_cmd"].append(0.0)
-                    for key in window:
-                        if len(window[key]) > pre_ticks:
-                            del window[key][0]
-                else:
-                    for key in window:
-                        window[key] = []
-                if i % int(1.0 / args.dt) == 0:
-                    print(f"    t={i*args.dt:5.1f}s  v_x={v_x:5.2f}/{target_speed:.1f} m/s  "
-                          f"settled={cruise_settled_ticks}/{cruise_ticks}")
-                if cruise_settled_ticks >= cruise_ticks:
-                    stepped = True
-                    # +1 because the stepped command is only applied at the *end* of this
-                    # iteration: the sample read at the top of the next one still belongs to the
-                    # unsteered tick, and the one after it is the first the step actually moved.
-                    step_idx = len(window["t"]) + 1
-                    print(f"    STEP at t={i*args.dt:.1f}s: steer -> "
-                          f"{math.degrees(steer_cmd * max_steer):+.1f} deg "
-                          f"({len(window['t'])} pre-step ticks buffered)")
-            else:
-                window["t"].append(0.0)
-                window["v_x"].append(v_x); window["v_y"].append(v_y); window["r"].append(r)
-                window["delta"].append(delta_meas)
-                window["delta_cmd"].append(steer_cmd * max_steer)
-                if len(window["t"]) - step_idx >= transient_ticks:
-                    window["t"] = [(k - step_idx) * args.dt for k in range(len(window["r"]))]
-                    window["step_idx"] = step_idx
-                    return window
-
-            elapsed = time.time() - step_start
-            if elapsed < args.dt / args.times_run:
-                time.sleep(args.dt / args.times_run - elapsed)
-    finally:
-        collision.destroy()
-        if imu is not None and imu.is_alive:
-            imu.stop()
-            imu.destroy()
-        vehicle.destroy()
-
-    return None   # never reached cruise speed within max_duration
-
-
-def method_step(world, args):
-    """Full step-steer identification. Returns the dict written to --out."""
-    with open(args.cf_cr_file) as f:
-        tire = json.load(f)
-    Cf, Cr, mass, lf, lr = tire["Cf"], tire["Cr"], tire["mass"], tire["lf"], tire["lr"]
-    print(f"Loaded {os.path.basename(args.cf_cr_file)}: Cf={Cf:,.0f} N/rad  Cr={Cr:,.0f} N/rad  "
-          f"mass={mass:.1f} kg  lf={lf:.2f} m  lr={lr:.2f} m")
-
-    if args.dt > 0.02:
-        print(f"\nWARNING: --dt {args.dt} is too coarse. The yaw rise lasts ~0.2-0.3 s, leaving "
-              f"roughly {0.25/args.dt:.0f} samples across it. Against a simulated bicycle with a "
-              f"known Iz this estimator holds to ~2% at dt=0.01 but drifts 10-28% high at "
-              f"dt=0.05 once realistic gyro noise is present.\n")
-
-    origin_transform = world.get_map().get_spawn_points()[ORIGIN_INDEX]
-    for actor in world.get_actors().filter("vehicle.*"):
-        if actor.get_location().distance(origin_transform.location) < 5.0:
-            actor.destroy()
-
-    blueprint = world.get_blueprint_library().filter(args.vehicle)[0]
-    imu_bp = world.get_blueprint_library().find("sensor.other.imu")
-
-    probe = world.spawn_actor(blueprint, origin_transform)
-    _, lf_probe, lr_probe, max_steer = get_vehicle_geometry(probe, origin_transform)
-    probe.destroy()
-    if abs(lf_probe - lf) > 0.05 or abs(lr_probe - lr) > 0.05:
-        print(f"warning: this vehicle's lf/lr ({lf_probe:.2f}/{lr_probe:.2f}) differ from the "
-              f"cornering-stiffness file's ({lf:.2f}/{lr:.2f}) -- Cf/Cr may not transfer cleanly")
-
-    steer_cmd = clipping(math.radians(args.steer_deg) / max_steer, 1.0, -1.0)
-
-    S_all, R_all, M_all, r_dot_all = [], [], [], []
-    delta_meas_all, delta_cmd_all = [], []
-    raw_log, per_speed = [], []
-    for target_speed in [float(v) for v in args.speeds.split(",")]:
-        print(f"\n=== cruise speed {target_speed:.1f} m/s ===")
-        window = run_step_trial(world, origin_transform, blueprint, imu_bp, max_steer, steer_cmd,
-                               target_speed, args)
-        if window is None:
-            print(f"  did not settle within {args.max_duration:.0f}s -- skipped")
-            continue
-
-        v_x = np.array(window["v_x"]); v_y = np.array(window["v_y"])
-        r = np.array(window["r"]); delta = np.array(window["delta"])
-        step_idx = window["step_idx"]
-
-        # Order matters: the fit window comes from r alone, then the derivative window is sized
-        # from that rise. A fixed derivative window either smears r_dot's peak or passes noise,
-        # and only the rise itself says which.
-        start, end = transient_span(r, step_idx, args.dt, settle_frac=args.settle_frac)
-        rise_s = (end - start) * args.dt
-        r_dot = zero_phase_derivative(r, args.dt, window_s=args.savgol_window, rise_s=rise_s)
-
-        beta = v_y / v_x
-        M = np.array(lf * Cf * (delta - beta - lf * r / v_x) - lr * Cr * (-beta + lr * r / v_x))
-
-        M_fit, r_dot_fit, r_fit = M[start:end], r_dot[start:end], r[start:end]
-        S_c, R_c = centered_integral_pair(M_fit, r_fit, args.dt)
-        S_all.extend(S_c.tolist()); R_all.extend(R_c.tolist())
-        M_all.extend(M_fit.tolist()); r_dot_all.extend(r_dot_fit.tolist())
-        delta_meas_all.extend(delta.tolist()); delta_cmd_all.extend(window["delta_cmd"])
-
-        tail = max(1, int(0.5 / args.dt))
-        r_ss = float(np.mean(r[-tail:])); v_ss = float(np.mean(v_x[-tail:]))
-        delta_ss = float(np.mean(delta[-tail:]))
-        r_ss_pred = steady_yaw_rate(delta_ss, v_ss, Cf, Cr, mass, lf, lr)
-
-        fwd, rev, geo = fit_inertia_integral(M_fit, r_fit, args.dt)
-        d_geo = fit_inertia_derivative(M_fit, r_dot_fit)[2]
-        wn, zeta = yaw_mode(Cf, Cr, mass, geo, lf, lr, v_ss) if geo == geo else (float("nan"),) * 2
-
-        print(f"  logged {len(r)} ticks ({step_idx} pre-step), fit window {end-start} ticks "
-              f"({rise_s:.2f} s of rise)")
-        if end - start < 15:
-            print(f"    WARNING: only {end-start} samples across the rise -- resolution-limited. "
-                  f"Rerun with a smaller --dt before reading anything into this trial.")
-        print(f"  steady-state r: measured {math.degrees(r_ss):+.2f} deg/s  vs  predicted "
-              f"{math.degrees(r_ss_pred):+.2f} deg/s from Cf/Cr")
-        print(f"  Iz = {geo:,.0f} kg*m^2   bracket [{fwd:,.0f}, {rev:,.0f}]   "
-              f"derivative cross-check {d_geo:,.0f}")
-        print(f"  implied yaw mode at {v_ss:.1f} m/s: omega_n={wn:.2f} rad/s  zeta={zeta:.2f}"
-              + ("  -> r(t) should not overshoot" if zeta >= 1 else "  -> r(t) should overshoot"))
-
-        per_speed.append({"target_speed": target_speed, "n_ticks": len(r),
-                         "n_fit_ticks": int(end - start), "Iz_forward": fwd, "Iz_reverse": rev,
-                         "Iz_trial": geo, "Iz_derivative": d_geo, "r_ss_measured": r_ss,
-                         "r_ss_predicted": r_ss_pred, "v_ss": v_ss, "delta_ss": delta_ss,
-                         "omega_n": wn, "zeta": zeta})
-        raw_log.append({"target_speed": target_speed, "step_idx": step_idx, "dt": args.dt,
-                       "t": window["t"], "v_x": window["v_x"], "v_y": window["v_y"],
-                       "r": window["r"], "delta": window["delta"],
-                       "delta_cmd": window["delta_cmd"],
-                       "fit_start": int(start), "fit_end": int(end)})
-
-    if len(S_all) < 10:
-        raise SystemExit(f"only {len(S_all)} ticks logged -- not enough transient data to fit Iz")
-
-    print(f"\n{'speed':>6} {'n_fit':>6} {'Iz_fwd':>11} {'Iz_rev':>11} {'Iz':>11} {'Iz_deriv':>11} {'zeta':>6}")
-    for p in per_speed:
-        print(f"{p['target_speed']:6.1f} {p['n_fit_ticks']:6d} {p['Iz_forward']:11,.0f} "
-              f"{p['Iz_reverse']:11,.0f} {p['Iz_trial']:11,.0f} {p['Iz_derivative']:11,.0f} "
-              f"{p['zeta']:6.2f}")
-
-    Iz_fwd, Iz_rev, Iz = bracket(S_all, R_all)
-    Iz_deriv = fit_inertia_derivative(M_all, r_dot_all)[2]
-    print(f"\nIz = {Iz:,.0f} kg*m^2   (integral form, pooled over {len(S_all)} fit ticks)")
-    print(f"   errors-in-variables bracket [{Iz_fwd:,.0f}, {Iz_rev:,.0f}] -- random error only, "
-          f"NOT a confidence interval")
-    print(f"   derivative-form cross-check: {Iz_deriv:,.0f} kg*m^2")
-
-    # A rigid body's inertia cannot depend on how fast it was going, so spread across trials is
-    # pure estimator bias and bounds how far this number can be trusted.
-    if len(per_speed) >= 2:
-        trials = np.array([p["Iz_trial"] for p in per_speed])
-        spread = (trials.max() - trials.min()) / trials.mean()
-        print(f"across-speed spread: {spread*100:.0f}% of mean "
-              f"({trials.min():,.0f} .. {trials.max():,.0f})")
-        if spread > 0.15:
-            print(f"  WARNING: Iz is a rigid-body property and cannot vary with speed. A "
-                  f"{spread*100:.0f}% spread is systematic error upstream -- most likely Cf/Cr, "
-                  f"whose scale error lands entirely here. --method impulse settles it.")
-
-    steer_slope, steer_note = steer_convention_report(delta_meas_all, delta_cmd_all)
-    print(f"measured/commanded steer slope: {steer_slope:.3f}")
-    if steer_note:
-        print(f"  WARNING: {steer_note}")
-
-    return {"method": "step", "Iz": Iz, "Iz_forward": Iz_fwd, "Iz_reverse": Iz_rev,
-            "Iz_derivative": Iz_deriv, "Cf": Cf, "Cr": Cr, "mass": mass, "lf": lf, "lr": lr,
-            "steer_slope": steer_slope, "per_speed": per_speed, "raw": raw_log,
-            "_plot": {"S": S_all, "R": R_all}}
-
-
-# ============================================================================================
-# method = impulse
-# ============================================================================================
 
 def spawn_airborne(world, blueprint, base_transform, height, imu_bp, settle_ticks=10):
     """Spawn `height` metres up and let the physics state settle.
@@ -450,16 +175,21 @@ def fit_decay(t, r):
     return float(sign * math.exp(intercept)), float(-1.0 / slope)
 
 
-def measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args, video_factory=None):
+def measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args, video_factory=None,
+                        label=None):
     """Phase 2: angular impulse about z, then log the spin-down.
 
-    video_factory(vehicle, J) -> VideoRecorder|None, called right after the vehicle is spawned
+    video_factory(vehicle, label) -> VideoRecorder|None, called right after the vehicle is spawned
     airborne, before the angular impulse is applied. If it returns a recorder, this closes it
     once the decay window finishes, before vehicle.destroy() (VideoRecorder's own lifecycle
     requirement -- the camera is attached to the vehicle). None (the default) records nothing.
+
+    label names the clip (e.g. "01_J145799561"). Falls back to the raw J if omitted.
     """
     vehicle, imu, imu_queue = spawn_airborne(world, blueprint, base_transform, args.height, imu_bp)
-    recorder = video_factory(vehicle, J) if video_factory is not None else None
+    recorder = (video_factory(vehicle, label if label is not None else f"J{J:,.0f}")
+               if video_factory is not None else None)
+    result = None
     try:
         vehicle.add_angular_impulse(carla.Vector3D(0.0, 0.0, J))
         ts, rz, rx, ry = [], [], [], []
@@ -471,49 +201,56 @@ def measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args, video
             rx.append(imu_data.gyroscope.x)
             ry.append(imu_data.gyroscope.y)
         r0, tau = fit_decay(np.array(ts), np.array(rz))
-        return {"J": J, "t": ts, "r_z": rz, "r_x": rx, "r_y": ry, "r_first": rz[0],
-               "r0": r0, "tau": tau,
-               "cross_axis": float(max(np.max(np.abs(rx)), np.max(np.abs(ry))))}
+        result = {"J": J, "t": ts, "r_z": rz, "r_x": rx, "r_y": ry, "r_first": rz[0],
+                 "r0": r0, "tau": tau,
+                 "cross_axis": float(max(np.max(np.abs(rx)), np.max(np.abs(ry))))}
+        return result
     finally:
         if recorder is not None:
-            recorder.close()   # before vehicle.destroy(): the camera is attached to it
+            video_path = recorder.close()   # before vehicle.destroy(): the camera is attached to it
+            # result is the same dict object the caller is about to receive -- mutating it here
+            # (rather than returning something new from finally) still reaches the caller.
+            if result is not None:
+                result["video_path"] = video_path
+                result["video_frames"] = recorder.frames
         imu.stop(); imu.destroy(); vehicle.destroy()
 
 
 def make_video_factory(world, args):
-    """--record -> a measure_yaw_impulse() video_factory(vehicle, J) that opens one VideoRecorder
-    per airborne trial, named after its impulse magnitude so the probe trial and every sweep
-    trial get their own clip instead of overwriting each other -- same per-trial auto-naming
-    estimate_cornering_stiffness.py uses for its own --record, keyed on J here instead of
-    (speed, steer)."""
+    """--record -> a measure_yaw_impulse() video_factory(vehicle, label) that opens one
+    VideoRecorder per airborne trial, named after its label so every trial gets its own clip
+    instead of overwriting each other -- same per-trial auto-naming
+    estimate_cornering_stiffness.py uses for its own --record, keyed on label here."""
     if not args.record:
         return None
 
     rec_w, rec_h = (int(v) for v in args.record_res.lower().split("x"))
 
-    def factory(vehicle, J):
-        suffix = f"J{J:,.0f}".replace(",", "")
+    def factory(vehicle, label):
         if args.record == "auto":
-            video_path = os.path.join(args.video_dir, run_name(suffix) + ".mp4")
+            video_path = os.path.join(args.video_dir, run_name(label) + ".mp4")
         else:
             base, ext = os.path.splitext(args.record)
-            video_path = f"{base}_{suffix}{ext}"
+            video_path = f"{base}_{label}{ext}"
         return VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
                              width=rec_w, height=rec_h, view=args.record_view)
 
     return factory
 
 
-def print_yaw_impulse_table(trials, targets):
-    """Per-trial J / target rate / measured r0 / decay tau / Iz under both unit candidates /
-    cross-axis leakage -- the plain-text companion to the spin-down and linearity figures
-    (save_plots()'s impulse branch): the numbers those two plots are drawn from, in one place.
+def print_yaw_impulse_table(trials):
+    """Per-trial J (given) / measured r0 / decay tau / Iz (kg*m^2, under the ANGULAR_IMPULSE_UNITS
+    convention) / cross-axis leakage. This is the table --report-only reprints from the saved JSON.
+
+    Column order follows the causal chain, not alphabetical convenience: J is what was applied,
+    everything to its right is what was measured or derived from that single trial.
     """
-    print(f"\n{'target (deg/s)':>15} {'J':>12} {'r0 (deg/s)':>11} {'tau (s)':>8} "
-          f"{'Iz [rad] (kg*m^2)':>18} {'Iz [deg] (kg*m^2)':>18} {'cross-axis (rad/s)':>19}")
-    for target, t in zip(targets, trials):
-        print(f"{target:15.1f} {t['J']:12,.0f} {math.degrees(t['r0']):11.2f} {t['tau']:8.2f} "
-              f"{t['Iz_if_rad']:18,.0f} {t['Iz_if_deg']:18,.0f} {t['cross_axis']:19.4f}")
+    print(f"\n{'#':>3} {'J (given, raw impulse)':>24} {'r0 (measured, deg/s)':>22} "
+          f"{'tau (s)':>10} {'Iz (kg*m^2)':>12} {'cross-axis (rad/s)':>19}")
+    for i, t in enumerate(trials, start=1):
+        tau_str = "inf" if not math.isfinite(t["tau"]) or t["tau"] > 1e6 else f"{t['tau']:.2f}"
+        print(f"{i:3d} {t['J']:24,.0f} {math.degrees(t['r0']):22.2f} "
+              f"{tau_str:>10} {t['Iz']:12,.1f} {t['cross_axis']:19.4f}")
 
 
 def method_impulse(world, args):
@@ -547,150 +284,141 @@ def method_impulse(world, args):
 
     # Phase 1 proves linear impulses are SI N*s, but that does NOT carry over to the angular API:
     # measured here, add_angular_impulse lands about six orders of magnitude off a kg*m^2*rad/s
-    # reading. UE4 works internally in centimetres and exposes both radian and degree variants, so
-    # there are four candidate conventions. Rather than pick one, probe the actual scale with a
-    # small impulse and size the real sweep from it, so the spin is large enough to measure
-    # properly and to fit the damping on.
+    # reading. The logic below is deliberately the direct one: apply each of several arbitrary,
+    # user-given angular impulses J (nothing is back-solved from a desired rate), read back
+    # whatever yaw rate r0 that particular J happened to produce, and compute Iz = J/r0 per trial.
+    # Cause and effect only run one way -- J in, r0 out -- so this is the loop that actually
+    # generates the "same J, different flavours of the same story" the module docstring promises:
+    # several independent (J, r0) pairs, each yielding its own Iz, that should all agree.
     video_factory = make_video_factory(world, args)
 
-    print("\n=== phase 2a: probing the angular impulse scale ===")
-    probe_t = measure_yaw_impulse(world, blueprint, base_transform, imu_bp, args.probe_impulse, args,
-                                  video_factory=video_factory)
-    scale = probe_t["r0"] / args.probe_impulse    # rad/s produced per unit of J
-    print(f"  J={args.probe_impulse:,.0f} -> r0={probe_t['r0']:.3e} rad/s   "
-          f"=> {scale:.3e} rad/s per unit J")
-    if abs(scale) < 1e-18:
-        raise SystemExit("angular impulse produced no measurable rotation -- cannot continue")
-    targets = [float(x) for x in args.target_rates.split(",")]
-    impulses = [math.radians(t) / scale for t in targets]
-    print(f"  sizing the sweep for {targets} deg/s  =>  J = "
-          + ", ".join(f"{j:,.3g}" for j in impulses))
+    impulses = [float(x) for x in args.impulses.split(",")]
+    print(f"\n=== phase 2: angular impulse about z -- {len(impulses)} arbitrary magnitudes ===")
+    print("  J (given) = " + ", ".join(f"{j:,.3g}" for j in impulses))
 
-    print("\n=== phase 2b: angular impulse about z ===")
     trials = []
-    for J in impulses:
+    for i, J in enumerate(impulses, start=1):
+        label = f"{i:02d}_J{J:,.0f}".replace(",", "")
         t = measure_yaw_impulse(world, blueprint, base_transform, imu_bp, J, args,
-                                video_factory=video_factory)
-        t["Iz_if_rad"] = J / t["r0"] if t["r0"] else float("nan")
-        t["Iz_if_deg"] = J / math.degrees(t["r0"]) if t["r0"] else float("nan")
+                                video_factory=video_factory, label=label)
+        # J / r0[deg/s] / 1e4 converts UE4's centimetre-scaled internal units back to m^2 -- see
+        # ANGULAR_IMPULSE_UNITS. r0 is measured, not chosen: it is whatever this J produced.
+        t["Iz_raw_rad"] = J / t["r0"] if t["r0"] else float("nan")            # J / r0   [rad]
+        t["Iz"] = t["Iz_raw_rad"] / math.degrees(1.0) / 1e4 if t["r0"] else float("nan")
         trials.append(t)
-        print(f"  J={J:>8,.0f}: r0={math.degrees(t['r0']):+8.2f} deg/s "
-              f"(first sample {math.degrees(t['r_first']):+.2f}, tau={t['tau']:.2f} s)  =>  "
-              f"Iz={t['Iz_if_rad']:>10,.0f} [if rad] | {t['Iz_if_deg']:>9,.0f} [if deg]")
+        print(f"  [{i}/{len(impulses)}] J={J:>14,.0f} (given)  ->  r0={math.degrees(t['r0']):+8.2f} "
+              f"deg/s (measured; first sample {math.degrees(t['r_first']):+.2f}, tau={t['tau']:.2f} s)"
+              f"  =>  Iz={t['Iz']:>9,.1f} kg*m^2")
+        if abs(t["r0"]) < math.radians(0.5):
+            print(f"    WARNING: r0 only {math.degrees(t['r0']):.3f} deg/s -- too close to gyro "
+                  f"noise to trust. Rerun with a larger J at this position in --impulses.")
         if t["cross_axis"] > args.cross_axis_tol:
             print(f"    WARNING: roll/pitch rate reached {t['cross_axis']:.3f} rad/s -- the z "
                   f"impulse is exciting other axes, so gyro.z is not a clean measurement here.")
 
-    print_yaw_impulse_table(trials, targets)
+    print_yaw_impulse_table(trials)
 
-    iz_rad_all = np.array([t["Iz_if_rad"] for t in trials])
-    spread = (iz_rad_all.max() - iz_rad_all.min()) / iz_rad_all.mean()
-    print(f"\nlinearity across impulse magnitudes: spread {spread*100:.2f}% of mean")
+    iz_all = np.array([t["Iz"] for t in trials])
+    spread = (iz_all.max() - iz_all.min()) / iz_all.mean()
+    Iz = float(np.mean(iz_all))
+    j_range = max(impulses) / min(impulses)
+    print(f"\nlinearity across impulse magnitudes: spread {spread*100:.4f}% of mean over a "
+          f"{j_range:.0f}x range of J")
     if spread > 0.05:
         print("  WARNING: Iz cannot depend on J. Something is nonlinear -- most likely the car "
               "touched down, or the impulse was clamped.")
 
+    print(f"\nIz = {Iz:,.1f} kg*m^2  (add_angular_impulse assumed to take "
+          f"{ANGULAR_IMPULSE_UNITS}, averaged over {len(trials)} trials)")
+    plausible = args.iz_min < Iz < args.iz_max
+    if not plausible:
+        print(f"  WARNING: {Iz:,.0f} kg*m^2 falls outside the {args.iz_min:,.0f}-"
+              f"{args.iz_max:,.0f} kg*m^2 plausible range for a {mass:.0f} kg car. Either this "
+              f"vehicle is unusual, or the {ANGULAR_IMPULSE_UNITS} convention no longer holds "
+              f"(e.g. a CARLA/UE4 version change) -- check the candidates table below.")
+
     # Four candidate conventions, from UE4's radian/degree variants crossed with its centimetre
-    # internals. They are separated by factors of 57.3 and 10,000, and a passenger car's yaw
-    # inertia is known to within a factor of ~3, so at most one of the four can be the answer.
-    # That is what makes this identifiable at all without documentation.
-    raw_rad = float(np.mean(iz_rad_all))                                  # J / r0   [rad]
+    # internals, kept here purely as an audit trail: they are separated by factors of 57.3 and
+    # 10,000, and a passenger car's yaw inertia is known to within a factor of ~3, so at most one
+    # of the four can be the answer -- which is how ANGULAR_IMPULSE_UNITS was established in the
+    # first place (see the module docstring).
+    raw_rad = float(np.mean([t["Iz_raw_rad"] for t in trials]))
     candidates = {
         "kg*m^2*rad/s":  raw_rad,
         "kg*m^2*deg/s":  raw_rad / math.degrees(1.0),
         "kg*cm^2*rad/s": raw_rad / 1e4,
         "kg*cm^2*deg/s": raw_rad / math.degrees(1.0) / 1e4,
     }
-    print("\nIz under each candidate unit convention for add_angular_impulse:")
+    print(f"\nIz under each candidate unit convention (audit -- only '{ANGULAR_IMPULSE_UNITS}' is "
+          f"used above):")
     for name, value in candidates.items():
-        print(f"  {name:>16} -> {value:>18,.1f} kg*m^2")
+        flag = "  <-- used" if name == ANGULAR_IMPULSE_UNITS else ""
+        print(f"  {name:>16} -> {value:>18,.1f} kg*m^2{flag}")
 
-    plausible = [(n, v) for n, v in candidates.items() if args.iz_min < v < args.iz_max]
-    Iz = units = None
-    if len(plausible) == 1:
-        units, Iz = plausible[0]
-        print(f"\nGROUND TRUTH Iz = {Iz:,.0f} kg*m^2")
-        print(f"  Only the '{units}' reading falls in the {args.iz_min:,.0f}-{args.iz_max:,.0f} "
-              f"kg*m^2 a {mass:.0f} kg car can possibly have; the others are off by factors of "
-              f"57.3 or 10,000. So add_angular_impulse takes {units}.")
-        print(f"  This is a *measurement*, not the documented convention -- it is confirmed by the "
-              f"linearity above ({spread*100:.2f}% across a {max(1e-9, max(t['J'] for t in trials)/min(t['J'] for t in trials)):.0f}x "
-              f"range of J) and should be cross-checked against --method step.")
-    else:
-        print(f"\n  -> {len(plausible)} candidates fall in the plausible range; cannot resolve the "
-              f"convention from magnitude alone.")
+    combined_video = None
+    if video_factory is not None and len(trials) >= 2:
+        print("\n=== phase 3: combining per-trial recordings ===")
+        # One clip per trial, played back to back in the order applied, each labelled with the J
+        # that produced it -- so the video makes the same "same physics, different magnitude"
+        # point the table does, just watchable instead of read. Unit is spelled out because J on
+        # its own is just a number: ANGULAR_IMPULSE_UNITS is what add_angular_impulse actually
+        # takes it as (established in phase 2 above), so this is the physically correct label, not
+        # a guess.
+        entries = [(f"J = {t['J']:.0f} {ANGULAR_IMPULSE_UNITS}", t.get("video_path"),
+                   t.get("video_frames", 0)) for t in trials]
+        if args.record == "auto":
+            combined_path = os.path.join(args.video_dir, run_name("impulses") + ".mp4")
+        else:
+            base, ext = os.path.splitext(args.record)
+            combined_path = f"{base}_impulses{ext}"
+        combined_video = concat_videos_sequential(entries, combined_path)
+        if combined_video is None:
+            print("  ! could not combine per-trial videos into one -- individual clips are still "
+                  "on disk")
 
-    return {"method": "impulse", "Iz": Iz, "units": units, "Iz_raw_rad": raw_rad,
+    return {"method": "impulse", "Iz": Iz, "units": ANGULAR_IMPULSE_UNITS, "Iz_raw_rad": raw_rad,
             "candidates": candidates, "linearity_spread": spread, "mass": mass,
             "mass_measured": mass_meas, "linear_impulse": args.linear_impulse,
-            "units_ok": units_ok, "trials": trials}
+            "units_ok": units_ok, "trials": trials, "combined_video": combined_video}
 
-
-# ============================================================================================
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", choices=("step", "impulse"), default="step",
-                        help="step: transient step-steer through the tire model. impulse: airborne "
-                             "angular impulse, no tire model at all (run this one first)")
     parser.add_argument("--report-only", action="store_true",
                         help="skip the simulator entirely and re-run the validation checks on the "
-                             "saved JSON files")
+                             "saved JSON")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--vehicle", default="vehicle.lincoln.mkz_2020")
-    parser.add_argument("--dt", type=float, default=0.01,
-                        help="fixed sim step (s) -- finer than the 0.05 the other scripts use, "
-                             "because the yaw transient lasts only ~0.2-0.3 s. Trials are a few "
-                             "seconds each, so the extra ticks are cheap")
-    parser.add_argument("--times-run", type=float, default=25.0, help="how times for simulation running?")
+    parser.add_argument("--dt", type=float, default=0.01, help="fixed sim step (s)")
 
-    # ---- method = step ---- #
-    parser.add_argument("--cf-cr-file",
-                        default=os.path.join(HERE, "cornering_stiffness_speed_report.json"),
-                        help="Cf/Cr/mass/lf/lr source -- estimate_cornering_stiffness.py's own "
-                             "--out")
-    parser.add_argument("--speeds", default="5,6,7,8", help="cruise speeds to step from (m/s)")
-    parser.add_argument("--steer-deg", type=float, default=9.0,
-                        help="step steer magnitude (deg) -- kept in the range Cf/Cr were "
-                             "calibrated over, since this reuses that linear tire fit")
-    parser.add_argument("--speed-tol", type=float, default=0.2)
-    parser.add_argument("--cruise-time", type=float, default=2.0)
-    parser.add_argument("--pre-step-time", type=float, default=0.5,
-                        help="how long to buffer before the step (s), so the centred derivative "
-                             "has samples on both sides of the step instant")
-    parser.add_argument("--transient-time", type=float, default=2.5,
-                        help="how long to log after the step. The fit uses only the rise; the "
-                             "settled tail is kept for the steady-state gain check")
-    parser.add_argument("--settle-frac", type=float, default=0.98)
-    parser.add_argument("--savgol-window", type=float, default=None,
-                        help="width (s) of the derivative window for the cross-check fit. Default "
-                             "sizes it at a quarter of the measured rise")
-    parser.add_argument("--max-duration", type=float, default=20.0)
-
-    # ---- method = impulse ---- #
     parser.add_argument("--height", type=float, default=80.0,
                         help="spawn height above the map (m) -- high enough not to reach the "
                              "ground within --decay-time")
-    parser.add_argument("--probe-impulse", type=float, default=1e6,
-                        help="small angular impulse used only to measure how much rotation a unit "
-                             "of J actually buys, so the real sweep can be sized in physical terms")
-    parser.add_argument("--target-rates", default="5,10,20,40",
-                        help="yaw rates (deg/s) the sweep aims for; the impulses to reach them are "
-                             "computed from the probe. Several, because Iz is a constant and a "
-                             "value that drifts with J means the model is wrong")
+    parser.add_argument("--impulses", default="145799561,291599122,583198243,1166396486",
+                        help="comma-separated raw angular-impulse magnitudes (CARLA's native "
+                             "add_angular_impulse units) to apply about z, one trial each -- no "
+                             "target rate, no back-solving: each J is applied as given and whatever "
+                             "yaw rate it produces is measured and used to compute that trial's Iz. "
+                             "Several, because Iz is a constant and a value that drifts with J means "
+                             "the model is wrong. Defaults are what worked well for "
+                             "vehicle.lincoln.mkz_2020 (~5-40 deg/s of resulting spin, under the "
+                             "kg*cm^2*deg/s convention) -- for a different vehicle, start with one "
+                             "value and watch the printed r0 to size the rest, since too small "
+                             "drowns in gyro noise and too large risks clipping/nonlinearity")
     parser.add_argument("--iz-min", type=float, default=500.0,
-                        help="plausibility window used to pick the impulse unit convention")
+                        help="plausibility window used to sanity-check the unit convention")
     parser.add_argument("--iz-max", type=float, default=8000.0)
     parser.add_argument("--linear-impulse", type=float, default=5000.0,
                         help="linear impulse (N*s) for the phase-1 mass/units calibration")
     parser.add_argument("--decay-time", type=float, default=1.0)
     parser.add_argument("--cross-axis-tol", type=float, default=0.05)
 
-    # ---- video (method = impulse only) ---- #
+    # ---- video ---- #
     parser.add_argument("--record", nargs="?", const="auto", default="",
-                        help="record each airborne trial (probe + sweep) to its own mp4; bare "
-                             "flag auto-names each clip under --video-dir. method=impulse only")
+                        help="record each --impulses trial, then (with 2+ trials) concatenate them "
+                             "in order into one combined mp4 with each segment's J overlaid at the "
+                             "top; bare flag auto-names it under --video-dir")
     parser.add_argument("--video-dir", default=os.path.join(HERE, "videos"),
                         help="where auto-named recordings go")
     parser.add_argument("--record-view", default="top", choices=sorted(VIEWS),
@@ -700,32 +428,30 @@ def main():
                              "beneath an apparently still car")
     parser.add_argument("--record-res", default="1280x720", help="recording resolution, WxH")
 
-    parser.add_argument("--out", default=None,
-                        help="defaults to yaw_inertia.json (step) or yaw_inertia_impulse.json "
-                             "(impulse)")
-    parser.add_argument("--plot-dir", default=os.path.join(HERE, "plots"))
-    parser.add_argument("--save-plot", action="store_true")
-    parser.add_argument("--no-show", action="store_true",
-                        help="build (and, with --save-plot, save) the figure but never call "
-                             "plt.show() -- for headless/background runs where nothing will be "
-                             "there to close the window")
+    parser.add_argument("--out", default=os.path.join(HERE, "yaw_inertia_impulse.json"))
     args = parser.parse_args()
 
-    out_path = args.out or os.path.join(
-        HERE, "yaw_inertia.json" if args.method == "step" else "yaw_inertia_impulse.json")
-
     if args.report_only:
-        with open(args.cf_cr_file) as f:
-            tire = json.load(f)
-        yawf = json.load(open(out_path)) if os.path.exists(out_path) else {}
-        report(tire["Cf"], tire["Cr"], tire["mass"], tire["lf"], tire["lr"],
-               Iz=yawf.get("Iz"), raw_transients=yawf.get("raw"))
+        if not os.path.exists(args.out):
+            raise SystemExit(f"{args.out} not found -- run without --report-only first")
+        with open(args.out) as f:
+            saved = json.load(f)
+        try:
+            print(f"Loaded {os.path.basename(args.out)}: Iz = {saved['Iz']:,.1f} kg*m^2 "
+                  f"({saved.get('units', ANGULAR_IMPULSE_UNITS)})")
+            print_yaw_impulse_table(saved["trials"])
+        except KeyError:
+            raise SystemExit(f"{args.out} is from an older version of this script (different "
+                              f"trial fields) -- rerun without --report-only to regenerate it")
+        iz_all = np.array([t["Iz"] for t in saved["trials"]])
+        spread = (iz_all.max() - iz_all.min()) / iz_all.mean()
+        print(f"\nlinearity across impulse magnitudes: spread {spread*100:.4f}% of mean")
         return
 
     world, original_settings = setup_world(args)
     results = None
     try:
-        results = method_step(world, args) if args.method == "step" else method_impulse(world, args)
+        results = method_impulse(world, args)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
@@ -735,116 +461,9 @@ def main():
     if results is None:
         return
 
-    plot_data = results.pop("_plot", None)
-    with open(out_path, "w") as f:
+    with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Saved: {out_path}")
-
-    if args.method == "step":
-        report(results["Cf"], results["Cr"], results["mass"], results["lf"], results["lr"],
-               Iz=results["Iz"], raw_transients=results["raw"])
-        impulse_path = os.path.join(HERE, "yaw_inertia_impulse.json")
-        if os.path.exists(impulse_path):
-            with open(impulse_path) as f:
-                truth = json.load(f).get("Iz")
-            if truth:
-                print(f"\n--- vs tire-free ground truth ---")
-                print(f"impulse method: {truth:,.0f} kg*m^2   step method: {results['Iz']:,.0f} "
-                      f"({results['Iz']/truth:.2f}x)")
-                if abs(results["Iz"] / truth - 1) > 0.2:
-                    print(f"  The step fit is off by {100*(results['Iz']/truth-1):+.0f}%. Since M's "
-                          f"scale is Cf/Cr's scale, that error most likely belongs to Cf/Cr.")
-
-    if args.save_plot:
-        save_plots(results, plot_data, args)
-
-
-def save_plots(results, plot_data, args):
-    from viz_utils import (COLOR_AXIS, COLOR_BLUE, COLOR_ORANGE, COLOR_INK, COLOR_MUTED,
-                           FONTSIZE_LABEL, FONTSIZE_TICK, LINEWIDTH, LINEWIDTH_THIN, MARKERSIZE,
-                           _legend, _save, _style_axes, _title, COLOR_BG)
-    import matplotlib.pyplot as plt
-
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-    fig.patch.set_facecolor(COLOR_BG)
-    _style_axes(ax_a); _style_axes(ax_b)
-    ax_a.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-    ax_a.axvline(0.0, color=COLOR_AXIS, linewidth=1)
-    ax_b.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-    ax_b.axvline(0.0, color=COLOR_AXIS, linewidth=1)
-
-    if results["method"] == "step":
-        for trial in results["raw"]:
-            ax_a.plot(trial["t"], np.degrees(trial["r"]), linewidth=1.2,
-                      label=f"{trial['target_speed']:.0f} m/s")
-            fs, fe = trial["fit_start"], trial["fit_end"]
-            ax_a.plot(trial["t"][fs:fe], np.degrees(trial["r"][fs:fe]), linewidth=3, alpha=0.25,
-                      color=COLOR_ORANGE)
-        ax_a.set_xlabel("time from step (s)"); ax_a.set_ylabel("yaw rate r (deg/s)")
-        _title(ax_a, "Step response (shaded = window used for the fit)")
-
-        S, R = plot_data["S"], plot_data["R"]
-        Iz, lo, hi = results["Iz"], results["Iz_forward"], results["Iz_reverse"]
-        ax_b.scatter(R, S, color=COLOR_BLUE, s=8, alpha=0.4, zorder=3, label="measured")
-        xs = np.linspace(min(R + [0]), max(R + [0]), 20)
-        ax_b.plot(xs, Iz * xs, color=COLOR_BLUE, linestyle="--", label=f"Iz={Iz:,.0f} kg*m^2")
-        ax_b.fill_between(xs, lo * xs, hi * xs, color=COLOR_BLUE, alpha=0.12,
-                          label=f"bracket [{lo:,.0f}, {hi:,.0f}]")
-        ax_b.set_xlabel("yaw rate, centred per trial (rad/s)")
-        ax_b.set_ylabel("delivered angular impulse, centred (N*m*s)")
-        _title(ax_b, "Yaw inertia fit: integral(M dt) = Iz * (r - r0)")
-        stem = "yaw_inertia_step"
-        _legend(ax_a); _legend(ax_b)
-    else:
-        trials = results["trials"]
-        rates = [abs(math.degrees(t["r0"])) for t in trials]
-        cmap = plt.get_cmap("plasma")
-        rate_norm = (plt.Normalize(min(rates), max(rates)) if len(set(rates)) > 1 else None)
-        rate_color = ({t["J"]: cmap(rate_norm(abs(math.degrees(t["r0"])))) for t in trials}
-                     if rate_norm else {trials[0]["J"]: cmap(0.5)})
-
-        for t in trials:
-            color = rate_color[t["J"]]
-            t_arr = np.asarray(t["t"], dtype=float)
-            ax_a.plot(t_arr, np.degrees(t["r_z"]), color=color, linewidth=LINEWIDTH, alpha=0.85,
-                     zorder=2)
-            # r(t) = r0*exp(-t/tau), the fit actually used, overlaid on its own raw trace so the
-            # fit is visually checkable rather than just trusting the r0 dot at t=0.
-            r_fit_deg = math.degrees(t["r0"]) * np.exp(-t_arr / t["tau"]) if math.isfinite(t["tau"]) else np.full_like(t_arr, math.degrees(t["r0"]))
-            ax_a.plot(t_arr, r_fit_deg, color=COLOR_INK, linewidth=LINEWIDTH_THIN,
-                     linestyle="--", zorder=3)
-            ax_a.scatter([0.0], [math.degrees(t["r0"])], s=MARKERSIZE, facecolor=color,
-                        edgecolor=COLOR_BG, linewidth=0.6, zorder=4)
-        ax_a.set_xlabel("time after impulse (s)"); ax_a.set_ylabel("yaw rate (deg/s)")
-        _title(ax_a, "Airborne spin-down (dashed = r0*exp(-t/tau) fit)")
-
-        r0s = [t["r0"] for t in trials]
-        js = [t["J"] for t in trials]
-        Iz_rad = results["Iz_raw_rad"]
-        for t in trials:
-            ax_b.scatter([t["r0"]], [t["J"]], s=MARKERSIZE, facecolor=rate_color[t["J"]],
-                        edgecolor=COLOR_BG, linewidth=0.6, zorder=3)
-        xs = np.linspace(0, max(r0s) * 1.05, 20)
-        ax_b.plot(xs, Iz_rad * xs, color=COLOR_INK, linewidth=LINEWIDTH * 1.2, linestyle="--",
-                 zorder=2, label=f"Iz={Iz_rad:,.0f} kg*m^2 [if rad]")
-        ax_b.set_xlabel("yaw rate step r0 (rad/s)"); ax_b.set_ylabel("applied angular impulse J")
-        _title(ax_b, "Linearity: J = Iz * r0")
-        stem = "yaw_inertia_impulse"
-        _legend(ax_b)   # ax_a's lines are unlabeled -- color already carries |r0| via the colorbar
-
-        if rate_norm is not None:
-            sm = plt.cm.ScalarMappable(norm=rate_norm, cmap=cmap)
-            sm.set_array([])
-            cbar = fig.colorbar(sm, ax=[ax_a, ax_b], pad=0.02, aspect=30)
-            cbar.set_label("|r0| (deg/s)", fontsize=FONTSIZE_LABEL, color=COLOR_MUTED)
-            cbar.ax.tick_params(colors=COLOR_MUTED, labelsize=FONTSIZE_TICK)
-            cbar.outline.set_visible(False)
-
-    os.makedirs(args.plot_dir, exist_ok=True)
-    print(f"Figure saved: {_save(fig, args.plot_dir, stem)}")
-    if not args.no_show:
-        plt.show()
-    plt.close(fig)
+    print(f"Saved: {args.out}")
 
 
 if __name__ == "__main__":
