@@ -330,9 +330,9 @@ def main():
                              "which gets noisy fast; this narrows it down.")
 
     noise = parser.add_argument_group("synthetic measurement noise")
-    noise.add_argument("--gyro-std", type=float, default=10,
+    noise.add_argument("--gyro-std", type=float, default=0,
                        help="synthetic gyro (dpsi) noise stddev, deg/s")
-    noise.add_argument("--accel-std", type=float, default=1,
+    noise.add_argument("--accel-std", type=float, default=0,
                        help="synthetic accelerometer (a_y) noise stddev, m/s^2")
     noise.add_argument("--seed", type=int, default=0, help="noise seed used for the reported/plotted replay")
     noise.add_argument("--n-seeds", type=int, default=3,

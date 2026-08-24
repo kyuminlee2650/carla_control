@@ -38,8 +38,8 @@ Pipeline, run end to end by main() on every invocation:
 
 Usage (Ubuntu):
     cd ~/carla_control
-    python3 lateral_parameter/collect_cornering_data.py                        # drive + log (once)
-    python3 lateral_parameter/estimate_cornering_stiffness.py --save-plot      # fit (many times)
+    .venv/bin/python lateral_parameter/collect_cornering_data.py                        # drive + log (once)
+    .venv/bin/python lateral_parameter/estimate_cornering_stiffness.py --save-plot      # fit (many times)
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control

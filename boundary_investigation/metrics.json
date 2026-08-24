@@ -1,0 +1,122 @@
+[
+ {
+  "route": "24367",
+  "town": "Town06",
+  "scenario": "ConstructionObstacle",
+  "frames": 68,
+  "ss_pct": 0.0,
+  "ss_mean": 0.0,
+  "bd_pct": 100.0,
+  "bd_mean": 1.0,
+  "bd_dist": 1.7500001118252284,
+  "ss_dist": NaN
+ },
+ {
+  "route": "27582",
+  "town": "Town11",
+  "scenario": "PedestrianCrossing",
+  "frames": 29,
+  "ss_pct": 89.65517241379311,
+  "ss_mean": 9.448275862068966,
+  "bd_pct": 100.0,
+  "bd_mean": 6.379310344827586,
+  "bd_dist": 1.752642152628725,
+  "ss_dist": 1.7512486507593965
+ },
+ {
+  "route": "3144",
+  "town": "Town12",
+  "scenario": "VanillaSignalizedTurnEncounterRedLight",
+  "frames": 21,
+  "ss_pct": 100.0,
+  "ss_mean": 2.761904761904762,
+  "bd_pct": 100.0,
+  "bd_mean": 4.190476190476191,
+  "bd_dist": 1.6251682964619707,
+  "ss_dist": 4.875557873668084
+ },
+ {
+  "route": "2416",
+  "town": "Town12",
+  "scenario": "VanillaNonSignalizedTurnEncounterStopsign",
+  "frames": 21,
+  "ss_pct": 0.0,
+  "ss_mean": 0.0,
+  "bd_pct": 100.0,
+  "bd_mean": 5.904761904761905,
+  "bd_dist": 1.3750632011453747,
+  "ss_dist": NaN
+ },
+ {
+  "route": "2715",
+  "town": "Town12",
+  "scenario": "StaticCutIn",
+  "frames": 68,
+  "ss_pct": 100.0,
+  "ss_mean": 2.0,
+  "bd_pct": 100.0,
+  "bd_mean": 2.0,
+  "bd_dist": 4.875007922826344,
+  "ss_dist": 1.6250026409421148
+ },
+ {
+  "route": "2286",
+  "town": "Town12",
+  "scenario": "HighwayCutIn",
+  "frames": 40,
+  "ss_pct": 0.0,
+  "ss_mean": 0.0,
+  "bd_pct": 100.0,
+  "bd_mean": 3.25,
+  "bd_dist": 5.249988323151809,
+  "ss_dist": NaN
+ },
+ {
+  "route": "17569",
+  "town": "Town12",
+  "scenario": "SequentialLaneChange",
+  "frames": 24,
+  "ss_pct": 0.0,
+  "ss_mean": 0.0,
+  "bd_pct": 100.0,
+  "bd_mean": 2.0,
+  "bd_dist": 1.7503976307638882,
+  "ss_dist": NaN
+ },
+ {
+  "route": "2790",
+  "town": "Town12",
+  "scenario": "InvadingTurn",
+  "frames": 52,
+  "ss_pct": 100.0,
+  "ss_mean": 2.730769230769231,
+  "bd_pct": 100.0,
+  "bd_mean": 3.269230769230769,
+  "bd_dist": 4.880450859869963,
+  "ss_dist": 1.6431625179375082
+ },
+ {
+  "route": "3373",
+  "town": "Town13",
+  "scenario": "YieldToEmergencyVehicle",
+  "frames": 53,
+  "ss_pct": 0.0,
+  "ss_mean": 0.0,
+  "bd_pct": 100.0,
+  "bd_mean": 2.0,
+  "bd_dist": 5.2496720393241745,
+  "ss_dist": NaN
+ },
+ {
+  "route": "1792",
+  "town": "Town12",
+  "scenario": "HazardAtSideLane",
+  "frames": 68,
+  "ss_pct": 0.0,
+  "ss_mean": 0.0,
+  "bd_pct": 100.0,
+  "bd_mean": 2.0,
+  "bd_dist": 1.7499919022628183,
+  "ss_dist": NaN
+ }
+]

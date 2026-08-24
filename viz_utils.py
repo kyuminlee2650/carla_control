@@ -113,11 +113,11 @@ COMPARE_LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
 LINEWIDTH = 1.5          # primary data series
 LINEWIDTH_THIN = 1.0     # reference lines: axhline/axvline, zero lines, gridlines
 MARKERSIZE = 28          # scatter marker area (matplotlib's `s=`)
-FONTSIZE_TITLE = 22      # figure suptitle
-FONTSIZE_SUBTITLE = 18   # per-axes title
-FONTSIZE_LABEL = 16      # axis labels
-FONTSIZE_TICK = 14        # tick labels
-FONTSIZE_LEGEND = 16      # legend text
+FONTSIZE_TITLE = 24      # figure suptitle
+FONTSIZE_SUBTITLE = 20   # per-axes title
+FONTSIZE_LABEL = 18      # axis labels
+FONTSIZE_TICK = 16        # tick labels
+FONTSIZE_LEGEND = 18      # legend text
 
 
 def _style_axes(ax):
@@ -149,6 +149,25 @@ def _title(ax, text, fontsize=FONTSIZE_SUBTITLE):
 
 def _legend(ax, **kwargs):
     ax.legend(frameon=False, labelcolor=COLOR_INK, fontsize=FONTSIZE_LEGEND, **kwargs)
+
+
+def _panel_handles(axes):
+    """Every labeled artist across `axes`, first-come order, deduped by label -- the handle list a
+    shared figure legend needs when the panels themselves already label their series (a per-panel
+    legend would have read the same artists). matplotlib's own "_"-prefixed labels are skipped, as
+    ax.legend() skips them.
+
+    Panels that draw the same signal in the same role (several runs' "desired vel") collapse to one
+    entry; that's the point of the dedup, and why order comes from the axes rather than a set.
+    """
+    handles, seen = [], set()
+    for ax in axes:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            if label in seen or label.startswith("_"):
+                continue
+            seen.add(label)
+            handles.append(handle)
+    return handles
 
 
 def _bottom_legend(fig, handles, title=None, max_ncol=6):
@@ -739,14 +758,13 @@ def b2d_comfort_penalty(hist):
 # Bench2Drive 의 채점 모듈이 있는 디렉터리. b2d_controller/b2d_metrics.py 가 --tools-dir 기본값으로
 # 쓰는 바로 그 경로이며, 두 곳이 같은 파일을 가리키도록 일부러 하드코딩 대신 여기 한 곳에 모아둔다.
 #
-# 기본값은 이 저장소에 함께 들어있는 로컬 사본(b2d_controller/comfort_metric/) -- 우분투 랩 머신의
+# 기본값은 이 저장소에 함께 들어있는 사본(b2d_controller/comfort_metric/) -- 우분투 랩 머신의
 # 절대경로였던 예전 기본값은 이 Windows 체크아웃에서는 애초에 존재하지 않는 경로라 항상 실패했다.
-# os.path.join 이라 OS 에 무관하게 동작하므로 우분투에서도 그대로 쓸 수 있다. 다만 이 로컬 사본은
-# 검증된 랩 머신 원본(md5 0c650615...)이 아니라 이 프로젝트가 문서화한 버그 3개를 공개판(tag 0.0.4,
-# md5 93c9b4b0...)에 직접 재구현한 것 -- 정확히 같은 파일인지 미확인 상태다. 랩 머신에서 실제
-# 검증된 파일(/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools)에 접근 가능하면
-# $B2D_TOOLS_DIR 로 그 경로를 넘겨 이 로컬 사본을 덮어쓸 것 -- efficiency_smoothness_benchmark.py
-# 자체 docstring 에 전체 경위가 적혀 있다.
+# os.path.join 이라 OS 에 무관하게 동작하므로 우분투에서도 그대로 쓸 수 있다. 이 사본은
+# 2026-08-24 부터 랩 머신 원본(/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools,
+# md5 0c65061599ff0f162777fca15ecf6dad)을 바이트 그대로 복사한 것이라 대시보드가 실제로 쓰는
+# 파일과 동일하다 -- 경위와 검증 방법은 b2d_controller/comfort_metric/PROVENANCE.md 참고.
+# 랩 머신 원본에서 직접 읽고 싶으면 $B2D_TOOLS_DIR 로 그 경로를 넘기면 된다 (같은 내용이 로드된다).
 B2D_TOOLS_DIR = os.environ.get(
     "B2D_TOOLS_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "b2d_controller", "comfort_metric"))
@@ -775,21 +793,38 @@ def b2d_comfortness(hist, tools_dir=None):
     를 직접 걸기 때문에, 이미 저역통과된 hist["a_x"]/["a_y"] 를 넣으면 이중 평활이 되어 점수가
     실제보다 후하게 나온다. 원시 채널이 없는 예전 hist 는 필터본으로 폴백하되 그 사실을 알린다.
     """
+    scorer, kwargs = _b2d_comfort_inputs(hist, tools_dir)
+    if kwargs is None:
+        return None
+    try:
+        return float(scorer.seg_compute_comfort_metric(**kwargs))
+    except Exception as exc:
+        print(f"  ! comfortness 계산 실패 ({exc})")
+        return None
+
+
+def _b2d_comfort_inputs(hist, tools_dir=None):
+    """(채점 모듈, seg_compute_comfort_metric 에 넘길 kwargs) 또는 (모듈, None).
+
+    b2d_comfortness() 와 b2d_comfort_report() 가 반드시 같은 입력을 보게 하려고 따로 뺐다 --
+    두 곳이 각자 hist 를 풀면 한쪽만 고쳐졌을 때 "점수"와 "그 점수의 내역"이 조용히 어긋난다.
+    입력 구성의 근거는 b2d_comfortness() docstring 참고.
+    """
     tools_dir = tools_dir or B2D_TOOLS_DIR
     if tools_dir not in sys.path:
         sys.path.insert(0, tools_dir)
     try:
-        from efficiency_smoothness_benchmark import seg_compute_comfort_metric
+        import efficiency_smoothness_benchmark as scorer
     except Exception as exc:
         print(f"  ! comfortness 계산 불가 -- {tools_dir} 에서 채점 모듈을 import 하지 못했습니다 ({exc})")
-        return None
+        return None, None
 
     yaw_deg = hist.get("yaw", [])
     a_x = hist.get("a_x_raw") or hist.get("a_x", [])
     a_y = hist.get("a_y_raw") or hist.get("a_y", [])
     n = min(len(yaw_deg), len(a_x), len(a_y), len(hist.get("yaw_rate", [])))
     if n < 2:
-        return None
+        return scorer, None
 
     yaw = np.radians(np.asarray(yaw_deg[:n], dtype=float))
     fwd = np.stack([np.cos(yaw), np.sin(yaw), np.zeros(n)], axis=1)
@@ -799,13 +834,165 @@ def b2d_comfortness(hist, tools_dir=None):
     ang_vel = np.zeros((n, 3))
     ang_vel[:, 2] = np.asarray(hist["yaw_rate"][:n], dtype=float)   # deg/s, 채점 함수가 직접 변환
 
+    return scorer, dict(acceleration=accel, angular_velocity=ang_vel, forward_vector=fwd,
+                        right_vector=right, location=np.zeros((n, 3)), rotation=np.zeros((n, 3)))
+
+
+# (표시 이름, 상수 이름, 부호) -- compute_comfort_metric() 이 검사하는 여섯 채널의 한계를 채점
+# 모듈에서 그대로 읽어오기 위한 표. 값을 여기 옮겨적지 않는 이유는 b2d_metrics 의 b2d_limits() 와
+# 같다: 옮겨적는 순간 채점 모듈이 바뀌어도 이쪽은 모른 채로 남는다.
+_COMFORT_CHANNELS = (
+    ("lon_acc",  ("MIN_LON_ACCEL", "min_lon_accel"), ("MAX_LON_ACCEL", "max_lon_accel")),
+    ("lat_acc",  ("MAX_ABS_LAT_ACCEL", "max_abs_lat_accel"), None),
+    ("|jerk|",   ("MAX_ABS_MAG_JERK", "max_abs_mag_jerk"), None),
+    ("lon_jerk", ("MAX_ABS_LON_JERK", "max_abs_lon_jerk"), None),
+    ("yaw_acc",  ("MAX_ABS_YAW_ACCEL", "max_abs_yaw_accel"), None),
+    ("yaw_rate", ("MAX_ABS_YAW_RATE", "max_abs_yaw_rate"), None),
+)
+
+
+def _comfort_channel_series(scorer, kw, start, stop, window_size=7, poly_order=2):
+    """The six channels compute_comfort_metric() actually bound-checks, for one segment.
+
+    Rebuilt from the scoring module's OWN _smooth()/constants rather than recomputed here, so this
+    breakdown follows the module if it changes. It is still a second implementation of that
+    function's body, which is exactly why b2d_comfort_report() cross-checks its own pass/fail count
+    against the module's seg_compute_comfort_metric() and refuses to report a breakdown that
+    disagrees -- a silent drift here would be worse than no breakdown at all.
+
+    Returns {name: (values, lo, hi)} or None if the module doesn't expose what this needs.
+    """
     try:
-        return float(seg_compute_comfort_metric(
-            acceleration=accel, angular_velocity=ang_vel, forward_vector=fwd,
-            right_vector=right, location=np.zeros((n, 3)), rotation=np.zeros((n, 3))))
-    except Exception as exc:
-        print(f"  ! comfortness 계산 실패 ({exc})")
+        smooth, dt = scorer._smooth, scorer.CARLA_TICK_SECONDS
+    except AttributeError:
         return None
+
+    accel = kw["acceleration"][start:stop]
+    fwd, right = kw["forward_vector"][start:stop], kw["right_vector"][start:stop]
+    window_size = min(window_size, len(accel))
+    if poly_order >= window_size:
+        return None
+
+    lon = np.einsum("ij,ij->i", accel[:, :2], fwd[:, :2])
+    lat = np.einsum("ij,ij->i", accel[:, :2], right[:, :2])
+    mag = np.hypot(accel[:, 0], accel[:, 1])
+    yaw_rate = np.deg2rad(kw["angular_velocity"][start:stop, 2])
+
+    yaw_acc = smooth(yaw_rate, window_size, poly_order, deriv=1, delta=dt)
+    yaw_rate = smooth(yaw_rate, window_size, poly_order)
+    lon = smooth(lon, window_size, poly_order)
+    lat = smooth(lat, window_size, poly_order)
+    mag = smooth(mag, window_size, poly_order)
+    mag_jerk = smooth(mag, window_size, poly_order, deriv=1, delta=dt)
+    lon_jerk = smooth(lon, window_size, poly_order, deriv=1, delta=dt)
+
+    series = dict(lon_acc=lon, lat_acc=lat, jerk=mag_jerk, lon_jerk=lon_jerk,
+                  yaw_acc=yaw_acc, yaw_rate=yaw_rate)
+    out = {}
+    for (name, lo_names, hi_names), key in zip(_COMFORT_CHANNELS,
+                                               ("lon_acc", "lat_acc", "jerk", "lon_jerk",
+                                                "yaw_acc", "yaw_rate")):
+        try:
+            lo_v = next(getattr(scorer, n) for n in lo_names if hasattr(scorer, n))
+        except StopIteration:
+            return None
+        if hi_names is None:                       # symmetric +/- bound from one constant
+            lo, hi = -lo_v, lo_v
+        else:
+            hi = next(getattr(scorer, n) for n in hi_names if hasattr(scorer, n))
+            lo = lo_v
+        out[name] = (series[key], lo, hi)
+    return out
+
+
+def b2d_comfort_report(hist, tools_dir=None, per_step=20, tick_s=0.05):
+    """Why b2d_comfortness() came out the way it did: one row per scored 1-second segment.
+
+    The score is a pass/fail ratio over fixed 20-tick segments and a segment fails the moment ONE
+    sample on ONE of six channels leaves its band, so the single number can't say whether a run
+    was mildly bad everywhere or catastrophically bad in one spot -- and it reads the RAW
+    acceleration channels, not the low-passed ones the figures plot, so "the graph looks clean" and
+    "the segment failed" are not in contradiction. This prints what actually happened.
+
+    Returns {"score", "segments", "n_pass", "n_fail", "dropped_ticks"} or None. segments is a list
+    of {"index", "t0", "t1", "passed", "channels": {name: {"min","max","lo","hi","ok"}}}.
+    "channels" is {} when the scoring module doesn't expose the internals the breakdown needs.
+    """
+    scorer, kw = _b2d_comfort_inputs(hist, tools_dir)
+    if kw is None:
+        return None
+    n = len(kw["angular_velocity"])
+    if n <= per_step:
+        return None
+
+    segments, n_pass = [], 0
+    for index, start in enumerate(range(0, n, per_step)):
+        stop = start + per_step
+        if stop > n:
+            break                                   # the scorer drops a short tail; so do we
+        passed = bool(scorer.compute_comfort_metric(
+            kw["acceleration"][start:stop], kw["angular_velocity"][start:stop],
+            kw["forward_vector"][start:stop], kw["right_vector"][start:stop],
+            kw["location"][start:stop], kw["rotation"][start:stop]))
+        n_pass += passed
+        channels = {}
+        detail = _comfort_channel_series(scorer, kw, start, stop)
+        if detail:
+            for name, (values, lo, hi) in detail.items():
+                channels[name] = dict(min=float(values.min()), max=float(values.max()),
+                                      lo=lo, hi=hi,
+                                      ok=bool(values.min() > lo and values.max() < hi))
+        segments.append(dict(index=index, t0=start * tick_s, t1=stop * tick_s,
+                             passed=passed, channels=channels))
+
+    # The breakdown is a second implementation of the module's own channel math; if it disagrees
+    # with the module about even one segment, drop the per-channel detail rather than print
+    # numbers that don't explain the score they claim to explain.
+    official = b2d_comfortness(hist, tools_dir)
+    if official is not None and segments and abs(n_pass / len(segments) - official) > 1e-9:
+        print("  ! comfort report: 구간 판정이 채점 모듈과 불일치 -- 채널 내역을 생략합니다")
+        for seg in segments:
+            seg["channels"] = {}
+    return dict(score=official, segments=segments, n_pass=n_pass,
+                n_fail=len(segments) - n_pass, dropped_ticks=n - len(segments) * per_step)
+
+
+def print_comfort_report(hist, target_speed_ms=None, tools_dir=None, failures_only=False):
+    """b2d_comfort_report() as a table. Marks the offending channel(s) on every failed segment.
+
+    failures_only=True prints just the failed segments -- for a long run where most pass.
+    """
+    report = b2d_comfort_report(hist, tools_dir)
+    if report is None:
+        print("  ! comfort report: 구간을 만들 만큼의 데이터가 없습니다")
+        return None
+
+    print(f"\n=== B2D Comfortness 구간 내역: {report['n_pass']}/{len(report['segments'])} 통과 "
+          f"= {report['score']:.4f} ===")
+    if report["dropped_ticks"]:
+        print(f"  (뒤 {report['dropped_ticks']}틱은 20틱을 못 채워 채점에서 제외됨)")
+    names = [name for name, _, _ in _COMFORT_CHANNELS]
+    print("  seg  t (s)        " + "  ".join(f"{n:>9}" for n in names))
+    for seg in report["segments"]:
+        if failures_only and seg["passed"]:
+            continue
+        cells = []
+        for name in names:
+            ch = seg["channels"].get(name)
+            if ch is None:
+                cells.append(f"{'?':>9}")
+                continue
+            worst = ch["max"] if abs(ch["max"]) >= abs(ch["min"]) else ch["min"]
+            cells.append(f"{worst:>8.2f}{'' if ch['ok'] else '*'}")
+        mark = "PASS" if seg["passed"] else "FAIL"
+        print(f"  {seg['index']:>3}  {seg['t0']:>5.1f}-{seg['t1']:<5.1f} {mark}  " + "  ".join(cells))
+    # a "*" marks the channel whose own band this segment left -- the reason it failed
+    print("  * = 이 채널이 한계를 벗어남 (값은 구간 내 절대값 최대 샘플)")
+    print("  한계: " + ",  ".join(
+        f"{name} [{seg['channels'][name]['lo']:.2f}, {seg['channels'][name]['hi']:.2f}]"
+        for name in names
+        for seg in report["segments"][:1] if name in seg["channels"]))
+    return report
 
 
 def print_error_summary(hist, target_speed_ms):
@@ -867,10 +1054,22 @@ def print_error_summary(hist, target_speed_ms):
 # 7. plotting internals
 # ---------------------------------------------------------------------------
 
-def _panels(title, n_rows=3, n_cols=2, figsize=(15, 10)):
+def _panels(title, n_rows=3, n_cols=2, figsize=(15, 10), xlabel="$t$ (s)"):
     """A styled grid sharing the time axis, flattened in row-major order. title="" (or None) skips
     the suptitle entirely -- for figures (like plot_comparison()'s) where each panel's own title
-    already carries the identifying info and a figure-level title would just be redundant."""
+    already carries the identifying info and a figure-level title would just be redundant.
+
+    EVERY panel gets its own x tick labels and its own xlabel, not just the bottom row. sharex=True
+    is kept -- it is what keeps the panels on one common x range, and what makes an interactive
+    zoom/pan move all of them together -- but its side effect of blanking the tick labels on every
+    row except the last is undone here. The reason is how these figures are actually read: a panel
+    gets cropped into a slide or pointed at on its own, and one with a bare x axis is then
+    unreadable, while counting rows up to the bottom of a 4-row grid to find the time axis is
+    something a reader should not have to do. The cost is repeated identical tick rows, which is
+    cheap next to that.
+
+    xlabel: the shared x-axis label put on every panel. Defaults to time since every current caller
+    is a time series; pass something else for a grid parameterized differently."""
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True, constrained_layout=True)
     fig.patch.set_facecolor(COLOR_BG)
     if title:
@@ -878,6 +1077,9 @@ def _panels(title, n_rows=3, n_cols=2, figsize=(15, 10)):
     axes = np.atleast_1d(axes).ravel()
     for ax in axes:
         _style_axes(ax)
+        ax.tick_params(labelbottom=True)     # undo sharex's hiding, see docstring
+        if xlabel:
+            ax.set_xlabel(xlabel)
     return fig, axes
 
 
@@ -914,27 +1116,19 @@ def _rmse_badge(ax, e, unit):
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor=COLOR_AXIS, alpha=0.85))
 
 
-def _rmse_box_multi(ax, results, colors, key, unit):
-    """Bottom-left box, one line per controller: 'Label: 0.123 unit' in that controller's own
-    color -- the multi-run analogue of _rmse_badge(), used by plot_comparison()'s error panels
-    instead of folding the numbers into the panel title (which is what _rmse_suffix() used to do
-    there; with 3+ controllers the title wrapped onto its neighbor's row). Each line's own color
-    doubles as a legend, since the line's color already IDs the controller everywhere else in the
-    figure -- no swatch/marker needed in the box itself, just colored text.
+def _rmse_box(ax, entries):
+    """Bottom-left box holding one line of colored text per entry -- entries is [(text, color)].
 
     Built from matplotlib.offsetbox (TextArea/VPacker/AnnotationBbox) rather than stacked ax.text()
     calls: a single ax.text() can't mix colors within its string, and separately-bboxed lines don't
     read as one box -- VPacker stacks per-line TextAreas (each free to have its own color) inside
     one shared frame, which is what this needs.
+
+    Corner and frame match _rmse_badge()'s, so a single-run box and a multi-run box are the same
+    object in two sizes rather than two different-looking annotations.
     """
-    children = []
-    for run_label, hist in results.items():
-        e = _get(hist, key)
-        stats = error_stats(e) if e is not None else None
-        if stats is not None:
-            children.append(TextArea(f"{run_label}: {stats[0]:.3f} {unit}",
-                                     textprops=dict(color=colors[run_label], fontsize=9,
-                                                    fontweight="bold")))
+    children = [TextArea(text, textprops=dict(color=color, fontsize=9, fontweight="bold"))
+                for text, color in entries]
     if not children:
         return
     packed = VPacker(children=children, pad=4, sep=3, align="left")
@@ -945,22 +1139,50 @@ def _rmse_box_multi(ax, results, colors, key, unit):
     ax.add_artist(box)
 
 
+def _rmse_box_multi(ax, results, colors, key, unit):
+    """Bottom-left box, one line per controller: 'Label: 0.123 unit' in that controller's own
+    color -- the multi-run analogue of _rmse_badge(), used by plot_comparison()'s error panels
+    instead of folding the numbers into the panel title (which is what _rmse_suffix() used to do
+    there; with 3+ controllers the title wrapped onto its neighbor's row). Each line's own color
+    doubles as a legend, since the line's color already IDs the controller everywhere else in the
+    figure -- no swatch/marker needed in the box itself, just colored text.
+
+    Reads a stored hist key. _error_multi(rmse_box=True) builds the same box for panels whose error
+    series is computed rather than stored (speed error, which is v_des - v_x).
+    """
+    entries = []
+    for run_label, hist in results.items():
+        e = _get(hist, key)
+        stats = error_stats(e) if e is not None else None
+        if stats is not None:
+            entries.append((f"{run_label}: {stats[0]:.3f} {unit}", colors[run_label]))
+    _rmse_box(ax, entries)
+
+
 def _error_multi(ax, runs, colors, multi, ylabel, panel_title, unit, series_fn, legend=True,
-                 linestyles=None):
+                 linestyles=None, rmse_box=False):
     """One error-vs-time panel, for a single run or several overlaid.
 
     series_fn(hist) -> the error array for that run (or None if this stack never recorded it).
-    Single run keeps the filled-band/corner-badge look; multiple runs switch to plain colored
-    lines with each RMSE folded into the legend, since stacked badges stop being readable.
+    Single run keeps the filled-band look; multiple runs switch to plain colored lines.
 
-    legend=False skips this panel's own legend -- for callers (plot_comparison()) that build one
-    shared legend for the whole figure instead of repeating it on every panel.
+    legend=False skips this panel's own legend -- for callers (plot_comparison(),
+    plot_longitudinal()) that build one shared legend for the whole figure instead of repeating it
+    on every panel.
+
+    rmse_box=True puts the RMSE in a bottom-left _rmse_box() instead of the two places it lives by
+    default (bottom-right _rmse_badge() for a single run, a "(RMSE=...)" suffix on the legend label
+    for several). Both defaults assume this panel has a legend of its own to carry the run names;
+    once the legend moves to the figure bottom the suffix goes with it, too far from the panel to
+    read as that panel's number -- so a figure with a shared bottom legend wants this on. Same
+    corner and frame as _rmse_box_multi(), which does the same job for a stored hist key.
 
     linestyles: optional {label: linestyle}, consulted only when multi=True (see COMPARE_LINESTYLES)
     -- a run without an entry falls back to solid, same as before this parameter existed.
     """
     ax.axhline(0.0, color=COLOR_AXIS, linewidth=1, linestyle="--")
     found = False
+    box_entries = []
     for label, hist in runs.items():
         e = series_fn(hist)
         if e is None:
@@ -968,15 +1190,23 @@ def _error_multi(ax, runs, colors, multi, ylabel, panel_title, unit, series_fn, 
         found = True
         t = np.asarray(hist["t"], dtype=float)
         color = colors[label]
+        stats = error_stats(e)
         if not multi:
             ax.plot(t, e, color=color, linewidth=1.6, solid_capstyle="round")
             ax.fill_between(t, e, 0, color=color, alpha=0.15)
-            _rmse_badge(ax, e, unit)
+            if not rmse_box:
+                _rmse_badge(ax, e, unit)
+            elif stats:
+                # single run: no run name to prefix, and COLOR_INK rather than the series color,
+                # so it reads the same as the _rmse_badge() it replaces
+                box_entries.append((f"RMSE = {stats[0]:.3f} {unit}", COLOR_INK))
         else:
-            stats = error_stats(e)
-            tag = f"{label} (RMSE={stats[0]:.2f})" if stats else label
+            tag = label if rmse_box else (f"{label} (RMSE={stats[0]:.2f})" if stats else label)
             style = linestyles[label] if linestyles else "-"
             ax.plot(t, e, color=color, linewidth=1.4, linestyle=style, label=tag)
+            if rmse_box and stats:
+                box_entries.append((f"{label}: {stats[0]:.3f} {unit}", color))
+    _rmse_box(ax, box_entries)
     if not found:
         _not_recorded(ax, "e")
     elif multi and legend:
@@ -1054,15 +1284,30 @@ def _dynamics_panel(ax, runs, colors, multi, key, ylabel, panel_title, fill_colo
     _title(ax, panel_title)
 
 
+# One place for the B2D limit line's stroke, so _b2d_limit_lines() and the legend swatch a shared
+# figure legend needs for it (_b2d_limit_handle()) cannot drift apart. Its (5, 3) dash is longer
+# and its stroke thicker than _dynamics_panel()'s "--" reference line, which is also COLOR_RED --
+# that contrast is the only thing separating the two in a panel that draws both.
+_B2D_LIMIT_STYLE = dict(color=COLOR_RED, linewidth=1.8, linestyle=(0, (5, 3)), alpha=0.95)
+
+
 def _b2d_limit_lines(ax, lo, hi):
     """Red dashed line(s) marking a B2D_COMFORT_LIMITS band on a dynamics panel -- both bounds for
     a two-sided range, just the top one when lo==0 (a magnitude/norm signal like |jerk|, which
     never goes negative, so a line at 0 would just sit on the axis). Drawn at zorder=2.5, above the
     data lines (zorder~2 by default) and the axhline(0) reference (zorder~1), so the limit itself
     always reads clearly instead of blending into whatever data line happens to sit on top of it."""
-    ax.axhline(hi, color=COLOR_RED, linewidth=1.8, linestyle=(0, (5, 3)), alpha=0.95, zorder=2.5)
+    ax.axhline(hi, zorder=2.5, **_B2D_LIMIT_STYLE)
     if lo != 0:
-        ax.axhline(lo, color=COLOR_RED, linewidth=1.8, linestyle=(0, (5, 3)), alpha=0.95, zorder=2.5)
+        ax.axhline(lo, zorder=2.5, **_B2D_LIMIT_STYLE)
+
+
+def _b2d_limit_handle(label="B2D comfort limit"):
+    """Legend swatch for the _b2d_limit_lines() stroke. Only a figure with a shared bottom legend
+    needs one: a per-panel legend is built from that panel's own labeled artists, and the limit
+    lines are deliberately unlabeled axhlines (labeling them would repeat the same entry on every
+    dynamics panel). A single figure-level legend is the one place the marking can be named once."""
+    return plt.Line2D([0], [0], label=label, **_B2D_LIMIT_STYLE)
 
 
 def _save(fig, out_dir, stem):
@@ -1116,10 +1361,8 @@ def plot_lateral(hist, title="Lateral tracking performance"):
                     ref_key="v_y_hat", ref_name="estimated")
     _dynamics_panel(ax_ay, runs, colors, False, "a_y", "$a_y$ (m/s$^2$)", "Lateral acceleration (body frame)")
     _b2d_limit_lines(ax_ay, *B2D_COMFORT_LIMITS["a_y"])
-    ax_ay.set_xlabel("$t$ (s)")
 
     _dynamics_panel(ax_steer, runs, colors, False, "steer_deg", r"$\delta$ (deg)", "Steering angle (front wheel)")
-    ax_steer.set_xlabel("$t$ (s)")
 
     return fig
 
@@ -1173,6 +1416,8 @@ def plot_kf_run(hist, title=""):
         fig.suptitle(title, fontsize=FONTSIZE_TITLE, color=COLOR_INK, fontweight="bold")
     for ax in (ax_vy, ax_dpsi, ax_ay):
         _style_axes(ax)
+        ax.tick_params(labelbottom=True)     # same as _panels(): sharex must not blank these
+        ax.set_xlabel("$t$ (s)")
 
     _dynamics_panel(ax_vy, runs, colors, False, "v_y", "$v_y$ (m/s)",
                     "$v_y$ estimate vs. ground truth", ref_key="v_y_hat", ref_name="estimated")
@@ -1185,7 +1430,6 @@ def plot_kf_run(hist, title=""):
     _dynamics_panel(ax_ay, runs, colors, False, "a_y", "$a_y$ (m/s$^2$)",
                     "$a_y$: clean vs. noisy sensor", ref_key="ay_noisy",
                     series_name="clean", ref_name="noisy")
-    ax_ay.set_xlabel("$t$ (s)")
     return fig
 
 
@@ -1291,7 +1535,8 @@ def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking perfor
     fig, (ax_ev, ax_v, ax_a, ax_j, ax_jtot, ax_cmd) = _panels(title)
 
     _error_multi(ax_ev, runs, colors, False, "$e_v$ (m/s)", "Speed error (reference - measured)",
-                "m/s", lambda h: np.asarray(speed_error_series(h, target_speed_ms), dtype=float))
+                "m/s", lambda h: np.asarray(speed_error_series(h, target_speed_ms), dtype=float),
+                legend=False, rmse_box=True)
 
     v_des = _get(hist, "v_des")
     if v_des is None:
@@ -1302,17 +1547,20 @@ def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking perfor
               label="ego vel")
     ax_v.set_ylabel("$v_x$ (m/s)")
     _title(ax_v, "Speed")
-    _legend(ax_v)
 
+    # series_name/ref_name spelled out rather than left at "actual"/"reference": those read fine in
+    # a legend sitting on this panel, but the shared legend below the figure has no panel context
+    # to borrow, so the entry has to name its own signal.
     _dynamics_panel(ax_a, runs, colors, False, "a_x", "$a_x$ (m/s$^2$)", "Longitudinal acceleration",
-                    ref_key="a_cmd")
+                    ref_key="a_cmd", legend=False,
+                    series_name="measured $a_x$", ref_name="commanded $a_x$")
     _b2d_limit_lines(ax_a, *B2D_COMFORT_LIMITS["a_x"])
-    _dynamics_panel(ax_j, runs, colors, False, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk (ride comfort)")
+    _dynamics_panel(ax_j, runs, colors, False, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk (ride comfort)",
+                    legend=False)
     _b2d_limit_lines(ax_j, *B2D_COMFORT_LIMITS["jerk"])
     _dynamics_panel(ax_jtot, runs, colors, False, "jerk_total", "|jerk| (m/s$^3$)",
-                    "Total jerk magnitude (long. + lat.)", fill_color=COLOR_PURPLE)
+                    "Total jerk magnitude (long. + lat.)", fill_color=COLOR_PURPLE, legend=False)
     _b2d_limit_lines(ax_jtot, *B2D_COMFORT_LIMITS["jerk_total"])
-    ax_jtot.set_xlabel("$t$ (s)")
 
     ax_cmd.axhline(0.0, color=COLOR_AXIS, linewidth=1)
     t = np.asarray(hist["t"], dtype=float)
@@ -1323,8 +1571,8 @@ def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking perfor
     ax_cmd.set_ylim(-1.05, 1.05)
     ax_cmd.set_ylabel("$u$")
     _title(ax_cmd, "Longitudinal control input $u$  (u > 0: throttle, u < 0: brake)")
-    ax_cmd.set_xlabel("$t$ (s)")
 
+    _bottom_legend(fig, _panel_handles([ax_v, ax_a]) + [_b2d_limit_handle()])
     return fig
 
 
@@ -1464,8 +1712,6 @@ def plot_comparison(results, path_x, path_y, out_dir, target_speed_ms, show=True
     _dynamics_panel(ax_jtot, results, colors, True, "jerk_total", "|jerk| (m/s$^3$)",
                     "Total jerk magnitude", legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_jtot, *B2D_COMFORT_LIMITS["jerk_total"])
-    ax_j.set_xlabel("$t$ (s)")
-    ax_jtot.set_xlabel("$t$ (s)")
 
     # one shared legend for the whole figure, bottom center -- controller-name -> color + dash
     # pattern (the RMSE numbers now live in each error panel's own bottom-left box instead)
@@ -1508,7 +1754,7 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
 
     _error_multi(ax_ev, runs, colors, True, "$e_v$ (m/s)", "Speed error (reference - measured)",
                 "m/s", lambda h: np.asarray(speed_error_series(h, target_speed_ms), dtype=float),
-                linestyles=linestyles)
+                legend=False, rmse_box=True, linestyles=linestyles)
 
     first_hist = next(iter(runs.values()))
     v_des = _get(first_hist, "v_des")
@@ -1521,18 +1767,16 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
                  linestyle=linestyles[run_label], solid_capstyle="round", label=run_label)
     ax_v.set_ylabel("$v_x$ (m/s)")
     _title(ax_v, "Speed")
-    _legend(ax_v, ncol=min(len(runs) + 1, 4))
 
     _dynamics_panel(ax_a, runs, colors, True, "a_x", "$a_x$ (m/s$^2$)", "Longitudinal acceleration",
-                    ref_key="a_cmd", linestyles=linestyles)
+                    ref_key="a_cmd", legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_a, *B2D_COMFORT_LIMITS["a_x"])
     _dynamics_panel(ax_j, runs, colors, True, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk (ride comfort)",
-                    linestyles=linestyles)
+                    legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_j, *B2D_COMFORT_LIMITS["jerk"])
     _dynamics_panel(ax_jtot, runs, colors, True, "jerk_total", "|jerk| (m/s$^3$)",
-                    "Total jerk magnitude (long. + lat.)", linestyles=linestyles)
+                    "Total jerk magnitude (long. + lat.)", legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_jtot, *B2D_COMFORT_LIMITS["jerk_total"])
-    ax_jtot.set_xlabel("$t$ (s)")
 
     ax_cmd.axhline(0.0, color=COLOR_AXIS, linewidth=1)
     for run_label, hist in runs.items():
@@ -1540,11 +1784,24 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
         u = np.asarray(hist["throttle"], dtype=float) - np.asarray(hist["brake"], dtype=float)
         ax_cmd.plot(t, u, color=colors[run_label], linewidth=1.4,
                    linestyle=linestyles[run_label], label=run_label)
-    _legend(ax_cmd, ncol=len(runs))
     ax_cmd.set_ylim(-1.05, 1.05)
     ax_cmd.set_ylabel("$u$")
     _title(ax_cmd, "Longitudinal control input $u$  (u > 0: throttle, u < 0: brake)")
-    ax_cmd.set_xlabel("$t$ (s)")
+
+    # One handle per controller (color + dash pattern), same as plot_comparison()'s shared legend,
+    # plus the two markings that aren't a controller. Built by hand rather than scraped with
+    # _panel_handles(): _dynamics_panel()'s a_cmd overlay labels its lines "<run> measured" /
+    # "<run> commanded" per run, which would put 2*len(runs) near-duplicate entries in the legend.
+    handles = [plt.Line2D([0], [0], color=colors[run_label], linewidth=2,
+                          linestyle=linestyles[run_label], label=run_label)
+              for run_label in runs]
+    handles.append(plt.Line2D([0], [0], color=COLOR_MUTED, linewidth=2, linestyle="--",
+                              label="desired vel"))
+    if any(_get(h, "a_cmd") is not None for h in runs.values()):
+        handles.append(plt.Line2D([0], [0], color=COLOR_RED, linewidth=LINEWIDTH, linestyle="--",
+                                  label="commanded $a_x$"))
+    handles.append(_b2d_limit_handle())
+    _bottom_legend(fig, handles)
     return fig
 
 
@@ -1587,8 +1844,11 @@ def plot_longitudinal_result(data, target_speed_ms, out_dir, show=True, summary=
 # ---------------------------------------------------------------------------
 
 def plot_lut_validation(hist_ff, hist_pid, mode, args, out_dir, hist_pidonly=None, show=True, name=None):
-    """Overlay LUT feedforward-only vs. feedforward+PID vs. (optionally) plain-PID-only tracking,
-    for validate_lut.py.
+    """Overlay LUT-only vs. LUT+PID vs. (optionally) plain-PID-only tracking, for validate_lut.py.
+
+    "LUT" is this figure's name for what the code calls the feedforward term -- they are the same
+    thing (LookupController.feedforward() is a table lookup), and the figures in this project name
+    the mechanism rather than its role.
 
     mode == "accel": reference/response is commanded longitudinal acceleration (a_cmd vs a_x).
     mode == "speed":  reference/response is vehicle speed (v_des vs v_x) -- a_cmd there is the
@@ -1603,17 +1863,21 @@ def plot_lut_validation(hist_ff, hist_pid, mode, args, out_dir, hist_pidonly=Non
     else:
         ref_key, resp_key, unit, ylabel = "v_des", "v_x", "m/s", "speed (m/s)"
 
-    series = [("feedforward only", hist_ff, COLOR_AQUA), ("feedforward + PID", hist_pid, COLOR_BLUE)]
+    # "LUT" rather than "feedforward" in every label this figure draws -- the feedforward term IS
+    # the lookup table, and "LUT only / LUT + PID / PID only" reads as one parallel set where
+    # "feedforward only / feedforward + PID / PID only" did not. These are display strings built
+    # here; validate_lut.py's own results dict keys are separate and untouched.
+    series = [("LUT only", hist_ff, COLOR_AQUA), ("LUT + PID", hist_pid, COLOR_BLUE)]
     if hist_pidonly is not None:
         series.append(("PID only", hist_pidonly, COLOR_ORANGE))
     ts = {label: np.asarray(hist["t"], dtype=float) for label, hist, _ in series}
 
-    title = "LUT feedforward vs. feedforward+PID" + (" vs. PID only" if hist_pidonly is not None else "")
+    title = "LUT only vs. LUT+PID" + (" vs. PID only" if hist_pidonly is not None else "")
     fig, (ax_main, ax_err, ax_u) = _panels(
         f"{title} -- {mode} tracking, {args.profile} profile",
         n_rows=3, n_cols=1, figsize=(14, 10))
 
-    ax_main.plot(ts["feedforward only"], hist_ff[ref_key], color=COLOR_MUTED, linewidth=2.2,
+    ax_main.plot(ts["LUT only"], hist_ff[ref_key], color=COLOR_MUTED, linewidth=2.2,
                 linestyle="--", label="reference")
     for label, hist, color in series:
         ax_main.plot(ts[label], hist[resp_key], color=color, linewidth=1.6, label=label)
@@ -1634,7 +1898,6 @@ def plot_lut_validation(hist_ff, hist_pid, mode, args, out_dir, hist_pidonly=Non
         ax_u.plot(ts[label], hist["u"], color=color, linewidth=1.3, label=label)
     ax_u.set_ylim(-1.15, 1.15)
     ax_u.set_ylabel("pedal $u$")
-    ax_u.set_xlabel("$t$ (s)")
     _title(ax_u, "Control input")
     _legend(ax_u, ncol=len(series))
 
@@ -1808,6 +2071,7 @@ def plot_cornering_stiffness_quadrant(alpha_f, Fyf, mask_f, alpha_r, Fyr, mask_r
     for ax, alpha, Fy, mask, C, axle in (
             (ax_f, alpha_f, Fyf, mask_f, Cf, "front"),
             (ax_r, alpha_r, Fyr, mask_r, Cr, "rear")):
+        sub = axle[0]                       # "f" / "r" -- the subscript shared by alpha, Fy and C
         alpha_deg = np.degrees(np.asarray(alpha))
         Fy = np.asarray(Fy)
         mask = np.asarray(mask)
@@ -1823,10 +2087,13 @@ def plot_cornering_stiffness_quadrant(alpha_f, Fyf, mask_f, alpha_r, Fyr, mask_r
         lo, hi = min(0.0, alpha_deg.min()), max(0.0, alpha_deg.max())
         xs = np.linspace(lo, hi, 20)
         ax.plot(xs, C * np.radians(xs), color=COLOR_INK, linewidth=LINEWIDTH * 1.4,
-               linestyle="--", zorder=5, label=f"fit C={C:,.0f} N/rad")
-        ax.set_xlabel(rf"$\alpha_{{{axle[0]}}}$ (deg)")
-        ax.set_ylabel(rf"$F_{{y{axle[0]}}}$ (N)")
-        _title(ax, f"{axle.capitalize()} axle: Fy = C * alpha")
+               linestyle="--", zorder=5, label=rf"fit $C_{sub}$ = {C:,.0f} N/rad")
+        ax.set_xlabel(rf"$\alpha_{{{sub}}}$ (deg)")
+        ax.set_ylabel(rf"$F_{{y{sub}}}$ (N)")
+        # mathtext, matching the axis labels' own subscripts: the panel title states the law being
+        # fitted rather than spelling it out in ascii ("Fy = C * alpha"), so the title, the axes and
+        # the legend entry all name the same three symbols the same way.
+        _title(ax, rf"{axle.capitalize()} axle:  $F_{{y{sub}}} = C_{sub}\,\alpha_{sub}$")
         _legend(ax)
 
     out_path = None

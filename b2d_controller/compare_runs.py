@@ -54,8 +54,11 @@ TICK_DT_S = 0.05        # CARLA fixed_delta_seconds / the agent's sensor_tick --
 SG_WINDOW, SG_POLY = 7, 2   # B2D's own savgol settings (efficiency_smoothness_benchmark.py)
 
 DEFAULT_XODR = "/home/ailab/2026intern/carla/CarlaUE4/Content/Carla/Maps/OpenDrive/Town10HD.xodr"
-B2D_BENCHMARK = ("/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools/"
-                 "efficiency_smoothness_benchmark.py")
+# viz_utils.B2D_TOOLS_DIR / b2d_metrics.DEFAULT_TOOLS_DIR 와 같은 파일을 가리킨다: 저장소에
+# 함께 들어있는 채점 모듈 사본(랩 머신 원본과 바이트 동일, comfort_metric/PROVENANCE.md 참고).
+# 예전에는 랩 머신 절대경로였는데 그쪽 트리가 없는 체크아웃에서는 항상 하드코딩 값으로 폴백했다.
+B2D_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "comfort_metric", "efficiency_smoothness_benchmark.py")
 
 
 def _colors(runs):

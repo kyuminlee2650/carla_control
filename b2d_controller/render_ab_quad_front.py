@@ -82,7 +82,15 @@ LIDAR2IMG = {
 LIDAR2IMG = {k: np.array(v, dtype=float) for k, v in LIDAR2IMG.items()}
 
 TICK_DT_S = 0.05
-QUAD_W, CAM_H, BOT_H, BAR_H = 1400, 525, 525, 54
+# --- front-only 판 (2026-08-23) ---
+# 6-카메라 그리드 대신 CAM_FRONT 하나만 위에 둔다. 원본 카메라가 1200x675 이므로
+# 폭 1400 을 채우면 높이는 787 이다(비율 유지, 왜곡 없음).
+# 아래 칸은 525 -> 560 으로 키웠다. BEV+범례를 letterbox 로 축소해 넣는 구조라
+# 칸이 커진 만큼 범례 글자가 화면에서 커진다.
+QUAD_W, BOT_H, BAR_H = 1400, 560, 54
+CAM_TOP_H = 787                     # round(1400 * 675/1200)
+BEV_FRAC = 0.58                     # 아래 칸에서 BEV+범례가 차지하는 폭 비율 (원본 0.52)
+CAM_H = CAM_TOP_H                   # 하위 호환
 COLLISION_FLASH_TICKS = 12          # +-0.6 s around the impact
 ROUTE_BGR = (60, 200, 255)          # amber; VAD's own plan is the blue-green 'winter' gradient
 INK, MUTED, PANEL = (24, 24, 24), (140, 140, 140), (250, 250, 248)
@@ -326,23 +334,23 @@ def draw_route_on_front(img, route_xy, ego_p, ego_yaw, rvs, ahead=60.0):
     return img
 
 
-def bev_legend(bev, rvs, map_classes=None):
+def bev_legend(bev, rvs):
     """Name the BEV's colours. Drawn onto a widened canvas so nothing covers the scene itself.
 
-    map_classes overrides render_vad_style's own names. Needed because the two sides of an A/B
-    can be trained against different map GT: the boundary experiment redefines class 2 from
-    SolidSolid (centre double line) to Boundary (road edge). Labelling that side "SolidSolid"
-    would name the very thing the experiment changed after the thing it replaced.
+    front-only 판에서는 글자를 키웠다. 이 캔버스는 나중에 letterbox 로 축소돼 들어가므로
+    화면에서 보이는 크기는 (여기 fontScale) x (축소 배율) 이다. 원본은 0.44 x 0.67 = 0.30 이라
+    읽기 어려웠다. 여기서는 0.92 x 0.71 = 0.65 로 약 2.2배가 된다.
+    pad 는 가장 긴 라벨("agent + forecast")이 잘리지 않을 만큼만 늘린다 — 더 늘리면
+    캔버스가 가로로 길어져 letterbox 배율이 떨어지고, 결국 글자가 도로 작아진다.
     """
     from matplotlib.colors import to_rgb
-    names = map_classes or rvs.MAP_CLASSES
-    pad = 250
+    pad = 360
     out = cv2.copyMakeBorder(bev, 0, 0, 0, pad, cv2.BORDER_CONSTANT, None, value=(255, 255, 255))
-    x0, y = bev.shape[1] + 14, 30
-    cv2.putText(out, "MAP VECTORS", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, INK, 1, cv2.LINE_AA)
-    y += 22
+    x0, y = bev.shape[1] + 18, 48
+    cv2.putText(out, "MAP VECTORS", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.98, INK, 2, cv2.LINE_AA)
+    y += 44
     rows = [(n, tuple(int(255 * v) for v in to_rgb(c))[::-1])
-            for n, c in zip(names, rvs.MAP_COLORS)]
+            for n, c in zip(rvs.MAP_CLASSES, rvs.MAP_COLORS)]
     rows += [("", None),
              ("agent + forecast", tuple(int(255 * v) for v in to_rgb("tomato"))[::-1]),
              ("ego", tuple(int(255 * v) for v in to_rgb("mediumseagreen"))[::-1]),
@@ -350,11 +358,11 @@ def bev_legend(bev, rvs, map_classes=None):
              ("route planner", ROUTE_BGR)]
     for name, bgr in rows:
         if not name:
-            y += 10
+            y += 18
             continue
-        cv2.line(out, (x0, y - 4), (x0 + 26, y - 4), bgr, 4, cv2.LINE_AA)
-        cv2.putText(out, name, (x0 + 34, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, INK, 1, cv2.LINE_AA)
-        y += 24
+        cv2.line(out, (x0, y - 7), (x0 + 44, y - 7), bgr, 7, cv2.LINE_AA)
+        cv2.putText(out, name, (x0 + 56, y), cv2.FONT_HERSHEY_SIMPLEX, 0.92, INK, 2, cv2.LINE_AA)
+        y += 46
     return out
 
 
@@ -380,27 +388,25 @@ def render_half(side, idx):
     use = idx if live else st["last"]
 
     npz = np.load(osp.join(dump, "pred", "%04d.npz" % use))
-    cams = []
-    for cam in rvs.CAMS:
-        img = cv2.imread(osp.join(dump, cam, "%04d.jpg" % use))
-        img = cv2.resize(img, (rvs.CAM_W, rvs.CAM_H))
-        # map vectors first (they are the background layer), then the route, then VAD's own plan
-        # on top -- so where all three coincide the plan stays readable.
-        img = draw_map_vectors_on_cam(img, npz, cam, rvs)
-        if use < len(st["loc"]):
-            img = draw_route_on_cam(img, st["route"], st["loc"][use], st["yaw"][use], cam, rvs)
-        if cam == "CAM_FRONT":
-            img = rvs.draw_plan_on_front(img, npz)
-        cv2.putText(img, cam, (12, 34), 0, 1.0, (0, 0, 0), 5, cv2.LINE_AA)
-        cv2.putText(img, cam, (12, 34), 0, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
-        cams.append(img)
-    grid = cv2.vconcat([cv2.hconcat(cams[0:3]), cv2.hconcat(cams[3:6])])
-    grid = cv2.resize(grid, (QUAD_W, CAM_H), interpolation=cv2.INTER_AREA)
+    # --- front-only: 앞 카메라 하나만. 6분할보다 한 칸이 6배 커져 장면이 실제로 보인다 ---
+    cam = "CAM_FRONT"
+    img = cv2.imread(osp.join(dump, cam, "%04d.jpg" % use))
+    img = cv2.resize(img, (rvs.CAM_W, rvs.CAM_H))
+    # map vectors first (they are the background layer), then the route, then VAD's own plan
+    # on top -- so where all three coincide the plan stays readable.
+    img = draw_map_vectors_on_cam(img, npz, cam, rvs)
+    if use < len(st["loc"]):
+        img = draw_route_on_cam(img, st["route"], st["loc"][use], st["yaw"][use], cam, rvs)
+    img = rvs.draw_plan_on_front(img, npz)
+    # 칸이 커졌으니 라벨도 그만큼 키운다
+    cv2.putText(img, cam, (16, 48), 0, 1.4, (0, 0, 0), 7, cv2.LINE_AA)
+    cv2.putText(img, cam, (16, 48), 0, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
+    grid = cv2.resize(img, (QUAD_W, CAM_TOP_H), interpolation=cv2.INTER_AREA)
 
-    bev = bev_legend(rvs.render_bev(npz), rvs, st.get("map_classes"))
-    cv2.putText(bev, rvs.CMD_LIST[int(npz["command"])], (16, bev.shape[0] - 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
-    bev = _letterbox(bev, int(QUAD_W * 0.52), BOT_H, bg=(255, 255, 255))
+    bev = bev_legend(rvs.render_bev(npz), rvs)
+    cv2.putText(bev, rvs.CMD_LIST[int(npz["command"])], (18, bev.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2, cv2.LINE_AA)
+    bev = _letterbox(bev, int(QUAD_W * BEV_FRAC), BOT_H, bg=(255, 255, 255))
 
     with open(osp.join(dump, "meta", "%04d.json" % use)) as f:
         meta = json.load(f)
@@ -409,13 +415,13 @@ def render_half(side, idx):
 
     # title bar: which controller, where it is in time, and its final score
     bar = np.full((BAR_H, QUAD_W, 3), (32, 32, 32), np.uint8)
-    cv2.putText(bar, st["label"], (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+    cv2.putText(bar, st["label"], (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.92,
                 (255, 255, 255), 2, cv2.LINE_AA)
     tail = "" if live else "   (run ended)"
-    # 라벨이 길면 고정 x=330 에 찍힌 tick 텍스트와 겹친다 (실제로 겹쳤다).
-    # 라벨 실제 폭을 재서 그 뒤에 놓는다.
-    (lw, _), _ = cv2.getTextSize(st["label"], cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-    cv2.putText(bar, f"tick {use:04d}   t = {use * TICK_DT_S:6.2f} s{tail}", (max(330, 16 + lw + 28), 36),
+    # 라벨에 DS 까지 들어가 길어졌다. 고정 x=330 이면 겹치므로 오른쪽 정렬한다.
+    ttxt = f"tick {use:04d}   t = {use * TICK_DT_S:6.2f} s{tail}"
+    (tw, _), _ = cv2.getTextSize(ttxt, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 1)
+    cv2.putText(bar, ttxt, (QUAD_W - 210 - tw, 36),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (200, 200, 200), 1, cv2.LINE_AA)
     if st["scores"]:
         cv2.putText(bar, f"DS {st['scores']['score_composed']:.2f}", (QUAD_W - 190, 37),
@@ -497,10 +503,6 @@ def main():
                          "runs that are not MPC at all (e.g. stock PID with a different "
                          "checkpoint), and a wrong banner on a saved video is a real trap")
     ap.add_argument("--pid-label", default="PID (stock)")
-    ap.add_argument("--pid-map-classes", default=None,
-                    help="comma-separated BEV legend names for the left side, when that run was "
-                         "trained against different map GT (e.g. class 2 = Boundary)")
-    ap.add_argument("--mpc-map-classes", default=None, help="same, for the right side")
     ap.add_argument("--out", required=True)
     ap.add_argument("--route", default=None, help="route id, for the route-planner overlay")
     ap.add_argument("--town", default=None, help="town name; inferred from the dump path if absent")
@@ -523,12 +525,8 @@ def main():
     route_xy = build_route(route_id, town) if (route_id and town) else None
 
     state = {"mpc": side_state(args.mpc_dump, args.mpc_label, route_xy, args.rvs, args.ctrl)}
-    if args.mpc_map_classes:
-        state["mpc"]["map_classes"] = args.mpc_map_classes.split(",")
     if args.pid_dump:
         state["pid"] = side_state(args.pid_dump, args.pid_label, route_xy, args.rvs, args.ctrl)
-        if args.pid_map_classes:
-            state["pid"]["map_classes"] = args.pid_map_classes.split(",")
     n = max(s["last"] for s in state.values())
     if args.max_tick is not None:
         n = min(n, args.max_tick)

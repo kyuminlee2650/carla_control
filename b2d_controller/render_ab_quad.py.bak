@@ -326,23 +326,16 @@ def draw_route_on_front(img, route_xy, ego_p, ego_yaw, rvs, ahead=60.0):
     return img
 
 
-def bev_legend(bev, rvs, map_classes=None):
-    """Name the BEV's colours. Drawn onto a widened canvas so nothing covers the scene itself.
-
-    map_classes overrides render_vad_style's own names. Needed because the two sides of an A/B
-    can be trained against different map GT: the boundary experiment redefines class 2 from
-    SolidSolid (centre double line) to Boundary (road edge). Labelling that side "SolidSolid"
-    would name the very thing the experiment changed after the thing it replaced.
-    """
+def bev_legend(bev, rvs):
+    """Name the BEV's colours. Drawn onto a widened canvas so nothing covers the scene itself."""
     from matplotlib.colors import to_rgb
-    names = map_classes or rvs.MAP_CLASSES
     pad = 250
     out = cv2.copyMakeBorder(bev, 0, 0, 0, pad, cv2.BORDER_CONSTANT, None, value=(255, 255, 255))
     x0, y = bev.shape[1] + 14, 30
     cv2.putText(out, "MAP VECTORS", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, INK, 1, cv2.LINE_AA)
     y += 22
     rows = [(n, tuple(int(255 * v) for v in to_rgb(c))[::-1])
-            for n, c in zip(names, rvs.MAP_COLORS)]
+            for n, c in zip(rvs.MAP_CLASSES, rvs.MAP_COLORS)]
     rows += [("", None),
              ("agent + forecast", tuple(int(255 * v) for v in to_rgb("tomato"))[::-1]),
              ("ego", tuple(int(255 * v) for v in to_rgb("mediumseagreen"))[::-1]),
@@ -397,7 +390,7 @@ def render_half(side, idx):
     grid = cv2.vconcat([cv2.hconcat(cams[0:3]), cv2.hconcat(cams[3:6])])
     grid = cv2.resize(grid, (QUAD_W, CAM_H), interpolation=cv2.INTER_AREA)
 
-    bev = bev_legend(rvs.render_bev(npz), rvs, st.get("map_classes"))
+    bev = bev_legend(rvs.render_bev(npz), rvs)
     cv2.putText(bev, rvs.CMD_LIST[int(npz["command"])], (16, bev.shape[0] - 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
     bev = _letterbox(bev, int(QUAD_W * 0.52), BOT_H, bg=(255, 255, 255))
@@ -412,10 +405,7 @@ def render_half(side, idx):
     cv2.putText(bar, st["label"], (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                 (255, 255, 255), 2, cv2.LINE_AA)
     tail = "" if live else "   (run ended)"
-    # 라벨이 길면 고정 x=330 에 찍힌 tick 텍스트와 겹친다 (실제로 겹쳤다).
-    # 라벨 실제 폭을 재서 그 뒤에 놓는다.
-    (lw, _), _ = cv2.getTextSize(st["label"], cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-    cv2.putText(bar, f"tick {use:04d}   t = {use * TICK_DT_S:6.2f} s{tail}", (max(330, 16 + lw + 28), 36),
+    cv2.putText(bar, f"tick {use:04d}   t = {use * TICK_DT_S:6.2f} s{tail}", (330, 36),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (200, 200, 200), 1, cv2.LINE_AA)
     if st["scores"]:
         cv2.putText(bar, f"DS {st['scores']['score_composed']:.2f}", (QUAD_W - 190, 37),
@@ -497,10 +487,6 @@ def main():
                          "runs that are not MPC at all (e.g. stock PID with a different "
                          "checkpoint), and a wrong banner on a saved video is a real trap")
     ap.add_argument("--pid-label", default="PID (stock)")
-    ap.add_argument("--pid-map-classes", default=None,
-                    help="comma-separated BEV legend names for the left side, when that run was "
-                         "trained against different map GT (e.g. class 2 = Boundary)")
-    ap.add_argument("--mpc-map-classes", default=None, help="same, for the right side")
     ap.add_argument("--out", required=True)
     ap.add_argument("--route", default=None, help="route id, for the route-planner overlay")
     ap.add_argument("--town", default=None, help="town name; inferred from the dump path if absent")
@@ -523,12 +509,8 @@ def main():
     route_xy = build_route(route_id, town) if (route_id and town) else None
 
     state = {"mpc": side_state(args.mpc_dump, args.mpc_label, route_xy, args.rvs, args.ctrl)}
-    if args.mpc_map_classes:
-        state["mpc"]["map_classes"] = args.mpc_map_classes.split(",")
     if args.pid_dump:
         state["pid"] = side_state(args.pid_dump, args.pid_label, route_xy, args.rvs, args.ctrl)
-        if args.pid_map_classes:
-            state["pid"]["map_classes"] = args.pid_map_classes.split(",")
     n = max(s["last"] for s in state.values())
     if args.max_tick is not None:
         n = min(n, args.max_tick)

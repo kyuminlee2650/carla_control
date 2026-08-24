@@ -17,11 +17,12 @@ tools/efficiency_smoothness_benchmark.py rather than reimplemented from the pape
                  only if ALL SIX channels stay in bounds; the metric is the ratio of such
                  segments, averaged over routes.
 
-Comfortness is computed by importing Bench2Drive's own seg_compute_comfort_metric, not a copy, so
-it cannot drift from the scored version. Note that that function has three known defects (deg/s
-values checked against rad/s bounds, an undifferentiated "yaw acceleration" channel, and a 0.1 s
-derivative delta on 0.05 s data) -- see the project's submission-hooks note. They are left intact
-here on purpose: the point of this script is to report what the leaderboard would report.
+Comfortness is computed by importing Bench2Drive's own seg_compute_comfort_metric, so it cannot
+drift from the scored version. That module is vendored at b2d_controller/comfort_metric/ as a
+byte-identical copy of the lab checkout the dashboard actually scores with (md5 0c650615...,
+see that directory's PROVENANCE.md). It is the 2026-08-18 corrected version, i.e. the three
+defects this project reported (deg/s values checked against rad/s bounds, an undifferentiated
+"yaw acceleration" channel, and a 0.1 s derivative delta on 0.05 s data) are already fixed in it.
 
 Usage:
     python b2d_metrics.py --runs <runs_root> --suffix _mpckf [--suffix _pidviz] [--json out.json]
@@ -72,19 +73,18 @@ def efficiency_of(rec):
 def comfort_of(run_dir, tools_dir):
     """Bench2Drive's own segment-wise comfort ratio for one route, or None without metric_info.
 
-    On the lab's Ubuntu machine (--tools-dir pointed at the verified checkout), this imports the
-    LAB'S SCORING MODULE, not a copy, so the number is the number the dashboard reports. Off that
-    machine (the default --tools-dir, see DEFAULT_TOOLS_DIR above), it imports this repo's own
-    b2d_controller/comfort_metric/efficiency_smoothness_benchmark.py instead -- a local
-    reconstruction of the same fix, not verified byte-for-byte against the real file (see that
-    file's own docstring for exactly what that means and how to replace it with the real one).
+    The default --tools-dir (see DEFAULT_TOOLS_DIR above) is this repo's vendored copy at
+    b2d_controller/comfort_metric/, which since 2026-08-24 is a byte-identical copy of the lab
+    checkout the dashboard scores with (md5 0c650615..., see that directory's PROVENANCE.md) --
+    so the number here is the number the dashboard reports, on this machine or off it. Pointing
+    --tools-dir at the lab checkout itself still works and loads the same bytes.
 
-    The module (either copy) was corrected on 2026-08-18 (md5 0c650615... on the verified lab
-    checkout) after this project reported three defects in it: yaw values in deg/s were being
-    checked against rad/s bounds, the "yaw acceleration" channel was never differentiated, and
-    jerks used a 0.1 s step on 0.05 s data. All three are fixed upstream now, the bounds are
-    unchanged, and this project's own b2d_comfort_fixed.py -- written to score against while the
-    fix was pending -- was verified to agree with it to 0.0000 on route 27582 before being retired.
+    That module was corrected on 2026-08-18 after this project reported three defects in it: yaw
+    values in deg/s were being checked against rad/s bounds, the "yaw acceleration" channel was
+    never differentiated, and jerks used a 0.1 s step on 0.05 s data. All three are fixed in it
+    now, the bounds are unchanged, and this project's own b2d_comfort_fixed.py -- written to
+    score against while the fix was pending -- was verified to agree with it to 0.0000 on route
+    27582 before being retired.
 
     One difference from that interim module is worth recording: the corrected official version
     does NOT phase-unwrap the yaw rate ("a rate is not an angle"), which is right, and which the
@@ -197,10 +197,10 @@ def main():
                          "Repeat for several; default: _mpckf and _pidviz")
     ap.add_argument("--tools-dir", default=DEFAULT_TOOLS_DIR,
                     help="directory containing efficiency_smoothness_benchmark.py -- defaults to "
-                         "this repo's own local copy (b2d_controller/comfort_metric/, see its "
-                         "docstring); pass the lab machine's verified checkout "
-                         "(/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools) to use "
-                         "that instead")
+                         "this repo's vendored copy (b2d_controller/comfort_metric/), which is "
+                         "byte-identical to the lab checkout "
+                         "(/home/ailab/2026intern/kmlee/vad_demo_video/Bench2Drive/tools); pass "
+                         "that path to load it from there instead")
     ap.add_argument("--json", default=None, help="also write the numbers here")
     args = ap.parse_args()
     suffixes = args.suffix or ["_mpckf", "_pidviz"]

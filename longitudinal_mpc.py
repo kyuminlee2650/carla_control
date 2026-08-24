@@ -49,10 +49,18 @@ MpcController, both a single step(ctx) -> pedal method).
 
 Usage (Ubuntu):
     cd ~/carla_control
-    python3 longitudinal_mpc.py --profile constant --initial-speed 15
-    python3 longitudinal_mpc.py --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 10 --save-plot
-    python3 longitudinal_mpc.py --profile step --initial-speed 15 --step-size 5 --step-time 10 --save-plot
-    python3 longitudinal_mpc.py --controller mpc+ff+pid mpc+pid pid --profile sine --save-plot
+    .venv/bin/python longitudinal_mpc.py --profile constant --initial-speed 15
+    .venv/bin/python longitudinal_mpc.py --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 10 --save-plot
+    .venv/bin/python longitudinal_mpc.py --profile step --initial-speed 15 --step-size 5 --step-time 10 --save-plot
+    .venv/bin/python longitudinal_mpc.py --controller mpc+ff+pid mpc+pid pid --profile sine --save-plot
+
+    # emergency stop and restart: hold a full stop for 5s from t=5, then demand 15 m/s again
+    .venv/bin/python longitudinal_mpc.py --profile step --initial-speed 15 --step-size -15 \
+        --step-time 5 --step-duration 5 --duration 20 --save-plot
+
+    # several controllers recorded and stitched left-to-right into one mp4, in --controller order
+    .venv/bin/python longitudinal_mpc.py --controller pid mpc+pid mpc+ff+pid --profile sine \
+        --save-plot --record
 
 Usage (Windows):
     cd C:\Users\mumu2\carla_control
@@ -61,6 +69,12 @@ Usage (Windows):
     .venv\Scripts\python.exe longitudinal_mpc.py --profile constant --initial-speed 15 --times-run 10 --save-plot --record
     .venv\Scripts\python.exe longitudinal_mpc.py --controller mpc+ff+pid mpc+pid --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 3 --save-plot
     .venv\Scripts\python.exe longitudinal_mpc.py --controller mpc+ff+pid mpc+pid pid --profile step --initial-speed 15 --step-size -5 --step-time 5 --save-plot
+
+    # emergency stop and restart: hold a full stop for 5s from t=5, then demand 15 m/s again
+    .venv\Scripts\python.exe longitudinal_mpc.py --profile step --initial-speed 15 --step-size -15 --step-time 5 --step-duration 5 --duration 20 --save-plot
+
+    # several controllers recorded and stitched left-to-right into one mp4, in --controller order
+    .venv\Scripts\python.exe longitudinal_mpc.py --controller pid mpc+pid mpc+ff+pid --profile sine --save-plot --record
 """
 
 import argparse
@@ -88,7 +102,8 @@ import carla
 
 from functions import PID, ImuAcceleration, LowPassFilter, clipping, reference_preview, speed_reference
 from viz_utils import (VIEWS, VideoRecorder, follow_with_spectator, plot_longitudinal_result,
-                       print_error_summary, run_name)
+                       print_comfort_report, print_error_summary, run_name,
+                       stack_videos_side_by_side)
 
 from longitudinal_lut import LongitudinalLUT
 from lookup_controller import LookupController
@@ -293,7 +308,12 @@ class MpcController:
 
     def __init__(self, args, use_ff):
         self.args = args
-        self.label = "MPC+FF+PID" if use_ff else "MPC+PID"
+        # "LUT", not "FF", everywhere this label surfaces (figure legends and titles, the video
+        # overlay, the per-run console headers): the feedforward term IS the longitudinal lookup
+        # table, and naming the thing rather than its role is what the rest of this project's
+        # figures do. The --controller key stays "mpc+ff+pid" -- it is a CLI spelling, not a label,
+        # and renaming it would break every command and note already written against it.
+        self.label = "MPC+LUT+PID" if use_ff else "MPC+PID"
         self.mpc = SpeedMPC(dt=args.dt, n_p=args.n_p, n_c=args.n_c,
                             w_v=args.w_v, w_a=args.w_a, w_j=args.w_j,
                             a_min=args.a_min, a_max=args.a_max)
@@ -332,18 +352,27 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
     vehicle = world.spawn_actor(blueprint, origin_transform)
 
     # a_x/a_y off the IMU -- see stanley_PID.py for why (true body-frame values straight from the
-    # sensor, nothing to derive by hand). a_y only exists here to feed jerk_total; nothing plots it
-    # on its own since there's no lateral figure in a steer=0 run.
+    # sensor, nothing to derive by hand). a_y feeds jerk_total and the Comfortness score below;
+    # nothing plots it on its own, since there's no lateral figure in a steer=0 run.
     accel = ImuAcceleration(dt=args.dt)
 
-    hist = {"t": [], "v_x": [], "v_des": [], "a_x": [], "jerk": [], "jerk_total": [],
-            "throttle": [], "brake": []}
+    # yaw/yaw_rate/a_y/a_x_raw/a_y_raw are not read by the longitudinal figure -- they are here so
+    # viz_utils.b2d_comfortness() can score the run, which needs all six of the channels B2D's own
+    # metric_info.json carries and returns None if any is missing (which is why a run of this
+    # script used to print no Comfortness line at all). Steering is pinned to 0, so the two yaw
+    # channels sit at ~0 and the score is decided by the longitudinal ones -- exactly the point of
+    # scoring this stack. The RAW accelerations are logged alongside the filtered a_x because the
+    # scoring function runs its own Savitzky-Golay pass and prefers them: handing it the already
+    # low-passed channel double-smooths and scores the run more kindly than it deserves.
+    hist = {"t": [], "v_x": [], "v_des": [], "a_x": [], "a_x_raw": [], "a_y": [], "a_y_raw": [],
+            "jerk": [], "jerk_total": [], "yaw": [], "yaw_rate": [], "throttle": [], "brake": []}
 
     warmed_up = False
     log_start_i = 0
 
     imu = None
     recorder = None
+    video_meta = None
     try:
         world.tick()
 
@@ -366,8 +395,13 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             vel_vec = vehicle.get_velocity()
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)  # body-frame forward speed
 
+            # same source and units as the lateral stacks (mpc_mpc.py, mpc_mpc_KF.py): the IMU
+            # gyroscope's z channel in rad/s, converted once to the deg/s every hist in this repo
+            # stores yaw_rate in
+            yaw_rate_deg = math.degrees(imu_data.gyroscope.z)
+
             accel.step(imu_data)
-            a_x, a_y, a_x_raw = accel.a_x, accel.a_y, accel.a_x_raw
+            a_x, a_y, a_x_raw, a_y_raw = accel.a_x, accel.a_y, accel.a_x_raw, accel.a_y_raw
 
             jerk, jerk_total = accel.jerk, accel.jerk_total
 
@@ -407,8 +441,13 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             hist["v_x"].append(v_x)
             hist["v_des"].append(v_ref)
             hist["a_x"].append(a_x)
+            hist["a_x_raw"].append(a_x_raw)
+            hist["a_y"].append(a_y)
+            hist["a_y_raw"].append(a_y_raw)
             hist["jerk"].append(jerk)
             hist["jerk_total"].append(jerk_total)
+            hist["yaw"].append(math.degrees(yaw))
+            hist["yaw_rate"].append(yaw_rate_deg)
             hist["throttle"].append(control.throttle)
             hist["brake"].append(control.brake)
 
@@ -427,12 +466,21 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
     finally:
         if recorder is not None:
             recorder.close()  # before vehicle.destroy(): the camera is attached to it
+            # 합치기(viz_utils.stack_videos_side_by_side)에 필요한 정보. frames 는 실제로 쓰인
+            # 프레임 수 -- 두 주행의 길이가 다를 때 짧은 쪽을 얼마나 늘릴지 계산하는 데 쓴다.
+            video_meta = {"path": recorder.out_path, "frames": recorder.frames}
         if imu is not None and imu.is_alive:
             imu.stop()
             imu.destroy()
         vehicle.destroy()
 
-    return hist
+    return hist, video_meta
+
+
+def _comfort_report(args, hist):
+    """The opt-in per-segment Comfortness breakdown, for one run."""
+    if args.comfort_report or args.comfort_report_failures_only:
+        print_comfort_report(hist, failures_only=args.comfort_report_failures_only)
 
 
 def main():
@@ -446,23 +494,40 @@ def main():
                              "PID-only pedal layer, no LUT (validate_lut.py's 'PID only' baseline); "
                              "pid: plain speed PID straight to the pedal, no MPC at all. Pass more "
                              "than one to overlay them on one comparison figure")
-    parser.add_argument("--initial-speed", type=float, default=15.0,
+    parser.add_argument("--initial-speed", type=float, default=10.0,
                         help="m/s; starting speed, also the sine profile's midline and the step "
                              "profile's pre-step level")
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
-    parser.add_argument("--duration", type=float, default=15.0, help="scored run length (s)")
+    parser.add_argument("--duration", type=float, default=20.0, help="scored run length (s)")
     parser.add_argument("--times-run", type=float, default=2.0, help="how times for simulation running?")
 
     parser.add_argument("--profile", default="constant", choices=("constant", "sine", "step"),
                         help="speed reference shape: flat initial-speed, a sine wave around it, "
-                             "or a single step away from it partway through the run")
-    parser.add_argument("--sine-amplitude", type=float, default=3.0, help="sine profile peak deviation (m/s)")
-    parser.add_argument("--sine-period", type=float, default=1.0, help="sine profile period (s)")
-    parser.add_argument("--step-size", type=float, default=5.0,
+                             "or a step away from it at --step-time, held for --step-duration and "
+                             "then released back to --initial-speed. The step window is what makes "
+                             "an emergency-stop-and-restart run: --step-size -<initial speed> "
+                             "--step-duration <seconds> brakes to a standstill and then demands the "
+                             "original speed again in one step (see functions.speed_reference)")
+    parser.add_argument("--sine-amplitude", type=float, default=0.75, help="sine profile peak deviation (m/s)")
+    parser.add_argument("--sine-period", type=float, default=2.0, help="sine profile period (s)")
+    parser.add_argument("--step-size", type=float, default=-10.0,
                         help="step profile: m/s added to initial-speed after --step-time (negative = "
-                             "a deceleration step)")
-    parser.add_argument("--step-time", type=float, default=5.0,
+                             "a deceleration step). The result is clamped at 0, so anything "
+                             "<= -(initial speed) is a full stop rather than a negative reference")
+    parser.add_argument("--step-time", type=float, default=3.0,
                         help="step profile: when the step happens, seconds into the scored run")
+    parser.add_argument("--step-duration", type=float, default=3,
+                        help="step profile: how long the stepped speed is held (s) before the "
+                             "reference returns to --initial-speed. Unset (the default) holds it "
+                             "for the rest of the run -- the permanent step this script's step "
+                             "profile has always been, so leaving it off changes nothing. Set it "
+                             "and BOTH edges become steps, i.e. a hard decel followed by a hard "
+                             "re-accel; how hard each one gets is bounded by --a-min/--a-max, not "
+                             "by this profile. Give --duration room for the second edge: the run "
+                             "ends at --duration, so a window that closes at or after "
+                             "--step-time + --step-duration never shows the re-accel. "
+                             "mpc_mpc_KF.py/mpc_mpc_kinematic.py/final_comparison.py default this "
+                             "to 5 instead; match them explicitly if you want the same run here")
 
     # ---- MPC ---- #
     mpc = parser.add_argument_group("--controller mpc+ff+pid / mpc+pid")
@@ -490,6 +555,16 @@ def main():
     pid.add_argument("--pid-kd", type=float, default=0.05)
     pid.add_argument("--pid-tau", type=float, default=0.1, help="output low-pass time constant (s)")
 
+    parser.add_argument("--comfort-report", action="store_true",
+                        help="after the error summary, print the per-segment breakdown behind the "
+                             "Comfortness score: one row per scored 1-second segment, marking which "
+                             "of the six channels left its band. Use it when the score disagrees "
+                             "with the figure -- the score reads the RAW acceleration channels "
+                             "while the figure plots the low-passed ones, and one bad sample fails "
+                             "a whole segment no matter how far out it went")
+    parser.add_argument("--comfort-report-failures-only", action="store_true",
+                        help="--comfort-report, but only the segments that failed")
+
     # ---- plot ---- #
     parser.add_argument("--plot-dir", default=os.path.join(HERE, "plots"),
                          help="directory to save the end-of-run result figures into")
@@ -498,7 +573,12 @@ def main():
 
     # ---- video ---- #
     parser.add_argument("--record", nargs="?", const="auto", default="",
-                        help="record the drive to an mp4; bare flag auto-names it under --video-dir")
+                        help="record the drive to an mp4; bare flag auto-names it under --video-dir. "
+                             "With several --controller entries each trial is recorded separately "
+                             "and then stitched left-to-right into one mp4 in --controller order, "
+                             "and the per-trial files are deleted. The trials run one after another, "
+                             "so the panels are each run's own t=0 played together, not the same "
+                             "instant; a run that finishes early holds its last frame")
     parser.add_argument("--video-dir", default=os.path.join(HERE, "videos"),
                         help="where auto-named recordings go")
     parser.add_argument("--record-view", default="chase", choices=sorted(VIEWS),
@@ -555,18 +635,34 @@ def main():
         return make
 
     results = {}
+    videos = []
     try:
         for key in keys:
             controller = CONTROLLERS[key](args)
             print(f"\n=== running {controller.label} ===")
-            results[controller.label] = run_trial(world, origin_transform, blueprint, imu_bp,
-                                                   controller, args,
-                                                   recorder_factory(key, len(keys)))
+            hist, video_meta = run_trial(world, origin_transform, blueprint, imu_bp,
+                                         controller, args,
+                                         recorder_factory(key, len(keys)))
+            results[controller.label] = hist
+            # --controller 에 적은 순서 그대로 쌓는다 -- 그 순서가 곧 합친 영상의 좌->우 배치다.
+            if video_meta is not None:
+                videos.append((controller.label, video_meta["path"], video_meta["frames"]))
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
         world.apply_settings(original_settings)
         print("Cleaned up: world settings restored.")
+
+    # 제어기를 둘 이상 녹화했으면 좌우로 합쳐 하나만 남긴다. 순서는 --controller 인자 순서.
+    # 제어기들은 순차로 주행하므로 동시 녹화가 아니라 "각자의 t=0 부터"를 나란히 놓은 것이고,
+    # 길이가 다르면 짧은 쪽 마지막 프레임을 늘려 끝을 맞춘다 (그쪽 docstring 참고).
+    if len(videos) >= 2:
+        if args.record == "auto":
+            combined = os.path.join(args.video_dir, run_name("combined") + ".mp4")
+        else:
+            base, ext = os.path.splitext(args.record)
+            combined = f"{base}_combined{ext}"
+        stack_videos_side_by_side(videos, combined, fps=1.0 / args.dt)
 
     have_data = all(len(hist["t"]) > 1 for hist in results.values())
     if not args.save_plot or not have_data:
@@ -574,16 +670,25 @@ def main():
             if len(results) > 1:
                 print(f"\n### {label} ###")
             print_error_summary(hist, args.initial_speed)  # plot_longitudinal_result prints it otherwise
+            _comfort_report(args, hist)
     else:
         data = results if len(results) > 1 else next(iter(results.values()))
         title = " vs ".join(results) if len(results) > 1 else next(iter(results), "")
         try:
             plot_longitudinal_result(data, args.initial_speed, args.plot_dir,
                                      label=f"{title} ({args.profile})")
+            # plot_longitudinal_result() already printed each run's error summary; the comfort
+            # breakdown is opt-in and goes after it, per run, in the same order
+            for label, hist in results.items():
+                if args.comfort_report or args.comfort_report_failures_only:
+                    if len(results) > 1:
+                        print(f"\n### {label} ###")
+                    _comfort_report(args, hist)
         except Exception as exc:
             print(f"Plotting failed: {exc}")
             for label, hist in results.items():
                 print_error_summary(hist, args.initial_speed)
+                _comfort_report(args, hist)
 
 
 if __name__ == "__main__":

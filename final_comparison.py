@@ -713,7 +713,7 @@ def main():
                           "this route's low-speed corners, not something --kin-w-ey alone closes the "
                           "rest of the way. See --kin-w-epsi (scaled alongside this)")
     kin.add_argument("--kin-w-epsi", type=float, default=10.0, help="heading error weight -- see --kin-w-ey")
-    kin.add_argument("--kin-w-r", type=float, default=0.0,
+    kin.add_argument("--kin-w-r", type=float, default=0.1,
                      help="steering-vs-Ackermann-feedforward tracking weight (delta -> L*kappa, see "
                           "LateralMPCKinematic's docstring) -- off by default. Measured to have very "
                           "little effect either way on the oscillation described under --kin-w-ey (it "
