@@ -6,7 +6,7 @@ longest straight (index 86) -- so the runs test the exact same speed-profile-tra
 comparison figure instead of eyeballing separate runs (viz_utils.plot_longitudinal accepts
 {label: hist}):
 
-    mpc+ff+pid   (default) SpeedMPC -> a_cmd -> LUT feedforward + PID pedal layer
+    mpc+lut+pid   (default) SpeedMPC -> a_cmd -> LUT feedforward + PID pedal layer
     mpc+pid      SpeedMPC -> a_cmd -> PID-only pedal layer, no LUT term at all -- the same
                  use_feedforward=False baseline validate_lut.py's "PID only" trial uses, so this
                  isolates what the LUT is actually buying the MPC stack over closing the
@@ -15,11 +15,11 @@ comparison figure instead of eyeballing separate runs (viz_utils.plot_longitudin
                  longitudinal_PID.py's own gains, so it's the same controller, not a
                  reimplementation of it
 
-    --controller mpc+ff+pid mpc+pid          # does the LUT feedforward help?
-    --controller mpc+ff+pid pid              # does the MPC help at all, top to bottom?
-    --controller mpc+ff+pid mpc+pid pid      # all three at once
+    --controller mpc+lut+pid mpc+pid          # does the LUT feedforward help?
+    --controller mpc+lut+pid pid              # does the MPC help at all, top to bottom?
+    --controller mpc+lut+pid mpc+pid pid      # all three at once
 
-Control stack (two layers, cascaded) for mpc+ff+pid / mpc+pid:
+Control stack (two layers, cascaded) for mpc+lut+pid / mpc+pid:
 
     1. SpeedMPC (this file): a linear MPC over the plant
 
@@ -41,7 +41,9 @@ a_meas for the pedal layer comes raw off the IMU (functions.ImuAcceleration.a_x_
 filtered -- same reasoning as validate_lut.py: the LUT was calibrated against the raw signal, and
 filtering only on this side would compare the controller's a_meas against a lagged version of what
 it was fit on. A separately filtered a_x (tau=0.15, matching longitudinal_PID.py) is kept purely
-for the jerk derivative and the result plot, exactly as longitudinal_PID.py does for its own a_x.
+for the result plot, exactly as longitudinal_PID.py does for its own a_x. Jerk is not derived from
+it at all any more -- every jerk number comes from the scoring module's own derivative, rebuilt
+post-run by viz_utils.add_scored_comfort_channels().
 
 Every controller shares one run_trial() (spawn -> warm-up -> log -> teardown) instead of each
 having its own copy of that harness; only the per-step control law differs (PidController /
@@ -52,14 +54,14 @@ Usage (Ubuntu):
     .venv/bin/python longitudinal_mpc.py --profile constant --initial-speed 15
     .venv/bin/python longitudinal_mpc.py --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 10 --save-plot
     .venv/bin/python longitudinal_mpc.py --profile step --initial-speed 15 --step-size 5 --step-time 10 --save-plot
-    .venv/bin/python longitudinal_mpc.py --controller mpc+ff+pid mpc+pid pid --profile sine --save-plot
+    .venv/bin/python longitudinal_mpc.py --controller mpc+lut+pid mpc+pid pid --profile sine --save-plot
 
     # emergency stop and restart: hold a full stop for 5s from t=5, then demand 15 m/s again
     .venv/bin/python longitudinal_mpc.py --profile step --initial-speed 15 --step-size -15 \
         --step-time 5 --step-duration 5 --duration 20 --save-plot
 
     # several controllers recorded and stitched left-to-right into one mp4, in --controller order
-    .venv/bin/python longitudinal_mpc.py --controller pid mpc+pid mpc+ff+pid --profile sine \
+    .venv/bin/python longitudinal_mpc.py --controller pid mpc+pid mpc+lut+pid --profile sine \
         --save-plot --record
 
 Usage (Windows):
@@ -67,14 +69,14 @@ Usage (Windows):
     .venv\Scripts\python.exe longitudinal_mpc.py --profile constant --initial-speed 15
     .venv\Scripts\python.exe longitudinal_mpc.py --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 10
     .venv\Scripts\python.exe longitudinal_mpc.py --profile constant --initial-speed 15 --times-run 10 --save-plot --record
-    .venv\Scripts\python.exe longitudinal_mpc.py --controller mpc+ff+pid mpc+pid --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 3 --save-plot
-    .venv\Scripts\python.exe longitudinal_mpc.py --controller mpc+ff+pid mpc+pid pid --profile step --initial-speed 15 --step-size -5 --step-time 5 --save-plot
+    .venv\Scripts\python.exe longitudinal_mpc.py --controller mpc+lut+pid mpc+pid --profile sine --initial-speed 15 --sine-amplitude 3 --sine-period 3 --save-plot
+    .venv\Scripts\python.exe longitudinal_mpc.py --controller mpc+lut+pid mpc+pid pid --profile step --initial-speed 15 --step-size -5 --step-time 5 --save-plot
 
     # emergency stop and restart: hold a full stop for 5s from t=5, then demand 15 m/s again
     .venv\Scripts\python.exe longitudinal_mpc.py --profile step --initial-speed 15 --step-size -15 --step-time 5 --step-duration 5 --duration 20 --save-plot
 
     # several controllers recorded and stitched left-to-right into one mp4, in --controller order
-    .venv\Scripts\python.exe longitudinal_mpc.py --controller pid mpc+pid mpc+ff+pid --profile sine --save-plot --record
+    .venv\Scripts\python.exe longitudinal_mpc.py --controller pid mpc+pid mpc+lut+pid --profile sine --save-plot --record
 """
 
 import argparse
@@ -112,6 +114,9 @@ from lookup_controller import LookupController
 MAP_NAME = "Town06"
 ORIGIN_INDEX = 86
 
+
+CREEP_SPEED = 0.5            # m/s -- below this the pedal layer coasts rather than brakes; see the
+                             # branch in run_trial() for what goes wrong without it
 
 WARM_START_SPEED_TOL = 0.3   # m/s
 WARM_START_ACCEL_TOL = 0.5   # m/s^2
@@ -302,23 +307,29 @@ class PidController:
 class MpcController:
     """SpeedMPC -> a_cmd -> pedal layer, tracking a_cmd either with the LUT feedforward + PID
     stack (see module docstring) or with the PID-only baseline validate_lut.py's "PID only" trial
-    uses (use_ff=False -- LookupController.step() still runs, but its feedforward() call is
+    uses (use_lut=False -- LookupController.step() still runs, but its feedforward() call is
     skipped, per its own use_feedforward flag: the same class either way, not a reimplementation).
     """
 
-    def __init__(self, args, use_ff):
+    def __init__(self, args, use_lut):
         self.args = args
-        # "LUT", not "FF", everywhere this label surfaces (figure legends and titles, the video
-        # overlay, the per-run console headers): the feedforward term IS the longitudinal lookup
-        # table, and naming the thing rather than its role is what the rest of this project's
-        # figures do. The --controller key stays "mpc+ff+pid" -- it is a CLI spelling, not a label,
-        # and renaming it would break every command and note already written against it.
-        self.label = "MPC+LUT+PID" if use_ff else "MPC+PID"
+        # "LUT", not "FF", everywhere: the feedforward term IS the longitudinal lookup table, so
+        # the label, the --controller key and the flag all name the thing rather than its role.
+        self.label = "MPC+LUT+PID" if use_lut else "MPC+PID"
         self.mpc = SpeedMPC(dt=args.dt, n_p=args.n_p, n_c=args.n_c,
                             w_v=args.w_v, w_a=args.w_a, w_j=args.w_j,
                             a_min=args.a_min, a_max=args.a_max)
-        self.pedal_ctrl = LookupController(LongitudinalLUT(args.lut), kp=args.kp, ki=args.ki,
-                                           kd=args.kd, dt=args.dt, use_feedforward=use_ff)
+        # Two DIFFERENT pedal-layer tunings, matching validate_lut.py's two corresponding trials:
+        # with the LUT carrying the bulk of the command the PID only has to trim the table's error,
+        # so it is tuned soft; without it the same PID has to produce the whole pedal command on its
+        # own, which is a different plant to close a loop around and was tuned separately (that is
+        # what validate_lut.py's "feedforward + PID" vs "PID only" trials measure). Sharing one
+        # gain set between them, as this used to, meant whichever variant was not tuned for it ran
+        # on gains that were never validated.
+        kp, ki, kd = ((args.kp, args.ki, args.kd) if use_lut
+                      else (args.mpc_pid_kp, args.mpc_pid_ki, args.mpc_pid_kd))
+        self.pedal_ctrl = LookupController(LongitudinalLUT(args.lut), kp=kp, ki=ki, kd=kd,
+                                           dt=args.dt, use_feedforward=use_lut)
         self.u_filter = LowPassFilter(tau=args.u_tau, dt=args.dt, initial=0.0)
 
     def reset(self, u):
@@ -333,8 +344,8 @@ class MpcController:
 
 
 CONTROLLERS = {
-    "mpc+ff+pid": lambda args: MpcController(args, use_ff=True),
-    "mpc+pid": lambda args: MpcController(args, use_ff=False),
+    "mpc+lut+pid": lambda args: MpcController(args, use_lut=True),
+    "mpc+pid": lambda args: MpcController(args, use_lut=False),
     "pid": PidController,
 }
 
@@ -365,7 +376,7 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
     # scoring function runs its own Savitzky-Golay pass and prefers them: handing it the already
     # low-passed channel double-smooths and scores the run more kindly than it deserves.
     hist = {"t": [], "v_x": [], "v_des": [], "a_x": [], "a_x_raw": [], "a_y": [], "a_y_raw": [],
-            "jerk": [], "jerk_total": [], "yaw": [], "yaw_rate": [], "throttle": [], "brake": []}
+            "yaw": [], "yaw_rate": [], "throttle": [], "brake": []}
 
     warmed_up = False
     log_start_i = 0
@@ -403,7 +414,6 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             accel.step(imu_data)
             a_x, a_y, a_x_raw, a_y_raw = accel.a_x, accel.a_y, accel.a_x_raw, accel.a_y_raw
 
-            jerk, jerk_total = accel.jerk, accel.jerk_total
 
             t = (i - log_start_i) * args.dt
             v_ref = args.initial_speed if not warmed_up else speed_reference(args, t)
@@ -412,7 +422,21 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             u = controller.step(ctx)
 
             control = carla.VehicleControl()
-            control.throttle, control.brake = (u, 0.0) if u >= 0 else (0.0, -u)
+            if u >= 0:
+                control.throttle, control.brake = u, 0.0
+            elif v_x < CREEP_SPEED:
+                # Below creep speed a negative u coasts instead of braking, or the car can never
+                # restart after a full stop (--profile step with --step-duration). At a standstill
+                # the vehicle still rocks a few cm/s, so a_meas alternates about +-0.4 m/s^2 tick to
+                # tick; through the pedal PID's derivative term that is d(error)/dt ~ -16 m/s^3, and
+                # at kd=0.25 with dt=0.05 the kd term alone is -4.1 -- enough to flip u from the
+                # +1.0 the rest of the loop is asking for (ff +0.17, kp*e +1.19, ki*I +0.40) to a
+                # clipped -1.0. Measured: u alternating +1.000/-1.000 every tick, and since a brake
+                # at standstill stops CARLA's transmission engaging, every throttle tick's creep is
+                # killed by the next brake tick. a_cmd sat pinned at +2.40 for 9 s with v_x at 0.
+                control.throttle, control.brake = 0.0, 0.0
+            else:
+                control.throttle, control.brake = 0.0, -u
             control.steer = 0.0
             vehicle.apply_control(control)
             follow_with_spectator(world, vehicle)
@@ -444,8 +468,6 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             hist["a_x_raw"].append(a_x_raw)
             hist["a_y"].append(a_y)
             hist["a_y_raw"].append(a_y_raw)
-            hist["jerk"].append(jerk)
-            hist["jerk_total"].append(jerk_total)
             hist["yaw"].append(math.degrees(yaw))
             hist["yaw_rate"].append(yaw_rate_deg)
             hist["throttle"].append(control.throttle)
@@ -487,9 +509,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
-    parser.add_argument("--controller", nargs="+", default=["mpc+ff+pid"],
-                        choices=("mpc+ff+pid", "mpc+pid", "pid"),
-                        help="which longitudinal controller(s) to run and score -- mpc+ff+pid: "
+    parser.add_argument("--controller", nargs="+", default=["mpc+lut+pid"],
+                        choices=("mpc+lut+pid", "mpc+pid", "pid"),
+                        help="which longitudinal controller(s) to run and score -- mpc+lut+pid: "
                              "SpeedMPC -> LUT feedforward + PID pedal layer; mpc+pid: SpeedMPC -> "
                              "PID-only pedal layer, no LUT (validate_lut.py's 'PID only' baseline); "
                              "pid: plain speed PID straight to the pedal, no MPC at all. Pass more "
@@ -530,23 +552,38 @@ def main():
                              "to 5 instead; match them explicitly if you want the same run here")
 
     # ---- MPC ---- #
-    mpc = parser.add_argument_group("--controller mpc+ff+pid / mpc+pid")
+    mpc = parser.add_argument_group("--controller mpc+lut+pid / mpc+pid")
     mpc.add_argument("--np", dest="n_p", type=int, default=40, help="prediction horizon (steps)")
-    mpc.add_argument("--nc", dest="n_c", type=int, default=40, help="control horizon (steps, <= --np)")
-    mpc.add_argument("--w-v", type=float, default=10.0, help="speed-tracking weight")
-    mpc.add_argument("--w-a", type=float, default=1, help="commanded-acceleration magnitude weight")
+    mpc.add_argument("--nc", dest="n_c", type=int, default=5, help="control horizon (steps, <= --np)")
+    mpc.add_argument("--w-v", type=float, default=100, help="speed-tracking weight")
+    mpc.add_argument("--w-a", type=float, default=15, help="commanded-acceleration magnitude weight")
     mpc.add_argument("--w-j", type=float, default=10, help="commanded-acceleration rate (jerk) weight")
     mpc.add_argument("--a-min", type=float, default=-4.05, help="hard lower bound on a_cmd (m/s^2)")
     mpc.add_argument("--a-max", type=float, default=2.4, help="hard upper bound on a_cmd (m/s^2)")
     mpc.add_argument("--lut", default=os.path.join(HERE, "longitudinal_lookup", "longitudinal_lut.npz"))
-    mpc.add_argument("--kp", type=float, default=0.15, help="accel-tracking PID proportional gain")
-    mpc.add_argument("--ki", type=float, default=0.6, help="accel-tracking PID integral gain")
-    mpc.add_argument("--kd", type=float, default=0.0, help="accel-tracking PID derivative gain")
-    mpc.add_argument("--u-tau", type=float, default=0.02,
-                     help="low-pass filter time constant on the pedal command u, before it's applied (s) "
-                          "-- kept low: multi-controller sine sweeps showed a slower actuator response "
-                          "here lags the LUT+PID inner loop more, producing bigger corrections later and "
-                          "*more* jerk, not less (0.2 measured ~1.5x the jerk of 0.02 at equal w_v/w_a/w_j)")
+    # Pedal layer: validate_lut.py's tuned pedal-layer value -- all three scripts run the identical stack (LookupController = LUT feedforward + PID on acceleration error, then the u_tau low-pass), so the gains it was tuned against carry over unchanged.
+    mpc.add_argument("--kp", type=float, default=0.6, help="accel-tracking PID proportional gain")
+    mpc.add_argument("--ki", type=float, default=0.05, help="accel-tracking PID integral gain")
+    mpc.add_argument("--kd", type=float, default=0.25, help="accel-tracking PID derivative gain")
+    # "mpc+pid" only -- validate_lut.py's "PID only" trial gains (see MpcController.__init__ for
+    # why the no-LUT variant does not share the --kp/--ki/--kd above).
+    #
+    # NOT --pid-kp/--pid-ki/--pid-kd: those already belong to the standalone "--controller pid"
+    # group below and feed PidController, whose PID closes on SPEED error. This one closes on
+    # ACCELERATION error. Different quantity, different units, gains that are not interchangeable --
+    # sharing the flag names would have silently handed each controller the other's tuning.
+    mpc.add_argument("--mpc-pid-kp", type=float, default=0.3,
+                     help="mpc+pid (no LUT): accel-tracking PID proportional gain")
+    mpc.add_argument("--mpc-pid-ki", type=float, default=0.1,
+                     help="mpc+pid (no LUT): accel-tracking PID integral gain")
+    mpc.add_argument("--mpc-pid-kd", type=float, default=0.03,
+                     help="mpc+pid (no LUT): accel-tracking PID derivative gain")
+    mpc.add_argument("--u-tau", type=float, default=0.6,
+                     help="low-pass filter time constant on the pedal command u, before it's applied (s). "
+                          "The earlier 0.1 default came from sine sweeps reading a slower actuator as "
+                          "*more* jerk (0.2 measured ~1.5x the jerk of 0.02 at equal w_v/w_a/w_j); that "
+                          "was measured against the old kp/kd, and validate_lut.py retuned the pedal "
+                          "loop as a whole, so the two are not comparable term by term")
 
     # ---- PID ---- #
     pid = parser.add_argument_group("--controller pid")
@@ -669,14 +706,17 @@ def main():
         for label, hist in results.items():
             if len(results) > 1:
                 print(f"\n### {label} ###")
-            print_error_summary(hist, args.initial_speed)  # plot_longitudinal_result prints it otherwise
+            print_error_summary(hist, args.initial_speed, lateral=False)  # plot_longitudinal_result prints it otherwise
             _comfort_report(args, hist)
     else:
         data = results if len(results) > 1 else next(iter(results.values()))
-        title = " vs ".join(results) if len(results) > 1 else next(iter(results), "")
         try:
-            plot_longitudinal_result(data, args.initial_speed, args.plot_dir,
-                                     label=f"{title} ({args.profile})")
+            # lateral=False: steer is pinned at 0 here, so the yaw/a_y rows are noise floor. They
+            # are still LOGGED (b2d_comfortness() needs all six channels) -- just not printed.
+            # label is just the profile -- the controller names are in the figure's own bottom
+            # legend, so repeating them in the suptitle only made it wrap on a 3-controller run
+            plot_longitudinal_result(data, args.initial_speed, args.plot_dir, lateral=False,
+                                     label=args.profile)
             # plot_longitudinal_result() already printed each run's error summary; the comfort
             # breakdown is opt-in and goes after it, per run, in the same order
             for label, hist in results.items():
@@ -687,7 +727,7 @@ def main():
         except Exception as exc:
             print(f"Plotting failed: {exc}")
             for label, hist in results.items():
-                print_error_summary(hist, args.initial_speed)
+                print_error_summary(hist, args.initial_speed, lateral=False)
                 _comfort_report(args, hist)
 
 

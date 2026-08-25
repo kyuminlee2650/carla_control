@@ -183,13 +183,13 @@ def control_input(u, steer, v_x, vehicle, physics):
 
 
 class ImuAcceleration:
-    """Shared post-processing for the IMU's accelerometer: settle, low-pass, differentiate.
+    """Shared post-processing for the IMU's accelerometer: settle and low-pass.
 
-    Every controller in this repo needs the same three things off `imu_data.accelerometer` --
-    longitudinal and lateral acceleration, and the jerk derived from them -- and each used to
-    build its own four filters and repeat the arithmetic inline. They had drifted apart: the two
-    MPC stacks clamped a_x to +/-8 m/s^2 and the two PID stacks clamped nothing, and no stack ever
-    clamped a_y.
+    Every controller in this repo needs the same two things off `imu_data.accelerometer` --
+    longitudinal and lateral acceleration -- and each used to build its own filters and repeat the
+    arithmetic inline. They had drifted apart: the two MPC stacks clamped a_x to +/-8 m/s^2 and the
+    two PID stacks clamped nothing, and no stack ever clamped a_y. (It used to differentiate them
+    into jerk here too; see the note above __init__ for where that went and why.)
 
     Why there is no clamp here at all now. The spikes it existed for are real but they are a
     *spawn* artefact, not a magnitude problem: measured on this build, the accelerometer reports
@@ -210,19 +210,23 @@ class ImuAcceleration:
     filtering at all, since the noise is zero-mean and averages out) is the right choice.
     """
 
-    def __init__(self, dt, tau=0.15, jerk_tau=0.15, settle_ticks=3):
+    # No jerk here any more. This class used to also differentiate a_x/a_y through a second pair of
+    # tau=0.15 low-passes and expose .jerk/.jerk_y/.jerk_total. Every jerk number in this project now
+    # comes from the SCORING module's own derivative instead (a non-causal Savitzky-Golay over each
+    # 20-tick segment, rebuilt post-run by viz_utils.add_scored_comfort_channels()), because the two
+    # disagreed badly: measured on real runs, corr(causal-LPF jerk, scored jerk) was 0.29-0.71 with
+    # the scored peak 1.2-1.7x higher, so a figure or a printed summary built on this one could sit
+    # comfortably inside the B2D limits on a segment the score had already failed. The accelerations
+    # themselves are untouched -- undifferentiated, the two agree to corr 1.000 -- and they are what
+    # the controllers actually consume, which is why the causal filtering below stays.
+    def __init__(self, dt, tau=0.15, settle_ticks=3):
         self.dt = dt
         self.settle_ticks = settle_ticks
         self._ticks = 0
         self._accel_x = LowPassFilter(tau=tau, dt=dt, initial=0.0)
         self._accel_y = LowPassFilter(tau=tau, dt=dt, initial=0.0)
-        self._jerk_x = LowPassFilter(tau=jerk_tau, dt=dt, initial=0.0)
-        self._jerk_y = LowPassFilter(tau=jerk_tau, dt=dt, initial=0.0)
-        self._prev_a_x = None
-        self._prev_a_y = None
         self.a_x_raw = self.a_y_raw = 0.0
         self.a_x = self.a_y = 0.0
-        self.jerk = self.jerk_y = self.jerk_total = 0.0
 
     def step(self, imu_data):
         """Feed one IMU measurement. Returns self, so attributes can be read straight after."""
@@ -236,13 +240,6 @@ class ImuAcceleration:
         self.a_y_raw = imu_data.accelerometer.y
         self.a_x = self._accel_x.step(self.a_x_raw)
         self.a_y = self._accel_y.step(self.a_y_raw)
-
-        self.jerk = self._jerk_x.step(
-            0.0 if self._prev_a_x is None else (self.a_x - self._prev_a_x) / self.dt)
-        self.jerk_y = self._jerk_y.step(
-            0.0 if self._prev_a_y is None else (self.a_y - self._prev_a_y) / self.dt)
-        self._prev_a_x, self._prev_a_y = self.a_x, self.a_y
-        self.jerk_total = math.hypot(self.jerk, self.jerk_y)
         return self
 
 

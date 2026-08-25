@@ -631,8 +631,6 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
     accel = ImuAcceleration(dt=args.dt)
     yaw_unwrapper = AngleUnwrapper()
     rh_unwrapper = AngleUnwrapper()
-    yaw_acc_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_yaw_rate_rad = None
     last_s = 0.0
 
     # matches plot_results()'s expectations (viz_utils.plot_lateral/plot_longitudinal/plot_trajectory).
@@ -642,7 +640,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
     # plot_kf_run() figure for the "mpc-kf" trial only).
     hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_y_hat": [], "dpsi_noisy": [],
             "ay_noisy": [], "v_des": [], "v_des_curve": [], "a_x": [], "a_x_raw": [], "a_y_raw": [],
-            "jerk": [], "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "steer_deg": [],
+            "a_y": [], "yaw_rate": [], "steer_deg": [],
             "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [], "e_theta": [],
             "a_cmd": []}
     warmed_up = False
@@ -703,11 +701,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
             accel.step(imu_data)
             a_x, a_x_raw, a_y = accel.a_x, accel.a_x_raw, accel.a_y
             a_y_raw = accel.a_y_raw
-            jerk, jerk_total = accel.jerk, accel.jerk_total
 
-            yaw_acc = yaw_acc_filter.step(
-                0.0 if prev_yaw_rate_rad is None else (r - prev_yaw_rate_rad) / args.dt)
-            prev_yaw_rate_rad = r
 
             t = (i - log_start_i) * args.dt
             v_ref = args.initial_speed if not warmed_up else speed_reference(args, t)
@@ -815,11 +809,8 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
             # 실제보다 좋게 나온다 (viz_utils.b2d_comfortness 참고).
             hist["a_x_raw"].append(a_x_raw)
             hist["a_y_raw"].append(a_y_raw)
-            hist["jerk"].append(jerk)
             hist["a_y"].append(a_y)
             hist["yaw_rate"].append(yaw_rate_deg)
-            hist["yaw_acc"].append(yaw_acc)
-            hist["jerk_total"].append(jerk_total)
             hist["steer_deg"].append(steer_deg)
             hist["throttle"].append(throttle_log)
             hist["brake"].append(brake_log)
@@ -1089,6 +1080,26 @@ def main():
             combined = f"{base}_combined{ext}"
         stack_videos_side_by_side(videos, combined, fps=1.0 / args.dt)
 
+    # One more figure just for the "mpc-kf" trial: v_y estimate vs. ground truth stacked over the
+    # dpsi/a_y clean-vs-noisy sensor channels the filter actually ran on, same 3-panel report
+    # kalman_filter.py's own offline replay draws (viz_utils.plot_kf_run). Runs whenever "mpc-kf"
+    # was one of --controller's picks, alone or against "mpc".
+    #
+    # BUILT BEFORE the plot_results()/plot_comparison() call below, and left OPEN (no plt.close):
+    # plt.show() shows every figure open when it is called, and those functions call it internally
+    # and block there -- built afterwards this was saved to disk but never appeared on screen.
+    if args.save_plot and "MPC-KF" in results:
+        try:
+            import matplotlib.pyplot as plt
+            fig = plot_kf_run(results["MPC-KF"],
+                              title="MPC-KF: v_y estimate + sensor noise")
+            os.makedirs(args.plot_dir, exist_ok=True)
+            out_path = os.path.join(args.plot_dir, run_name("kf") + ".png")
+            fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+            print(f"Figure saved: {out_path}")
+        except Exception as exc:
+            print(f"MPC-KF report plotting failed: {exc}")
+
     if len(results) == 1:
         (label, hist), = results.items()
         if args.save_plot:
@@ -1113,24 +1124,6 @@ def main():
                 print(f"\n--- {label} ---")
                 print_error_summary(hist, args.initial_speed)
 
-    # Extra, on top of whatever plot_results()/plot_comparison() above already drew (same format as
-    # mpc_mpc_comparison.py, untouched) -- one more figure just for the "mpc-kf" trial: v_y estimate
-    # vs. ground truth stacked over the dpsi/a_y clean-vs-noisy sensor channels the filter actually
-    # ran on, same 3-panel report kalman_filter.py's own offline replay draws (viz_utils.plot_kf_run).
-    # Runs whenever "mpc-kf" was one of --controller's picks, regardless of whether it ran alone or
-    # against "mpc".
-    if args.save_plot and "MPC-KF" in results:
-        try:
-            import matplotlib.pyplot as plt
-            fig = plot_kf_run(results["MPC-KF"],
-                              title="MPC-KF: v_y estimate + sensor noise")
-            os.makedirs(args.plot_dir, exist_ok=True)
-            out_path = os.path.join(args.plot_dir, run_name("kf") + ".png")
-            fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
-            plt.close(fig)
-            print(f"Figure saved: {out_path}")
-        except Exception as exc:
-            print(f"MPC-KF report plotting failed: {exc}")
 
 
 if __name__ == "__main__":

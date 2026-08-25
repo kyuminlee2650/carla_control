@@ -452,13 +452,11 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
     accel = ImuAcceleration(dt=args.dt)
     yaw_unwrapper = AngleUnwrapper()
     rh_unwrapper = AngleUnwrapper()
-    yaw_acc_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_yaw_rate_rad = None
     last_s = 0.0
 
     # matches plot_results()'s expectations (viz_utils.plot_lateral/plot_longitudinal/plot_trajectory)
-    hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], "jerk": [],
-            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "steer_deg": [],
+    hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], 
+            "a_y": [], "yaw_rate": [], "steer_deg": [],
             "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [], "e_theta": [],
             "a_cmd": []}
     warmed_up = False
@@ -500,11 +498,7 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
 
             accel.step(imu_data)
             a_x, a_x_raw, a_y = accel.a_x, accel.a_x_raw, accel.a_y
-            jerk, jerk_total = accel.jerk, accel.jerk_total
 
-            yaw_acc = yaw_acc_filter.step(
-                0.0 if prev_yaw_rate_rad is None else (r - prev_yaw_rate_rad) / args.dt)
-            prev_yaw_rate_rad = r
 
             # ---- longitudinal (MPC) -- runs first so ctx.v_x_preview is ready for the lateral
             # schedule below (see the "which speed plan" discussion in the module docstring) ---- #
@@ -553,11 +547,8 @@ def run_trial(world, origin_transform, path_x, path_y, path, blueprint, imu_bp, 
             hist["v_y"].append(v_y)
             hist["v_des"].append(ctx.v_ref_curve)
             hist["a_x"].append(a_x)
-            hist["jerk"].append(jerk)
             hist["a_y"].append(a_y)
             hist["yaw_rate"].append(yaw_rate_deg)
-            hist["yaw_acc"].append(yaw_acc)
-            hist["jerk_total"].append(jerk_total)
             hist["steer_deg"].append(math.degrees(delta))
             hist["throttle"].append(control.throttle)
             hist["brake"].append(control.brake)

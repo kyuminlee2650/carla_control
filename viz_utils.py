@@ -30,6 +30,7 @@ import datetime
 import math
 import multiprocessing as mp
 import os
+import signal
 import queue
 import subprocess
 import sys
@@ -713,8 +714,16 @@ B2D_COMFORT_LIMITS = {
     "yaw_rate":   (-0.95, 0.95),   # rad/s
     "yaw_acc":    (-1.93, 1.93),   # rad/s^2
     "jerk":       (-4.13, 4.13),   # m/s^3
-    "jerk_total": (0.0, 8.37),     # m/s^3 -- a norm (||j||), always >= 0, so the "lo" half of the
-}                                   # excess formula below is naturally always 0 for this one
+    # Two-sided, matching the scorer's own check: _within_bound(magnitude_jerk, -8.37, +8.37).
+    # It reads like a norm ("|jerk|") but the scored channel is d/dt(|accel|) -- the DERIVATIVE of a
+    # magnitude, which goes negative freely (measured to -40 m/s^3 on a real run, with 70+ ticks
+    # past -8.37 in a single 35 s drive). The old (0.0, 8.37) entry was right for this project's own
+    # hist["jerk_total"] = hypot(jerk_x, jerk_y), a genuine non-negative norm, and drew only the
+    # upper limit line -- which hid every negative-side violation once the panels switched to the
+    # scored channel. For a non-negative signal the extra lower bound is inert, so _band_penalty()'s
+    # use of this entry is unaffected.
+    "jerk_total": (-8.37, 8.37),   # m/s^3
+}
 
 def _band_penalty(values, lo, hi):
     """Mean, band-width-normalized excess-outside-[lo,hi]: 0 if the signal never left the band,
@@ -741,14 +750,16 @@ def b2d_comfort_penalty(hist):
     Comfort/smoothness terms only (a_x/a_y/yaw_rate/yaw_acc/jerk/jerk_total) -- lateral_error and
     lap_time score tracking/route-progress, a different thing, and were dropped from this scoring
     entirely rather than just excluded from "total"."""
+    hist = add_scored_comfort_channels(hist)
     terms = {}
     terms["a_x"] = _band_penalty(hist.get("a_x", []), *B2D_COMFORT_LIMITS["a_x"])
     terms["a_y"] = _band_penalty(hist.get("a_y", []), *B2D_COMFORT_LIMITS["a_y"])
     yaw_rate_rad = [math.radians(v) for v in hist.get("yaw_rate", [])]
     terms["yaw_rate"] = _band_penalty(yaw_rate_rad, *B2D_COMFORT_LIMITS["yaw_rate"])
-    terms["yaw_acc"] = _band_penalty(hist.get("yaw_acc", []), *B2D_COMFORT_LIMITS["yaw_acc"])
-    terms["jerk"] = _band_penalty(hist.get("jerk", []), *B2D_COMFORT_LIMITS["jerk"])
-    terms["jerk_total"] = _band_penalty(hist.get("jerk_total", []), *B2D_COMFORT_LIMITS["jerk_total"])
+    terms["yaw_acc"] = _band_penalty(hist.get("yaw_acc_scored", []), *B2D_COMFORT_LIMITS["yaw_acc"])
+    terms["jerk"] = _band_penalty(hist.get("jerk_scored", []), *B2D_COMFORT_LIMITS["jerk"])
+    terms["jerk_total"] = _band_penalty(hist.get("jerk_total_scored", []),
+                                        *B2D_COMFORT_LIMITS["jerk_total"])
 
     available = [v for v in terms.values() if v is not None]
     terms["total"] = sum(available) if available else None
@@ -905,6 +916,98 @@ def _comfort_channel_series(scorer, kw, start, stop, window_size=7, poly_order=2
     return out
 
 
+# The three comfort channels the scoring module DIFFERENTIATES, and the hist keys the recomputed
+# versions get stored under. Measured against real runs, the differentiated channels are the only
+# ones where this project's own signal and the scored one disagree at all:
+#
+#     channel      corr(control-path, scored)   peak ratio
+#     lon_acc                  1.000               1.00x     <- not differentiated
+#     lat_acc                  1.000               1.00x     <- not differentiated
+#     yaw_rate                 0.997               0.98x     <- not differentiated
+#     yaw_acc                  0.780               1.70x     <- differentiated
+#     lon_jerk                 0.708               1.51x     <- differentiated
+#     |jerk|                   0.291               1.55x     <- differentiated
+#
+# Cause: this project derives them with a CAUSAL low-pass (ImuAcceleration's tau=0.15 filters,
+# a matching tau=0.15 filter on yaw rate) because those ran inside a control loop, while the
+# scorer uses a NON-CAUSAL
+# Savitzky-Golay derivative over each 20-tick segment. Differentiation amplifies high frequency, so
+# the filter choice dominates the result; the undifferentiated channels barely notice it.
+#
+# The scored version is consistently LARGER (1.19x-1.70x on the runs measured), which means a
+# B2D_COMFORT_LIMITS line drawn over the control-path signal UNDER-reports violations: a curve can
+# sit comfortably inside the red lines on a segment the score has already failed.
+SCORED_COMFORT_KEYS = {"jerk": "jerk_scored", "jerk_total": "jerk_total_scored",
+                       "yaw_acc": "yaw_acc_scored"}
+_SCORED_SOURCE = {"jerk": "lon_jerk", "jerk_total": "|jerk|", "yaw_acc": "yaw_acc"}
+
+
+def _scored_key(runs, key):
+    """(hist key, title suffix) for a panel that carries a B2D limit line.
+
+    Prefers the scored channel add_scored_comfort_channels() built; falls back to this project's own
+    control-path series when it could not be built -- a steer=0 hist (longitudinal_PID.py) has no
+    yaw/yaw_rate, so the scorer's inputs cannot be assembled from it at all. The suffix goes in the
+    panel title so the two cases are never confused: without it, the same red limit line would be
+    drawn over two different signals under one label, which is the exact problem this whole change
+    exists to remove.
+    """
+    dest = SCORED_COMFORT_KEYS[key]
+    if any(_get(h, dest) is not None for h in runs.values()):
+        return dest, ""
+    # No fallback signal exists any more -- the control-path jerk/yaw_acc channels are gone, so a
+    # hist the scorer's inputs cannot be assembled from (no yaw/yaw_rate) simply has nothing to
+    # draw here, and _dynamics_panel()'s "not recorded" message is the honest thing to show.
+    return dest, ""
+
+
+def add_scored_comfort_channels(hist, tools_dir=None, per_step=20):
+    """hist + the differentiated comfort channels recomputed the way the SCORING module computes
+    them, under the SCORED_COMFORT_KEYS names. Returns hist unchanged if they can't be built.
+
+    Post-run, not per-tick, and that is not a shortcut: the scorer's derivative is a non-causal
+    savgol over a 20-sample window, so tick k's value depends on ticks k+1..k+3 and simply does not
+    exist yet inside a live control loop. Deriving it here from what hist already carries (yaw,
+    yaw_rate, a_x, a_y) also means every run ever logged gets it retroactively, with no change to
+    any controller script.
+
+    Two properties worth knowing before plotting the result:
+      * it is SEGMENT-WISE. The scorer filters each 20-tick block independently, so the series has
+        a real discontinuity every second. That is what is scored, so it is drawn as-is rather than
+        smoothed over -- and it makes the segment structure the metric works in visible.
+      * the last partial segment (< per_step ticks) has no scored value at all; the scorer drops it.
+        Those ticks are NaN here, which matplotlib skips, so the panel just ends slightly early.
+    """
+    scorer, kw = _b2d_comfort_inputs(hist, tools_dir)
+    if kw is None:
+        return hist
+    n = len(kw["angular_velocity"])
+    if n <= per_step:
+        return hist
+
+    out = {src: [] for src in _SCORED_SOURCE.values()}
+    covered = 0
+    for start in range(0, n, per_step):
+        stop = start + per_step
+        if stop > n:
+            break
+        detail = _comfort_channel_series(scorer, kw, start, stop)
+        if detail is None:
+            return hist
+        for src in out:
+            out[src].append(detail[src][0])
+        covered = stop
+
+    total = len(hist.get("t", [])) or n
+    merged = dict(hist)
+    for key, dest in SCORED_COMFORT_KEYS.items():
+        values = np.concatenate(out[_SCORED_SOURCE[key]])
+        padded = np.full(total, np.nan)
+        padded[:min(covered, total)] = values[:min(covered, total)]
+        merged[dest] = padded
+    return merged
+
+
 def b2d_comfort_report(hist, tools_dir=None, per_step=20, tick_s=0.05):
     """Why b2d_comfortness() came out the way it did: one row per scored 1-second segment.
 
@@ -995,13 +1098,15 @@ def print_comfort_report(hist, target_speed_ms=None, tools_dir=None, failures_on
     return report
 
 
-def print_error_summary(hist, target_speed_ms):
+def print_error_summary(hist, target_speed_ms, lateral=True):
     """RMSE / max / mean of each tracked error, plus mean/peak magnitude of the raw longitudinal
     and lateral dynamics signals, over the whole run.
 
     The dynamics rows are printed as sections that appear only when this stack actually recorded
-    them -- a steer=0 run (e.g. longitudinal_PID.py) has no yaw_rate/yaw_acc/a_y, and the section
-    is skipped rather than printed empty.
+    them, and the section is skipped rather than printed empty. Pass lateral=False for a stack with
+    no lateral control at all (longitudinal_mpc.py / longitudinal_PID.py pin steer at 0): those DO
+    log the yaw channels, because the scored comfort channels and Comfortness need all six, so the
+    "only print what was recorded" gating cannot tell them from a run that actually steers.
     """
     if not hist["t"]:
         return
@@ -1025,14 +1130,28 @@ def print_error_summary(hist, target_speed_ms):
         rmse, peak, bias = stats
         print(f"  {name}  RMSE={rmse:7.3f} {unit:<3}  max|e|={peak:7.3f} {unit:<3} ")
 
+    # Every jerk/yaw-acceleration number in this project now comes from ONE place: the scoring
+    # module's own derivative, rebuilt by add_scored_comfort_channels(). The figures already plot
+    # those; this table used to print a differently-derived pair (a causal tau=0.15 low-pass
+    # derivative) under the same names, so the printed peak and the scored peak disagreed by up to
+    # 1.6x and a run could read as clear of the 4.13 limit here while the score had already failed
+    # the segment. Same signal everywhere, or the numbers cannot be compared to each other.
+    hist = add_scored_comfort_channels(hist)
     long_rows = (("accel a_x   ", "m/s^2", hist.get("a_x", [])),
-                ("jerk        ", "m/s^3", hist.get("jerk", [])),
-                ("|jerk| total", "m/s^3", hist.get("jerk_total", [])))
+                ("jerk        ", "m/s^3", hist.get("jerk_scored", [])),
+                ("|jerk| total", "m/s^3", hist.get("jerk_total_scored", [])))
     lat_rows = (("yaw rate ", "deg/s  ", hist.get("yaw_rate", [])),
-               ("yaw accel", "rad/s^2", hist.get("yaw_acc", [])),
+               ("yaw accel", "rad/s^2", hist.get("yaw_acc_scored", [])),
                ("accel a_y", "m/s^2  ", hist.get("a_y", [])))
 
-    for section, rows in (("longitudinal dynamics", long_rows), ("lateral dynamics", lat_rows)):
+    # lateral=False drops the whole lateral block for a stack that has no lateral control at all
+    # (longitudinal_mpc.py pins steer at 0). Those runs DO log yaw/yaw_rate/a_y -- b2d_comfortness()
+    # needs all six channels or it returns None -- so the "only print what was recorded" gating
+    # below cannot tell them apart from a run that actually steers; the caller has to say.
+    sections = [("longitudinal dynamics", long_rows)]
+    if lateral:
+        sections.append(("lateral dynamics", lat_rows))
+    for section, rows in sections:
         printed_header = False
         for name, unit, series in rows:
             stats = magnitude_stats(series)
@@ -1310,6 +1429,55 @@ def _b2d_limit_handle(label="B2D comfort limit"):
     return plt.Line2D([0], [0], label=label, **_B2D_LIMIT_STYLE)
 
 
+def close_all_figures(*_):
+    """Close every open matplotlib figure. Bound to a key on each window and to SIGINT by _show()."""
+    plt.close("all")
+
+
+def _show():
+    """plt.show(), but every open window closes together on `q`/`escape` or on Ctrl+C.
+
+    Stock matplotlib makes a batch of figures tedious in exactly the way this repo produces them:
+    plt.show() blocks until the LAST window is closed, its default `q` keymap closes only the
+    focused one, and Ctrl+C in the terminal is swallowed by the GUI event loop -- so a run that
+    drew eight panels had to be dismissed eight times before the script would exit.
+
+    Both escapes are installed here rather than left to the caller so that every figure this module
+    shows behaves the same way, whichever entry point drew it:
+      * `q` / `escape` on any window  -> closes all of them (stock `q` closes just that one)
+      * Ctrl+C in the terminal        -> same, via a SIGINT handler restored on the way out
+
+    The SIGINT handler is only installable from the main thread (signal.signal raises otherwise, e.g.
+    under a worker thread or some notebook kernels); that case falls back to key-only, which is why
+    the whole install is guarded rather than assumed.
+    """
+    figs = [plt.figure(n) for n in plt.get_fignums()]
+    if not figs:
+        return
+    for fig in figs:
+        fig.canvas.mpl_connect(
+            "key_press_event",
+            lambda ev: close_all_figures() if ev.key in ("q", "escape") else None)
+
+    previous = None
+    try:
+        previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, close_all_figures)
+    except (ValueError, OSError):
+        previous = None      # not the main thread -- key-only, see docstring
+
+    print(f"  ({len(figs)} figure(s) open -- press q or esc on any window, or Ctrl+C here, "
+          f"to close them all)")
+    try:
+        plt.show()          # the real one -- everything else in this module calls _show()
+    finally:
+        if previous is not None:
+            try:
+                signal.signal(signal.SIGINT, previous)
+            except (ValueError, OSError):
+                pass
+
+
 def _save(fig, out_dir, stem):
     out_path = os.path.join(out_dir, f"{stem}.png")
     # bbox_inches="tight": recrops to whatever the figure actually drew, so a fig-level legend
@@ -1331,7 +1499,7 @@ def plot_lateral(hist, title="Lateral tracking performance"):
     plot_comparison() instead -- it reuses the same _error_multi/_dynamics_panel helpers this
     function calls with multi=True, in its own dedicated figures rather than overlaying them here.
     """
-    runs, colors = {"": hist}, {"": COLOR_BLUE}
+    runs, colors = {"": add_scored_comfort_channels(hist)}, {"": COLOR_BLUE}
     fig, (ax_ey, ax_eth, ax_yaw, ax_r, ax_racc, ax_vy, ax_ay, ax_steer) = _panels(
         title, n_rows=4, figsize=(15, 13))
 
@@ -1348,9 +1516,11 @@ def plot_lateral(hist, title="Lateral tracking performance"):
     _title(ax_yaw, "Vehicle heading vs. road heading")
     _legend(ax_yaw)
 
-    _dynamics_panel(ax_r, runs, colors, False, "yaw_rate", "$r$ (deg/s)", "Yaw rate")
+    _dynamics_panel(ax_r, runs, colors, False, "yaw_rate", r"$\dot\psi$ (deg/s)", "Yaw rate")
     _b2d_limit_lines(ax_r, *(math.degrees(v) for v in B2D_COMFORT_LIMITS["yaw_rate"]))
-    _dynamics_panel(ax_racc, runs, colors, False, "yaw_acc", r"$\dot{r}$ (rad/s$^2$)", "Yaw acceleration")
+    _k, _sfx = _scored_key(runs, "yaw_acc")
+    _dynamics_panel(ax_racc, runs, colors, False, _k, r"$\ddot\psi$ (rad/s$^2$)",
+                    "Yaw acceleration" + _sfx)
     _b2d_limit_lines(ax_racc, *B2D_COMFORT_LIMITS["yaw_acc"])
     # ref_key="v_y_hat": when a run logged a Kalman-filter v_y estimate alongside ground truth
     # (mpc_mpc_KF.py's "mpc-kf" controller), it's overlaid as a dashed line in the same color --
@@ -1518,7 +1688,7 @@ def plot_trajectory_fit(fwd, lat, path, vx_spline, s_max_wp, s_mid, v_seg, vx_pr
     return fig
 
 
-def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking performance"):
+def plot_longitudinal(hist, target_speed_ms, title="Longitudinal speed tracking performance"):
     """fig 2: speed error, speed pair, longitudinal acceleration, longitudinal jerk, total jerk
     magnitude, control input u -- for one controller's single run.
 
@@ -1531,7 +1701,7 @@ def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking perfor
     hist: one run's hist dict. For comparing several controllers' runs against each other, see
     plot_comparison() instead (reuses _error_multi/_dynamics_panel with multi=True there).
     """
-    runs, colors = {"": hist}, {"": COLOR_BLUE}
+    runs, colors = {"": add_scored_comfort_channels(hist)}, {"": COLOR_BLUE}
     fig, (ax_ev, ax_v, ax_a, ax_j, ax_jtot, ax_cmd) = _panels(title)
 
     _error_multi(ax_ev, runs, colors, False, "$e_v$ (m/s)", "Speed error (reference - measured)",
@@ -1555,11 +1725,13 @@ def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking perfor
                     ref_key="a_cmd", legend=False,
                     series_name="measured $a_x$", ref_name="commanded $a_x$")
     _b2d_limit_lines(ax_a, *B2D_COMFORT_LIMITS["a_x"])
-    _dynamics_panel(ax_j, runs, colors, False, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk (ride comfort)",
-                    legend=False)
+    _k, _sfx = _scored_key(runs, "jerk")
+    _dynamics_panel(ax_j, runs, colors, False, _k, "jerk (m/s$^3$)",
+                    "Longitudinal jerk" + _sfx, legend=False)
     _b2d_limit_lines(ax_j, *B2D_COMFORT_LIMITS["jerk"])
-    _dynamics_panel(ax_jtot, runs, colors, False, "jerk_total", "|jerk| (m/s$^3$)",
-                    "Total jerk magnitude (long. + lat.)", fill_color=COLOR_PURPLE, legend=False)
+    _k, _sfx = _scored_key(runs, "jerk_total")
+    _dynamics_panel(ax_jtot, runs, colors, False, _k, "|jerk| (m/s$^3$)",
+                    "Total jerk magnitude" + _sfx, fill_color=COLOR_PURPLE, legend=False)
     _b2d_limit_lines(ax_jtot, *B2D_COMFORT_LIMITS["jerk_total"])
 
     ax_cmd.axhline(0.0, color=COLOR_AXIS, linewidth=1)
@@ -1570,10 +1742,31 @@ def plot_longitudinal(hist, target_speed_ms, title="Longitudinal tracking perfor
     ax_cmd.fill_between(t, u, 0, where=(u <= 0), color=COLOR_RED, alpha=0.15, interpolate=True)
     ax_cmd.set_ylim(-1.05, 1.05)
     ax_cmd.set_ylabel("$u$")
-    _title(ax_cmd, "Longitudinal control input $u$  (u > 0: throttle, u < 0: brake)")
+    _title(ax_cmd, "Longitudinal control input $u$")
 
     _bottom_legend(fig, _panel_handles([ax_v, ax_a]) + [_b2d_limit_handle()])
     return fig
+
+
+def _draw_reference_path(ax, path_x, path_y, label="desired path"):
+    """The desired path, drawn as a corridor + centreline rather than one more line.
+
+    It used to be COLOR_MUTED at linewidth 3, dashed -- a thicker, greyer version of exactly what
+    the trial trajectories are, which is the one thing it must not look like: with 3+ trials
+    overlapping it, "which of these is the reference" came down to spotting a grey among five
+    colours. Two strokes fix that by making it a different KIND of mark:
+
+      * a wide, very pale band UNDER everything (zorder 1) -- reads as the road/corridor, gives the
+        eye the route's shape at a glance, and cannot hide a trial line because it sits below them
+      * a thin near-black dashed centreline ON TOP (zorder 6) -- the exact reference, in the one
+        colour COMPARE_COLORS never uses, thin enough that trials stay readable through it
+
+    Trials are 2 px solid/dashed colour at zorder ~2, so neither stroke competes with them.
+    """
+    ax.plot(path_x, path_y, color=COLOR_INK, linewidth=9, alpha=0.10,
+            solid_capstyle="round", solid_joinstyle="round", zorder=1)
+    ax.plot(path_x, path_y, color=COLOR_INK, linewidth=1.4, linestyle=(0, (7, 4)),
+            alpha=0.85, zorder=6, label=label)
 
 
 def plot_trajectory(path_x, path_y, hist, title="Desired path vs. ego trajectory"):
@@ -1589,10 +1782,9 @@ def plot_trajectory(path_x, path_y, hist, title="Desired path vs. ego trajectory
 
     ax.plot(hist["x"], hist["y"], color=COLOR_ORANGE, linewidth=2, solid_capstyle="round",
            label="ego trajectory")
-    ax.plot(path_x, path_y, color=COLOR_MUTED, linewidth=3, linestyle="--", zorder=4,
-           label="desired path")
-    ax.scatter([path_x[0]], [path_y[0]], color=COLOR_BLUE, zorder=5, label="start")
-    ax.scatter([path_x[-1]], [path_y[-1]], color=COLOR_RED, marker="*", s=140, zorder=5, label="goal")
+    _draw_reference_path(ax, path_x, path_y)
+    ax.scatter([path_x[0]], [path_y[0]], color=COLOR_BLUE, zorder=7, label="start")
+    ax.scatter([path_x[-1]], [path_y[-1]], color=COLOR_RED, marker="*", s=140, zorder=7, label="goal")
     ax.set_xlabel("$x$ (m)")
     ax.set_ylabel("$y$ (m)")
     _title(ax, title)
@@ -1612,11 +1804,11 @@ def plot_results(path_x, path_y, hist, target_speed_ms, out_dir,
     if summary:
         print_error_summary(hist, target_speed_ms)
 
-    suffix = f" — {label}" if label else ""
+    suffix = f" - {label}" if label else ""
     figures = [
         ("lateral", plot_lateral(hist, f"Lateral tracking performance{suffix}")),
         ("longitudinal", plot_longitudinal(hist, target_speed_ms,
-                                           f"Longitudinal tracking performance{suffix}")),
+                                           f"Longitudinal speed tracking performance{suffix}")),
         ("trajectory", plot_trajectory(path_x, path_y, hist)),
     ]
 
@@ -1626,7 +1818,7 @@ def plot_results(path_x, path_y, hist, target_speed_ms, out_dir,
         print(f"Figure saved: {path}")
 
     if show:
-        plt.show()  # blocks until every window is closed
+        _show()
     for _, fig in figures:
         plt.close(fig)
     return out_paths
@@ -1654,6 +1846,9 @@ def plot_comparison(results, path_x, path_y, out_dir, target_speed_ms, show=True
         print(f"\n### {run_label} ###")
         print_error_summary(hist, target_speed_ms)
 
+    # every panel carrying a B2D_COMFORT_LIMITS line must plot the signal the SCORE was computed
+    # from, not this project's own control-path derivative -- see add_scored_comfort_channels()
+    results = {k: add_scored_comfort_channels(v) for k, v in results.items()}
     colors = dict(zip(results, COMPARE_COLORS))
     linestyles = dict(zip(results, COMPARE_LINESTYLES))
     os.makedirs(out_dir, exist_ok=True)
@@ -1666,13 +1861,9 @@ def plot_comparison(results, path_x, path_y, out_dir, target_speed_ms, show=True
     for run_label, hist in results.items():
         ax.plot(hist["x"], hist["y"], color=colors[run_label], linewidth=2,
                linestyle=linestyles[run_label], solid_capstyle="round", label=run_label)
-    # Reference path drawn LAST and on top (zorder above every trial line, which default to ~2) and
-    # thicker than any of them, so it stays legible under 3+ overlapping trial trajectories instead
-    # of getting buried under whichever trial happens to be plotted last.
-    ax.plot(path_x, path_y, color=COLOR_MUTED, linewidth=3, linestyle="--", zorder=4,
-           label="desired path")
-    ax.scatter([path_x[0]], [path_y[0]], color=COLOR_BLUE, zorder=5, label="start")
-    ax.scatter([path_x[-1]], [path_y[-1]], color=COLOR_RED, marker="*", s=140, zorder=5, label="goal")
+    _draw_reference_path(ax, path_x, path_y)
+    ax.scatter([path_x[0]], [path_y[0]], color=COLOR_BLUE, zorder=7, label="start")
+    ax.scatter([path_x[-1]], [path_y[-1]], color=COLOR_RED, marker="*", s=140, zorder=7, label="goal")
     ax.set_xlabel("$x$ (m)")
     ax.set_ylabel("$y$ (m)")
     _title(ax, "Desired path vs. driven trajectories")
@@ -1694,11 +1885,12 @@ def plot_comparison(results, path_x, path_y, out_dir, target_speed_ms, show=True
     _error_multi(ax_eth, results, colors, True, r"$e_\psi$ (deg)", "Heading error", "deg",
                 lambda h: _get(h, "e_theta"), legend=False, linestyles=linestyles)
     _rmse_box_multi(ax_eth, results, colors, "e_theta", "deg")
-    _dynamics_panel(ax_r, results, colors, True, "yaw_rate", "$r$ (deg/s)", "Yaw rate", legend=False,
+    _dynamics_panel(ax_r, results, colors, True, "yaw_rate", r"$\dot\psi$ (deg/s)", "Yaw rate", legend=False,
                     linestyles=linestyles)
     _b2d_limit_lines(ax_r, *(math.degrees(v) for v in B2D_COMFORT_LIMITS["yaw_rate"]))
-    _dynamics_panel(ax_racc, results, colors, True, "yaw_acc", r"$\dot{r}$ (rad/s$^2$)",
-                    "Yaw acceleration", legend=False, linestyles=linestyles)
+    _k, _sfx = _scored_key(results, "yaw_acc")
+    _dynamics_panel(ax_racc, results, colors, True, _k, r"$\ddot\psi$ (rad/s$^2$)",
+                    "Yaw acceleration" + _sfx, legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_racc, *B2D_COMFORT_LIMITS["yaw_acc"])
     _dynamics_panel(ax_ax, results, colors, True, "a_x", "$a_x$ (m/s$^2$)", "Longitudinal acceleration",
                     legend=False, linestyles=linestyles)
@@ -1706,11 +1898,13 @@ def plot_comparison(results, path_x, path_y, out_dir, target_speed_ms, show=True
     _dynamics_panel(ax_ay, results, colors, True, "a_y", "$a_y$ (m/s$^2$)", "Lateral acceleration",
                     legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_ay, *B2D_COMFORT_LIMITS["a_y"])
-    _dynamics_panel(ax_j, results, colors, True, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk",
-                    legend=False, linestyles=linestyles)
+    _k, _sfx = _scored_key(results, "jerk")
+    _dynamics_panel(ax_j, results, colors, True, _k, "jerk (m/s$^3$)",
+                    "Longitudinal jerk" + _sfx, legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_j, *B2D_COMFORT_LIMITS["jerk"])
-    _dynamics_panel(ax_jtot, results, colors, True, "jerk_total", "|jerk| (m/s$^3$)",
-                    "Total jerk magnitude", legend=False, linestyles=linestyles)
+    _k, _sfx = _scored_key(results, "jerk_total")
+    _dynamics_panel(ax_jtot, results, colors, True, _k, "|jerk| (m/s$^3$)",
+                    "Total jerk magnitude" + _sfx, legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_jtot, *B2D_COMFORT_LIMITS["jerk_total"])
 
     # one shared legend for the whole figure, bottom center -- controller-name -> color + dash
@@ -1722,22 +1916,28 @@ def plot_comparison(results, path_x, path_y, out_dir, target_speed_ms, show=True
                   labelcolor=COLOR_INK, fontsize=FONTSIZE_LEGEND, bbox_to_anchor=(0.5, -0.02))
     figures.append(("comparison", fig_cmp))
 
+    # WHERE the Comfortness points went, next to WHAT the trajectories did -- same batch, so it
+    # shows with the rest instead of after them (see _show()).
+    fig_comfort = _comfort_breakdown_fig(results)
+    if fig_comfort is not None:
+        figures.append(("comfort-breakdown", fig_comfort))
+
     # ---- 3. each trial's own lateral/longitudinal pair ---- #
     for run_label, hist in results.items():
-        suffix = f" — {run_label}"
+        suffix = f" - {run_label}"
         stem = run_label.replace(" ", "-")
         figures.append((f"lateral-{stem}",
                         plot_lateral(hist, f"Lateral tracking performance{suffix}")))
         figures.append((f"longitudinal-{stem}",
                         plot_longitudinal(hist, target_speed_ms,
-                                          f"Longitudinal tracking performance{suffix}")))
+                                          f"Longitudinal speed tracking performance{suffix}")))
 
     out_paths = [_save(fig, out_dir, run_name(stem, name)) for stem, fig in figures]
     for path in out_paths:
         print(f"Figure saved: {path}")
 
     if show:
-        plt.show()  # blocks until every window is closed
+        _show()
     for _, fig in figures:
         plt.close(fig)
     return out_paths
@@ -1748,6 +1948,7 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
     _dynamics_panel helpers (multi=True) -- plot_longitudinal() itself is single-run only (see its
     own docstring), so plot_longitudinal_result builds this comparison layout itself instead of
     delegating to it, the same way plot_comparison() does for the full lateral+longitudinal case."""
+    runs = {k: add_scored_comfort_channels(v) for k, v in runs.items()}
     colors = dict(zip(runs, COMPARE_COLORS))
     linestyles = dict(zip(runs, COMPARE_LINESTYLES))
     fig, (ax_ev, ax_v, ax_a, ax_j, ax_jtot, ax_cmd) = _panels(title)
@@ -1771,11 +1972,13 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
     _dynamics_panel(ax_a, runs, colors, True, "a_x", "$a_x$ (m/s$^2$)", "Longitudinal acceleration",
                     ref_key="a_cmd", legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_a, *B2D_COMFORT_LIMITS["a_x"])
-    _dynamics_panel(ax_j, runs, colors, True, "jerk", "jerk (m/s$^3$)", "Longitudinal jerk (ride comfort)",
-                    legend=False, linestyles=linestyles)
+    _k, _sfx = _scored_key(runs, "jerk")
+    _dynamics_panel(ax_j, runs, colors, True, _k, "jerk (m/s$^3$)",
+                    "Longitudinal jerk" + _sfx, legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_j, *B2D_COMFORT_LIMITS["jerk"])
-    _dynamics_panel(ax_jtot, runs, colors, True, "jerk_total", "|jerk| (m/s$^3$)",
-                    "Total jerk magnitude (long. + lat.)", legend=False, linestyles=linestyles)
+    _k, _sfx = _scored_key(runs, "jerk_total")
+    _dynamics_panel(ax_jtot, runs, colors, True, _k, "|jerk| (m/s$^3$)",
+                    "Total jerk magnitude" + _sfx, legend=False, linestyles=linestyles)
     _b2d_limit_lines(ax_jtot, *B2D_COMFORT_LIMITS["jerk_total"])
 
     ax_cmd.axhline(0.0, color=COLOR_AXIS, linewidth=1)
@@ -1786,7 +1989,7 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
                    linestyle=linestyles[run_label], label=run_label)
     ax_cmd.set_ylim(-1.05, 1.05)
     ax_cmd.set_ylabel("$u$")
-    _title(ax_cmd, "Longitudinal control input $u$  (u > 0: throttle, u < 0: brake)")
+    _title(ax_cmd, "Longitudinal control input $u$")
 
     # One handle per controller (color + dash pattern), same as plot_comparison()'s shared legend,
     # plus the two markings that aren't a controller. Built by hand rather than scraped with
@@ -1805,7 +2008,8 @@ def _plot_longitudinal_multi(runs, target_speed_ms, title):
     return fig
 
 
-def plot_longitudinal_result(data, target_speed_ms, out_dir, show=True, summary=True, label="", name=None):
+def plot_longitudinal_result(data, target_speed_ms, out_dir, show=True, summary=True, label="",
+                             name=None, lateral=True):
     """Like plot_results(), but only the longitudinal figure.
 
     For stacks with no lateral control at all (e.g. longitudinal_PID.py, steer pinned at 0) --
@@ -1820,10 +2024,10 @@ def plot_longitudinal_result(data, target_speed_ms, out_dir, show=True, summary=
         for run_label, hist in runs.items():
             if run_label:
                 print(f"\n### {run_label} ###")
-            print_error_summary(hist, target_speed_ms)
+            print_error_summary(hist, target_speed_ms, lateral=lateral)
 
-    suffix = f" — {label}" if label else ""
-    title = f"Longitudinal tracking performance{suffix}"
+    suffix = f" - {label}" if label else ""
+    title = f"Longitudinal speed tracking performance{suffix}"
     if len(runs) > 1:
         fig = _plot_longitudinal_multi(runs, target_speed_ms, title)
     else:
@@ -1834,7 +2038,7 @@ def plot_longitudinal_result(data, target_speed_ms, out_dir, show=True, summary=
     print(f"Figure saved: {out_path}")
 
     if show:
-        plt.show()
+        _show()
     plt.close(fig)
     return out_path
 
@@ -1867,45 +2071,52 @@ def plot_lut_validation(hist_ff, hist_pid, mode, args, out_dir, hist_pidonly=Non
     # the lookup table, and "LUT only / LUT + PID / PID only" reads as one parallel set where
     # "feedforward only / feedforward + PID / PID only" did not. These are display strings built
     # here; validate_lut.py's own results dict keys are separate and untouched.
-    series = [("LUT only", hist_ff, COLOR_AQUA), ("LUT + PID", hist_pid, COLOR_BLUE)]
+    # colour AND dash pattern per trial, index-for-index with COMPARE_LINESTYLES the same way the
+    # multi-run figures pair them: these three curves sit on top of each other for most of a run
+    # (that is the point of the comparison), and colour alone stops separating them where they
+    # overlap -- or in grayscale, or for a red/green-colour-blind reader.
+    series = [("LUT only", hist_ff, COLOR_AQUA, COMPARE_LINESTYLES[0]),
+              ("LUT + PID", hist_pid, COLOR_BLUE, COMPARE_LINESTYLES[1])]
     if hist_pidonly is not None:
-        series.append(("PID only", hist_pidonly, COLOR_ORANGE))
-    ts = {label: np.asarray(hist["t"], dtype=float) for label, hist, _ in series}
+        series.append(("PID only", hist_pidonly, COLOR_ORANGE, COMPARE_LINESTYLES[2]))
+    ts = {label: np.asarray(hist["t"], dtype=float) for label, hist, _, _ in series}
 
-    title = "LUT only vs. LUT+PID" + (" vs. PID only" if hist_pidonly is not None else "")
+    # The trial names used to be spelled out in the suptitle too; they are in the shared legend at
+    # the bottom now, so the title states only what the run was: which a_cmd profile, tracking what.
     fig, (ax_main, ax_err, ax_u) = _panels(
-        f"{title} -- {mode} tracking, {args.profile} profile",
-        n_rows=3, n_cols=1, figsize=(14, 10))
+        f"{args.profile} profile {mode} tracking", n_rows=3, n_cols=1, figsize=(14, 10))
 
     ax_main.plot(ts["LUT only"], hist_ff[ref_key], color=COLOR_MUTED, linewidth=2.2,
                 linestyle="--", label="reference")
-    for label, hist, color in series:
-        ax_main.plot(ts[label], hist[resp_key], color=color, linewidth=1.6, label=label)
+    for label, hist, color, style in series:
+        ax_main.plot(ts[label], hist[resp_key], color=color, linewidth=1.6, linestyle=style,
+                     label=label)
     ax_main.set_ylabel(ylabel)
     _title(ax_main, "Tracking")
-    _legend(ax_main, ncol=len(series) + 1)
 
     ax_err.axhline(0.0, color=COLOR_AXIS, linewidth=1, linestyle="--")
-    for label, hist, color in series:
+    for label, hist, color, style in series:
         err = np.asarray(hist[ref_key], dtype=float) - np.asarray(hist[resp_key], dtype=float)
-        ax_err.plot(ts[label], err, color=color, linewidth=1.4, label=label)
+        ax_err.plot(ts[label], err, color=color, linewidth=1.4, linestyle=style, label=label)
     ax_err.set_ylabel(f"error ({unit})")
     _title(ax_err, "Tracking error (reference - measured)")
-    _legend(ax_err, ncol=len(series))
 
     ax_u.axhline(0.0, color=COLOR_AXIS, linewidth=1)
-    for label, hist, color in series:
-        ax_u.plot(ts[label], hist["u"], color=color, linewidth=1.3, label=label)
+    for label, hist, color, style in series:
+        ax_u.plot(ts[label], hist["u"], color=color, linewidth=1.3, linestyle=style, label=label)
     ax_u.set_ylim(-1.15, 1.15)
     ax_u.set_ylabel("pedal $u$")
     _title(ax_u, "Control input")
-    _legend(ax_u, ncol=len(series))
+
+    # one legend for the figure -- every panel draws the same trials in the same colour and dash,
+    # so repeating it three times only cost plot area. ax_main carries the reference line too.
+    _bottom_legend(fig, _panel_handles([ax_main]))
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = _save(fig, out_dir, run_name(mode, name))
     print(f"Figure saved: {out_path}")
     if show:
-        plt.show()
+        _show()
     plt.close(fig)
     return out_path
 
@@ -1969,7 +2180,7 @@ def plot_lut_raw_distribution(raw, out_dir, trusted_ranges=None, show=True, name
     out_path = _save(fig, out_dir, run_name("lut_raw_distribution", name))
     print(f"Figure saved: {out_path}")
     if show:
-        plt.show()
+        _show()
     plt.close(fig)
     return out_path
 
@@ -2036,7 +2247,7 @@ def plot_lut_surfaces(gear_tables, out_dir, raw=None, show=True, elev=25.0, azim
     out_path = _save(fig, out_dir, run_name("lut_surfaces", name))
     print(f"Figure saved: {out_path}")
     if show:
-        plt.show()
+        _show()
     plt.close(fig)
     return out_path
 
@@ -2102,8 +2313,128 @@ def plot_cornering_stiffness_quadrant(alpha_f, Fyf, mask_f, alpha_r, Fyr, mask_r
         out_path = _save(fig, out_dir, run_name("cornering_stiffness_quadrant", name))
         print(f"Figure saved: {out_path}")
     if show:
-        plt.show()
+        _show()
     plt.close(fig)
+    return out_path
+
+
+# One flat fill for every uncomfort mark in plot_comfort_breakdown(): raster cells, the time-axis
+# strip and the per-channel bars all use COLOR_RED at the same alpha, so the legend swatch is
+# literally the same colour the figure draws with and carries the figure's only colour meaning.
+_UNCOMFORT_CMAP = LinearSegmentedColormap.from_list("uncomfort", [COLOR_RED, COLOR_RED])
+
+
+def _comfort_breakdown_fig(data, tools_dir=None, tick_s=0.05):
+    """WHERE a run lost its Comfortness: a channel x 1-second-segment raster per controller, plus a
+    per-channel tally of how many segments each one broke.
+
+    The score is a pass/fail ratio over fixed 20-tick segments, and a segment fails the moment ONE
+    sample on ONE of six channels leaves its band -- so the single number cannot say whether a run
+    was mildly bad everywhere or catastrophically bad in one spot, nor which channel is responsible.
+    Read the raster down a column for "why did second 7 fail", along a row for "which channel is the
+    repeat offender".
+
+    Cells are a flat fill, not a severity gradient: the metric is a pass/fail judgement, so the
+    figure states the same thing it does -- filled means that channel put that second out of
+    bounds. One colour, one meaning, matching the legend swatch and the bars exactly. (For how far
+    outside a channel actually went, b2d_comfort_report() carries the per-channel min/max and
+    b2d_comfort_penalty() integrates the excess continuously.)
+
+    data: one hist dict, or {label: hist} for several controllers (stacked vertically).
+    """
+    runs = _runs(data)
+    reports = {}
+    for label, hist in runs.items():
+        rep = b2d_comfort_report(hist, tools_dir=tools_dir, tick_s=tick_s)
+        if rep is not None and rep["segments"]:
+            reports[label] = rep
+    if not reports:
+        print("  ! comfort breakdown: 채점 가능한 구간이 없습니다")
+        return None
+
+    names = [n for n, _, _ in _COMFORT_CHANNELS]
+    n_runs = len(reports)
+    fig, axes = plt.subplots(n_runs, 2, figsize=(15, 1.1 + 2.6 * n_runs), squeeze=False,
+                             gridspec_kw={"width_ratios": [4, 1]}, constrained_layout=True)
+    fig.patch.set_facecolor(COLOR_BG)
+    fig.suptitle("B2D Comfortness -- where each 1 s segment was lost",
+                fontsize=FONTSIZE_TITLE, color=COLOR_INK, fontweight="bold")
+
+    for row, (label, rep) in enumerate(reports.items()):
+        ax, ax_bar = axes[row][0], axes[row][1]
+        segs = rep["segments"]
+        grid = np.full((len(names), len(segs)), np.nan)
+        for col, seg in enumerate(segs):
+            for r, nm in enumerate(names):
+                ch = seg["channels"].get(nm)
+                if ch is not None and not ch["ok"]:
+                    grid[r, col] = 1.0          # filled = uncomfort, nothing else encoded
+
+        _style_axes(ax)
+        ax.grid(False)
+        ax.imshow(np.ma.masked_invalid(grid), aspect="auto", cmap=_UNCOMFORT_CMAP,
+                  vmin=0.0, vmax=1.0, alpha=0.75,
+                  extent=(segs[0]["t0"], segs[-1]["t1"], len(names) - 0.5, -0.5),
+                  interpolation="nearest")
+        # a failed segment is any column with at least one filled cell -- mark it on the axis so the
+        # score itself (passed/total) is readable straight off the raster
+        for seg in segs:
+            if not seg["passed"]:
+                ax.axvspan(seg["t0"], seg["t1"], ymin=0, ymax=0.035, color=COLOR_RED, alpha=0.75,
+                           lw=0)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels(names, fontsize=10)
+        ax.set_xlabel("$t$ (s)")
+        title = f"{label}: " if label else ""
+        _title(ax, f"{title}{rep['n_pass']}/{len(segs)} segments pass "
+                   f"= {rep['score']:.4f}", fontsize=FONTSIZE_SUBTITLE - 4)
+
+        _style_axes(ax_bar)
+        counts = [int(np.isfinite(grid[r]).sum()) for r in range(len(names))]
+        ax_bar.barh(range(len(names)), counts, color=COLOR_RED, alpha=0.75)
+        ax_bar.set_yticks(range(len(names)))
+        ax_bar.set_yticklabels([])
+        ax_bar.invert_yaxis()
+        # NOT the number of failed segments: a segment that breaks four channels at once is counted
+        # once in each of those four rows, so these bars sum to well past the failure count in the
+        # title (82 vs 25 on a measured run). Per channel, how many 1 s segments it made uncomfort.
+        ax_bar.set_xlabel("uncomfort segments")
+        ax_bar.set_xlim(0, max(1, len(segs)))
+        for r, c in enumerate(counts):
+            if c:
+                ax_bar.text(c, r, f" {c}", va="center", fontsize=9, color=COLOR_INK)
+        _title(ax_bar, "per channel", fontsize=FONTSIZE_SUBTITLE - 6)
+
+    # One entry for the one colour that carries meaning here: the same COLOR_RED fills the raster
+    # cells, the time-axis strip under them and the per-channel bars, and all three mean the same
+    # thing -- uncomfort. (Cell shading varies in intensity with how far outside the limit the
+    # channel went; any intensity at all is a violation.)
+    # label kept in ASCII: matplotlib's default font ships no Hangul glyphs, so Korean text here
+    # renders as boxes in the saved PNG (every other string this module draws is English too)
+    _bottom_legend(fig, [plt.Rectangle((0, 0), 1, 1, color=COLOR_RED, alpha=0.75,
+                                       label="uncomfort  (1 s segment with any channel out of "
+                                             "bounds)")],
+                   max_ncol=1)
+
+    return fig
+
+
+def plot_comfort_breakdown(data, out_dir=None, show=True, name=None, tools_dir=None, tick_s=0.05):
+    """_comfort_breakdown_fig() as a standalone figure: save it, optionally show it, return the
+    path. plot_comparison() calls the builder directly instead, so the breakdown lands in the same
+    batch of windows as everything else it draws rather than in a second blocking show()."""
+    fig = _comfort_breakdown_fig(data, tools_dir=tools_dir, tick_s=tick_s)
+    if fig is None:
+        return None
+    out_path = None
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = _save(fig, out_dir, run_name("comfort_breakdown", name))
+        print(f"Figure saved: {out_path}")
+    if show:
+        _show()
+    else:
+        plt.close(fig)
     return out_path
 
 
@@ -2153,7 +2484,7 @@ def plot_speed_slip_angle(queued, out_dir=None, show=True, name=None):
         out_path = _save(fig, out_dir, run_name("speed_slip_angle", name))
         print(f"Figure saved: {out_path}")
     if show:
-        plt.show()
+        _show()
     plt.close(fig)
     return out_path
 

@@ -120,8 +120,8 @@ def main():
     speed_filter = LowPassFilter(tau=0.1, dt=args.dt, initial=0.0)
 
     # a_x/a_y off the IMU -- see stanley_PID.py for why (true body-frame values straight from the
-    # sensor, nothing to derive by hand). a_y only exists here to feed jerk_total; nothing plots it
-    # on its own since there's no lateral figure in a steer=0 run.
+    # sensor, nothing to derive by hand). a_y feeds the scored comfort channels below; nothing plots
+    # it on its own since there's no lateral figure in a steer=0 run.
     accel = ImuAcceleration(dt=args.dt)
 
     recorder = None
@@ -132,8 +132,14 @@ def main():
         recorder = VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
                                  width=rec_w, height=rec_h, view=args.record_view)
 
-    hist = {"t": [], "v_x": [], "v_des": [], "a_x": [], "jerk": [], "jerk_total": [],
-            "throttle": [], "brake": []}
+    # yaw/yaw_rate/a_y/a_x_raw/a_y_raw are not plotted by the longitudinal figure -- they are here
+    # so viz_utils can rebuild the SCORED comfort channels (jerk, |jerk|, yaw acceleration) and the
+    # Comfortness score, both of which need all six of the channels B2D's metric_info.json carries.
+    # Steering is pinned to 0, so the yaw channels sit at ~0. The RAW accelerations are logged
+    # because the scoring function runs its own Savitzky-Golay pass and prefers them: handing it an
+    # already low-passed channel double-smooths and scores the run more kindly than it deserves.
+    hist = {"t": [], "v_x": [], "v_des": [], "a_x": [], "a_x_raw": [], "a_y": [], "a_y_raw": [],
+            "yaw": [], "yaw_rate": [], "throttle": [], "brake": []}
 
     # Same warm-up gate as stanley_PID.py: launch from rest under the real PID and hold off on
     # logging until v_x/a_x have actually settled near the profile's own t=0 value (initial_speed,
@@ -168,10 +174,12 @@ def main():
             vel_vec = vehicle.get_velocity()
             v_x = vel_vec.x * math.cos(yaw) + vel_vec.y * math.sin(yaw)  # body-frame forward speed
 
-            accel.step(imu_data)
-            a_x, a_y = accel.a_x, accel.a_y
+            # same source and units as the lateral stacks: the IMU gyroscope's z channel in rad/s,
+            # converted once to the deg/s every hist in this repo stores yaw_rate in
+            yaw_rate_deg = math.degrees(imu_data.gyroscope.z)
 
-            jerk, jerk_total = accel.jerk, accel.jerk_total
+            accel.step(imu_data)
+            a_x, a_y, a_x_raw, a_y_raw = accel.a_x, accel.a_y, accel.a_x_raw, accel.a_y_raw
 
             v_ref = args.initial_speed if not warmed_up else speed_reference(args, (i - log_start_i) * args.dt)
             e_vel = v_ref - v_x
@@ -207,8 +215,11 @@ def main():
             hist["v_x"].append(v_x)
             hist["v_des"].append(v_ref)
             hist["a_x"].append(a_x)
-            hist["jerk"].append(jerk)
-            hist["jerk_total"].append(jerk_total)
+            hist["a_x_raw"].append(a_x_raw)
+            hist["a_y"].append(a_y)
+            hist["a_y_raw"].append(a_y_raw)
+            hist["yaw"].append(math.degrees(yaw))
+            hist["yaw_rate"].append(yaw_rate_deg)
             hist["throttle"].append(control.throttle)
             hist["brake"].append(control.brake)
 

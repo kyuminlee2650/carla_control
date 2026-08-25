@@ -133,8 +133,6 @@ def main():
 
 
     accel = ImuAcceleration(dt=args.dt)
-    yaw_acc_filter = LowPassFilter(tau=0.15, dt=args.dt, initial=0.0)
-    prev_yaw_rate_rad = None
 
     bev = None if args.no_live_view else BevView(path_x, path_y)
 
@@ -146,8 +144,8 @@ def main():
         recorder = VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
                                  width=rec_w, height=rec_h, view=args.record_view)
 
-    hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], "jerk": [],
-            "a_y": [], "yaw_rate": [], "yaw_acc": [], "jerk_total": [], "s": [],
+    hist = {"t": [], "x": [], "y": [], "v_x": [], "v_y": [], "v_des": [], "a_x": [], 
+            "a_y": [], "yaw_rate": [], "s": [],
             "steer_deg": [], "throttle": [], "brake": [], "e_y": [], "yaw": [], "path_yaw": [],
             "e_theta": []}
 
@@ -194,11 +192,7 @@ def main():
             yaw_rate_rad = imu_data.gyroscope.z
             yaw_rate = math.degrees(yaw_rate_rad)  
 
-            jerk, jerk_total = accel.jerk, accel.jerk_total
 
-            yaw_acc = yaw_acc_filter.step(
-                0.0 if prev_yaw_rate_rad is None else (yaw_rate_rad - prev_yaw_rate_rad) / args.dt)
-            prev_yaw_rate_rad = yaw_rate_rad
 
 
             # ---- Stanley + PID ---- #
@@ -255,11 +249,8 @@ def main():
             hist["v_y"].append(v_y)
             hist["v_des"].append(v_ref)
             hist["a_x"].append(a_x)
-            hist["jerk"].append(jerk)
             hist["a_y"].append(a_y)
             hist["yaw_rate"].append(yaw_rate)
-            hist["yaw_acc"].append(yaw_acc)
-            hist["jerk_total"].append(jerk_total)
             hist["s"].append(last_s)
             hist["steer_deg"].append(steer_deg)
             hist["throttle"].append(control.throttle)
