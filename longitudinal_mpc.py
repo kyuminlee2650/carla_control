@@ -118,9 +118,43 @@ ORIGIN_INDEX = 86
 CREEP_SPEED = 0.5            # m/s -- below this the pedal layer coasts rather than brakes; see the
                              # branch in run_trial() for what goes wrong without it
 
+# --warm-start-speed injection: how many ticks to hold the gear by hand, and which gear to force
+# for a given injected speed. final_comparison.py 와 같은 값, 같은 이유다 (그쪽 주석 참고):
+# set_target_velocity() 는 강체 속도만 쓰고 기어박스는 중립(0)에 둔 채라, 자동변속기가 뒤늦게
+# 그 불일치로 물리면서 주입한 속도를 도로 끌어내린다 -- 14 m/s 주입이 스로틀과 무관하게 1 초
+# 만에 9.34 m/s 로 무너지는 것이 측정됐다. 몇 틱만 기어를 손으로 잡아주면 사라진다.
+WARM_START_INJECT_TICKS = 4
+WARM_START_INJECT_GEARS = ((6.0, 2), (10.0, 3), (14.0, 4), (1e9, 5))   # (speed below, gear)
+
+
+# 웜업 = 속도 주입 -> 고정 하한 대기 -> 수렴 게이트. 세 단계 모두 이유가 측정으로 붙어 있다.
+#
+# (1) 왜 주입인가. 정지 출발로 initial_speed 까지 올라오길 기다리는 예전 방식은 전제가 틀렸다.
+#     그 구간의 --controller pid 는 오차가 커서 스로틀이 0.02 <-> 0.95 로 포화를 왕복하고, 그
+#     포화가 리밋 사이클을 먹여살린다: v_x 가 9.07 <-> 10.58 을 주기 ~1 s 로 돌며 30 s 까지
+#     전혀 잦아들지 않는다 (|a_x| 평균 5-10 s 1.70 -> 20-30 s 1.81). 가라앉지 않는 대상에게
+#     "가라앉을 때까지"를 물으니 게이트는 사이클이 0 을 스쳐가는 순간을 잡았을 뿐이었고, 점수
+#     구간이 매번 진동의 임의 위상에서 시작했다. 구르는 출발이면 오차가 작아 u 가 선형 영역
+#     (0.2~0.7) 에 머물고, PID 도 그냥 수렴한다 -- 그래서 게이트가 비로소 의미를 가진다.
+#
+# (2) 왜 고정 하한이 먼저인가. 게이트는 a_x 를 보는데 ImuAcceleration 은 자기 앞 3 샘플을
+#     버리는 동안 a_x 를 0 으로 고정해서 내놓는다 (스폰 직후 가속도계가 -378,000 m/s^2 를
+#     찍기 때문). 그 구간을 게이트에 그냥 물리면 |a_x| = 0 이 조건을 즉시 통과해 버려서,
+#     주입 직후 첫 틱에 핸드오프된다. 그래서 게이트는 이 하한 뒤에만 본다.
+#
+# (3) 왜 a_x 까지 보는가. 속도만 맞추는 걸로는 부족하다는 게 측정으로 나왔다. 주입을
+#     initial_speed + 1 로 해서 핸드오프 v_x 를 9.79 (목표 10) 까지 끌어올려 봤더니, 그 순간
+#     a_x 가 -1.13 m/s^2 였다 -- 얹어준 1 m/s 를 털어내며 감속하는 중. 오차가 작아 제어기는
+#     u ~ 0.01 만 내고, 차는 8.10 까지 가라앉았다가 그 오차로 스로틀을 0.86 까지 포화시켜
+#     리밋 사이클을 다시 켰다 (PID: speed RMSE 0.393 -> 1.057, jerk 평균 1.30 -> 14.49,
+#     Comfortness 0.833 -> 0.000). 그래서 주입은 initial_speed 그대로 두고, v_x 와 a_x 가
+#     둘 다 조용해질 때까지 기다린다.
+WARM_START_SETTLE_S = 0.25   # s -- 게이트를 보기 전 무조건 버리는 하한 (위 (2))
 WARM_START_SPEED_TOL = 0.3   # m/s
-WARM_START_ACCEL_TOL = 0.5   # m/s^2
-WARM_START_TIMEOUT = 15.0    # s -- safety cap in case initial_speed is unreachable
+WARM_START_ACCEL_TOL = 0.3   # m/s^2
+WARM_START_HOLD_TICKS = 5    # 연속으로 이만큼 만족해야 인정 (dt=0.05 기준 0.25 s) -- 한 틱짜리
+                             # 판정은 과도응답이 0 을 지나가는 순간도 통과시킨다
+WARM_START_TIMEOUT = 15.0    # s -- 수렴하지 않을 때의 안전장치. 발동하면 그 사실을 찍는다
 
 
 class SpeedMPC:
@@ -294,11 +328,30 @@ class PidController:
     label = "PID"
 
     def __init__(self, args):
+        self.args = args
         self.pid = PID(kp=args.pid_kp, ki=args.pid_ki, kd=args.pid_kd, dt=args.dt)
         self.filter = LowPassFilter(tau=args.pid_tau, dt=args.dt, initial=0.0)
 
     def reset(self, u):
-        pass   # longitudinal_PID.py never resets its PID at hand-off either; match it exactly
+        """출력 저역통과만 지금 적용된 u 로 다시 시드한다. 적분은 일부러 그대로 둔다.
+
+        적분을 지우면 안 되는 이유: 순수 PID 는 정속 스로틀을 적분항이 들고 있다. MpcController
+        는 reset() 에서 페달 PID 적분을 털어도 되는데, 그건 LUT 피드포워드가 정속분을 대신 내주기
+        때문이다. 여기서 같은 짓을 하면 점수 구간 t=0 에서 스로틀이 0 으로 떨어져 속도가 꺼진다.
+
+        정작 털어야 하는 건 필터 상태다. step() 에서 필터가 PID 와 clipping *사이*에 있는데,
+        PID 의 안티와인드업(functions.PID.step)은 필터 이전의 raw 로 적분만 보호하고 필터 상태는
+        아무도 지키지 않는다. 정지 출발 구간에서는 e=10 m/s -> kp*e=7 이라 필터 상태가 1 을 한참
+        넘겨 올라가고 (alpha = dt/(tau+dt) = 1/3), PID 가 명령을 낮춘 뒤에도 그게 1 밑으로 내려올
+        때까지 스로틀이 1.0 에 붙어 있다. 웜업에서 쌓인 그 잔재가 그대로 점수 구간 t=0 에 얹혀서
+        PID 만 초반에 오버슈트했다 -- MpcController 는 출력 필터를 initial=u 로 재생성하므로 같은
+        잔재가 없어서, 비교 자체도 PID 에게만 불리했다.
+
+        longitudinal_PID.py 는 이 reset 이 없다 (거기도 같은 웜업 게이트를 쓰므로 같은 잔재를
+        안고 t=0 을 출발한다). 예전에는 "그쪽과 정확히 맞춘다"는 이유로 여기도 비워뒀지만, 그건
+        같은 결함을 두 곳에서 재현한 것이지 맞춘 것이 아니다.
+        """
+        self.filter = LowPassFilter(tau=self.args.pid_tau, dt=self.args.dt, initial=u)
 
     def step(self, ctx):
         return clipping(self.filter.step(self.pid.step(ctx.v_ref - ctx.v_x)), 1, -1)
@@ -355,10 +408,11 @@ CONTROLLERS = {
 def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, recorder_factory):
     """Spawn one vehicle, drive it under `controller` for the scored profile, tear it down.
 
-    Same warm-up gate as longitudinal_PID.py: launch from rest under the real controller and hold
-    off on logging until v_x/a_x have actually settled near the profile's own t=0 value
-    (initial_speed, since sin(0) = 0 for sine and the step hasn't happened yet at t=0 for step)
-    instead of faking that starting condition.
+    Warm-up is final_comparison.py's: --warm-start-speed injects the profile's own t=0 value at
+    spawn (initial_speed, since sin(0) = 0 for sine and the step hasn't happened yet at t=0 for
+    step), then a FIXED --warm-start-settle wait is discarded before logging starts. No convergence
+    gate and no timeout -- see WARM_START_SETTLE_S for the measurements that killed the gate.
+    longitudinal_PID.py still carries the old gate; it was deliberately left alone.
     """
     vehicle = world.spawn_actor(blueprint, origin_transform)
 
@@ -380,6 +434,7 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
 
     warmed_up = False
     log_start_i = 0
+    hold = 0            # 웜업 게이트를 연속으로 만족한 틱 수 (WARM_START_HOLD_TICKS 참고)
 
     imu = None
     recorder = None
@@ -390,6 +445,29 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
         # spawned after the priming tick above, so the first world.tick() in the loop below
         # produces this sensor's first queued sample -- one put() per get() keeps them in
         # lockstep for the rest of the trial.
+        # 구르는 출발. 위의 priming tick 뒤에 주입한다 (서스펜션이 한 스텝 간 뒤, 낙하 도중이
+        # 아니라), 스폰이 남긴 회전이 있을 수 있으므로 각속도도 같이 0 으로 눌러준다. 그 다음
+        # 몇 틱은 기어를 손으로 잡는다 -- WARM_START_INJECT_GEARS 참고. steer 는 이 스크립트
+        # 전체에서 0 이므로 forward vector 방향으로만 주면 된다.
+        if args.warm_start_speed > 0:
+            v0 = args.warm_start_speed
+            gear = next(g for lim, g in WARM_START_INJECT_GEARS if v0 < lim)
+            fwd = origin_transform.get_forward_vector()
+            vehicle.set_target_velocity(carla.Vector3D(fwd.x * v0, fwd.y * v0, 0.0))
+            vehicle.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            for _ in range(WARM_START_INJECT_TICKS):
+                hold = carla.VehicleControl()
+                hold.throttle, hold.steer = 0.5, 0.0
+                hold.manual_gear_shift, hold.gear = True, gear
+                vehicle.apply_control(hold)
+                world.tick()
+            release = carla.VehicleControl()
+            release.throttle, release.steer = 0.5, 0.0
+            release.manual_gear_shift = False
+            vehicle.apply_control(release)
+            world.tick()
+            print(f"  rolling start: injected {v0:.1f} m/s in gear {gear}")
+
         imu_queue = queue.Queue()
         imu = world.spawn_actor(imu_bp, carla.Transform(), attach_to=vehicle)
         imu.listen(imu_queue.put)
@@ -399,7 +477,12 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
         for i in range(steps):
             step_start = time.time()
             world.tick()
-            imu_data = imu_queue.get(timeout=2.0)
+            # 10s, not 2s: right after a fresh client.load_world(), the server is still streaming
+            # map assets/compiling shaders, so the first several ticks can take much longer than a
+            # steady-state ~dt-paced tick. Same margin matters on the SECOND trial onward here,
+            # where the previous trial's vehicle/camera teardown overlaps this one's first ticks --
+            # a real hang still raises Empty, just with more margin.
+            imu_data = imu_queue.get(timeout=10.0)
 
             transform = vehicle.get_transform()
             yaw = math.radians(transform.rotation.yaw)
@@ -442,20 +525,27 @@ def run_trial(world, origin_transform, blueprint, imu_bp, controller, args, reco
             follow_with_spectator(world, vehicle)
 
             if not warmed_up:
-                converged = abs(v_x - args.initial_speed) < WARM_START_SPEED_TOL and abs(a_x) < WARM_START_ACCEL_TOL
+                # 하한(고정 대기) 안에서는 게이트를 보지도 않는다 -- 위 (2)
+                past_floor = i * args.dt >= args.warm_start_settle
+                settled = (past_floor
+                           and abs(v_x - args.initial_speed) < WARM_START_SPEED_TOL
+                           and abs(a_x) < WARM_START_ACCEL_TOL)
+                hold = hold + 1 if settled else 0
+                converged = hold >= WARM_START_HOLD_TICKS
                 timed_out = i * args.dt >= WARM_START_TIMEOUT
-                if converged or timed_out:
-                    warmed_up = True
-                    log_start_i = i
-                    controller.reset(u)
-                    status = "converged" if converged else f"timed out after {WARM_START_TIMEOUT:.0f}s"
-                    print(f"[{controller.label}] Warm-start {status}: v_x={v_x:.2f} m/s, "
-                          f"a_x={a_x:.2f} m/s^2 -- logging starts now.")
-                else:
+                if not (converged or timed_out):
                     elapsed = time.time() - step_start
                     if elapsed < args.dt / args.times_run:
                         time.sleep(args.dt / args.times_run - elapsed)
                     continue
+                warmed_up = True
+                log_start_i = i
+                controller.reset(u)
+                status = (f"converged after {i * args.dt:.2f}s" if converged
+                          else f"TIMED OUT after {WARM_START_TIMEOUT:.0f}s (not settled -- the "
+                               f"scored window starts mid-transient)")
+                print(f"[{controller.label}] Warm-start {status}: v_x={v_x:.2f} m/s, "
+                      f"a_x={a_x:.2f} m/s^2 -- logging starts now.")
 
             # recompute now that log_start_i may have just been updated above -- the t used for
             # the controller's step() earlier in this same iteration was based on the pre-handoff
@@ -519,9 +609,23 @@ def main():
     parser.add_argument("--initial-speed", type=float, default=10.0,
                         help="m/s; starting speed, also the sine profile's midline and the step "
                              "profile's pre-step level")
+    parser.add_argument("--warm-start-speed", type=float, default=None,
+                        help="speed (m/s) injected at spawn so the run starts rolling. Default: "
+                             "--initial-speed. Aiming it HIGH to compensate the sag before "
+                             "hand-off is a trap -- see WARM_START_SETTLE_S (3); the convergence "
+                             "gate is what puts t=0 on the profile. Pass 0 to launch from rest "
+                             "instead. The matching gear is "
+                             "forced for a few ticks with it (see WARM_START_INJECT_GEARS) -- "
+                             "without that the injected speed collapses back to ~9.3 m/s within a "
+                             "second no matter the throttle, because set_target_velocity() moves "
+                             "the body and leaves the gearbox in neutral")
+    parser.add_argument("--warm-start-settle", type=float, default=WARM_START_SETTLE_S,
+                        help="seconds discarded before logging starts, to let the un-physical first "
+                             "ticks pass (spawn accelerometer spike, suspension). Not a convergence "
+                             "gate -- a fixed wait; see WARM_START_SETTLE_S for why the gate went")
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
-    parser.add_argument("--duration", type=float, default=20.0, help="scored run length (s)")
-    parser.add_argument("--times-run", type=float, default=2.0, help="how times for simulation running?")
+    parser.add_argument("--duration", type=float, default=15.0, help="scored run length (s)")
+    parser.add_argument("--times-run", type=float, default=5.0, help="how times for simulation running?")
 
     parser.add_argument("--profile", default="constant", choices=("constant", "sine", "step"),
                         help="speed reference shape: flat initial-speed, a sine wave around it, "
@@ -530,8 +634,8 @@ def main():
                              "an emergency-stop-and-restart run: --step-size -<initial speed> "
                              "--step-duration <seconds> brakes to a standstill and then demands the "
                              "original speed again in one step (see functions.speed_reference)")
-    parser.add_argument("--sine-amplitude", type=float, default=0.75, help="sine profile peak deviation (m/s)")
-    parser.add_argument("--sine-period", type=float, default=2.0, help="sine profile period (s)")
+    parser.add_argument("--sine-amplitude", type=float, default=1, help="sine profile peak deviation (m/s)")
+    parser.add_argument("--sine-period", type=float, default=5.0, help="sine profile period (s)")
     parser.add_argument("--step-size", type=float, default=-10.0,
                         help="step profile: m/s added to initial-speed after --step-time (negative = "
                              "a deceleration step). The result is clamped at 0, so anything "
@@ -555,9 +659,9 @@ def main():
     mpc = parser.add_argument_group("--controller mpc+lut+pid / mpc+pid")
     mpc.add_argument("--np", dest="n_p", type=int, default=40, help="prediction horizon (steps)")
     mpc.add_argument("--nc", dest="n_c", type=int, default=5, help="control horizon (steps, <= --np)")
-    mpc.add_argument("--w-v", type=float, default=100, help="speed-tracking weight")
+    mpc.add_argument("--w-v", type=float, default=150, help="speed-tracking weight")
     mpc.add_argument("--w-a", type=float, default=15, help="commanded-acceleration magnitude weight")
-    mpc.add_argument("--w-j", type=float, default=10, help="commanded-acceleration rate (jerk) weight")
+    mpc.add_argument("--w-j", type=float, default=30, help="commanded-acceleration rate (jerk) weight")
     mpc.add_argument("--a-min", type=float, default=-4.05, help="hard lower bound on a_cmd (m/s^2)")
     mpc.add_argument("--a-max", type=float, default=2.4, help="hard upper bound on a_cmd (m/s^2)")
     mpc.add_argument("--lut", default=os.path.join(HERE, "longitudinal_lookup", "longitudinal_lut.npz"))
@@ -572,11 +676,11 @@ def main():
     # group below and feed PidController, whose PID closes on SPEED error. This one closes on
     # ACCELERATION error. Different quantity, different units, gains that are not interchangeable --
     # sharing the flag names would have silently handed each controller the other's tuning.
-    mpc.add_argument("--mpc-pid-kp", type=float, default=0.3,
+    mpc.add_argument("--mpc-pid-kp", type=float, default=0.5,
                      help="mpc+pid (no LUT): accel-tracking PID proportional gain")
     mpc.add_argument("--mpc-pid-ki", type=float, default=0.1,
                      help="mpc+pid (no LUT): accel-tracking PID integral gain")
-    mpc.add_argument("--mpc-pid-kd", type=float, default=0.03,
+    mpc.add_argument("--mpc-pid-kd", type=float, default=0.1,
                      help="mpc+pid (no LUT): accel-tracking PID derivative gain")
     mpc.add_argument("--u-tau", type=float, default=0.6,
                      help="low-pass filter time constant on the pedal command u, before it's applied (s). "
@@ -587,10 +691,10 @@ def main():
 
     # ---- PID ---- #
     pid = parser.add_argument_group("--controller pid")
-    pid.add_argument("--pid-kp", type=float, default=0.5)
+    pid.add_argument("--pid-kp", type=float, default=0.6)
     pid.add_argument("--pid-ki", type=float, default=0.2)
-    pid.add_argument("--pid-kd", type=float, default=0.05)
-    pid.add_argument("--pid-tau", type=float, default=0.1, help="output low-pass time constant (s)")
+    pid.add_argument("--pid-kd", type=float, default=0.3)
+    pid.add_argument("--pid-tau", type=float, default=0.05, help="output low-pass time constant (s)")
 
     parser.add_argument("--comfort-report", action="store_true",
                         help="after the error summary, print the per-segment breakdown behind the "
@@ -622,6 +726,8 @@ def main():
                         help="camera mount for the recording")
     parser.add_argument("--record-res", default="1280x720", help="recording resolution, WxH")
     args = parser.parse_args()
+    if args.warm_start_speed is None:
+        args.warm_start_speed = args.initial_speed
 
     client = carla.Client(args.host, args.port)
     client.set_timeout(60.0)

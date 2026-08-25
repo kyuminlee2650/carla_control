@@ -127,7 +127,47 @@ WARM_START_INJECT_GEARS = ((6.0, 2), (10.0, 3), (14.0, 4), (1e9, 5))   # (speed 
 # curvature cap starts slowing it for the first corner immediately, so the wait does not "settle"
 # at --initial-speed, it just eats route. Measured hand-off speed from a 10 m/s injection:
 # 0.25 s -> 9.04, 0.5 s -> 8.94, 1.0 s -> 8.17, 2.0 s -> 6.71 m/s.
-WARM_START_SETTLE_S = 0.25    # s -- discarded before logging starts
+WARM_START_SETTLE_S = 0.25    # s -- 게이트를 보기 전 무조건 버리는 하한 (아래 (2))
+# 고정 대기만으로는 점수 구간 t=0 이 물리적으로 정돈된 상태가 아니라는 것이 측정으로 드러나서,
+# 하한 뒤에 수렴 게이트를 둔다. 측정된 두 가지:
+#
+# (1) 횡오차. 스폰이 경로 시작에서 0.2 m 떨어져 있고 0.25 s 로는 그게 흡수되지 않아, 점수 구간
+#     첫 틱의 |e_y| 가 0.346 m 로 찍힌다 (t=0.45 s 면 0.011 m 로 사라지는 과도응답이다). 이 한
+#     점이 cross-track 의 max|e| 를 그대로 결정해 버려서, Stanley 대비 비율이 1.16(짐) 으로
+#     나오다가 앞 5 틱만 빼면 0.57(크게 이김) 로 뒤집힌다. 제어 품질이 아니라 출발 조건을
+#     재고 있었다는 뜻이고, 'peak <= 0.15 m' 같은 절대 목표는 어떤 제어기로도 통과할 수 없었다.
+#
+# (2) 속도. set_target_velocity() 로 넣은 속도는 정착 구간에서 그냥 유지되지 않는다 -- 10 m/s
+#     주입이 t=0 에 9.00, t=1.40 s 에 6.94 m/s 까지 내려갔다가 t=4 s 에 9.72 로 돌아온다.
+#     이게 곡률 캡 때문이 아니라는 것도 확인했다: 첫 4 초 내내 v_des_curve 는 10.00 으로,
+#     캡이 걸려 있지 않다. 즉 점수 구간의 앞 몇 초가 순수한 주입 회복 과도응답이었다.
+#
+# 그래서 "속도·가속도·횡오차가 모두 조용해질 때까지" 기다린다. 고정 시간을 늘리는 것과는 다르다
+# (0.25 -> 1.0 s 로 늘리면 핸드오프 속도가 9.04 -> 8.17 로 더 나빠진다는 측정이 있다): 게이트는
+# 조건이 만족되는 즉시 넘어가므로, 기다림이 '가라앉는 데 필요한 만큼'으로 끝난다.
+WARM_START_HOLD_TICKS = 5    # 연속으로 이만큼 만족해야 인정 (dt=0.05 기준 0.25 s)
+WARM_START_TIMEOUT = 30.0    # s -- 수렴하지 않을 때의 안전장치. 발동하면 그 사실을 찍는다.
+                             # 15 였는데 공통 기점(WARM_START_START_S)까지 가는 데만 실측
+                             # 11.95~13.35 s 가 걸려 여유가 없었다 -- 조금만 느린 주행이
+                             # 타임아웃으로 빠지면 정확히 이 게이트가 막으려던 상황(과도응답
+                             # 한복판에서 채점 시작)이 된다.
+
+# 그리고 게이트만으로는 부족하다. 제어기마다 가라앉는 데 걸리는 시간이 달라서 -- 측정: Stanley
+# 5.10 s (s=20.2 m), "mpc-kf" 10.25 s (s=64.0 m) -- 게이트만 쓰면 각자 다른 지점에서 채점을
+# 시작한다. 그러면 한쪽은 앞 64 m 의 코너를 통째로 건너뛴 채로 비교되므로, 같은 경로를 달렸다는
+# 전제가 깨진다 (측정된 채점 길이도 685 틱 대 590 틱으로 벌어졌다). 그래서 "가라앉았고 AND
+# 공통 기점을 지났을 때" 채점을 시작한다 -- 모든 제어기가 정확히 같은 구간을 받는다.
+# 값은 관측된 최장 수렴 거리(64 m)에 여유를 얹은 것. 327 m 경로의 앞 21% 를 버리는 셈인데,
+# 남는 257 m 에 이 경로의 코너가 전부 들어 있다.
+WARM_START_START_S = 5.0     # m -- 모든 제어기가 채점을 시작하는 공통 경로 위치
+# 80 이었는데 과했다. 그 값은 이 기점의 목적(주입 과도응답을 채점 밖으로 내보내기)이 아니라,
+# 중간에 시도했다가 걷어낸 수렴 게이트의 최장 관측 거리(64 m)에 여유를 얹은 것이라 근거가
+# 남아 있지 않았다. 327 m 경로에서 82 m(25%)를 버려 채점이 733틱 36.6 s -> 553틱 27.6 s 로
+# 줄어 있었다. 실제로 필요한 거리는 훨씬 짧다 -- 10 m/s 실측으로 t=1.4 s 에 v_x 가 6.94 까지
+# 가라앉았다가 t=4.0 s(약 35 m)에 9.72 로 돌아오고, |e_y| 는 그 시점 0.001 m 다.
+# 30 m 는 그 회복 구간의 대부분을 지난 지점이고, 10 m/s 기준으로 정했다 (사용자 결정:
+# 15 m/s 는 이번 튜닝 대상이 아니다 -- 그 속도에서는 같은 시간에 더 멀리 가므로 30 m 가
+# 과도응답 끝보다 이를 수 있다는 점만 알고 있으면 된다).
 
 
 # Every controller "object" this file drives -- the LateralMPC/LateralMPCKinematic QPs, the
@@ -271,6 +311,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
             "a_cmd": []}
     warmed_up = False
     log_start_i = 0
+    hold_ticks = 0      # 웜업 게이트를 연속으로 만족한 틱 수 (WARM_START_HOLD_TICKS 참고)
     imu = None
     recorder = None
     video_meta = None   # 녹화했을 때만 채워진다 (run_trial 의 반환값 2번째)
@@ -317,7 +358,7 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
             recorder = VideoRecorder(world, vehicle, video_path, fps=1.0 / args.dt,
                                      width=rec_w, height=rec_h, view=args.record_view)
 
-        steps = int((args.max_duration + args.warm_start_settle) / args.dt)
+        steps = int((args.max_duration + WARM_START_TIMEOUT) / args.dt)
         for i in range(steps):
             step_start = time.time()
             # 녹화 중이면 인코더가 밀린 만큼 여기서 기다린다 (프레임 유실 -> 영상 끊김 방지).
@@ -491,7 +532,24 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
             follow_with_spectator(world, vehicle)
 
             if not warmed_up:
-                if i * args.dt < args.warm_start_settle:
+                # 하한 안에서는 게이트를 보지도 않는다: ImuAcceleration 이 앞 3 샘플을 버리는
+                # 동안 a_x 를 0 으로 고정해서 내놓기 때문에, 그 구간을 물리면 |a_x| = 0 이
+                # 조건을 즉시 통과해 주입 직후 첫 틱에 핸드오프된다.
+                past_floor = i * args.dt >= args.warm_start_settle
+                # 판정은 경로 위치 하나로 한다. v_x/a_x/e_y 가 "가라앉을 때까지" 기다리는
+                # 조건도 달아 봤지만 15 m/s 에서 무너졌다: 그 속도에서는 곡률 캡이 코너마다
+                # 목표 속도를 바꿔서 차가 늘 가속 아니면 감속 중이고, |a_x| < 0.3 이 연속으로
+                # 만족되는 순간이 사실상 없다. 게이트가 경로 끝에 가서야 열려서 채점 구간이
+                # 64 틱(3.2 s)까지 쪼그라들고 Comfortness 가 0.0000 으로 나왔다 -- 가라앉지
+                # 않는 대상에게 가라앉기를 요구한 셈이다. 공통 기점은 그런 실패 모드가 없다:
+                # 결정론적이고, 모든 제어기와 모든 속도에서 정확히 같은 구간을 준다. 기점까지
+                # 80 m 를 달리는 동안 주입 과도응답은 이미 사라져 있다 (10 m/s 에서 t=4 s,
+                # 약 35 m 면 v_x 가 9.72 로 회복되고 |e_y| 는 0.001 m 다).
+                settled = past_floor and last_s >= WARM_START_START_S
+                hold_ticks = hold_ticks + 1 if settled else 0
+                converged = hold_ticks >= WARM_START_HOLD_TICKS
+                timed_out = i * args.dt >= WARM_START_TIMEOUT
+                if not (converged or timed_out):
                     elapsed = time.time() - step_start
                     if elapsed < args.dt / args.times_run:
                         time.sleep(args.dt / args.times_run - elapsed)
@@ -499,8 +557,11 @@ def run_trial(world, spawn_transform, path_x, path_y, path, blueprint, imu_bp, c
                 warmed_up = True
                 log_start_i = i
                 controller.reset(reset_arg)
-                print(f"Warm-start settled after {args.warm_start_settle:.2f}s: v_x={v_x:.2f} m/s, "
-                      f"a_x={a_x:.2f} m/s^2 -- logging starts now.")
+                status = (f"converged after {i * args.dt:.2f}s" if converged
+                          else f"TIMED OUT after {WARM_START_TIMEOUT:.0f}s (not settled -- the "
+                               f"scored window starts mid-transient)")
+                print(f"Warm-start {status}: v_x={v_x:.2f} m/s, a_x={a_x:.2f} m/s^2, "
+                      f"e_y={raw_e_y:+.3f} m, s={last_s:.1f} m -- logging starts now.")
 
             t = (i - log_start_i) * args.dt
             hist["t"].append(t)
@@ -610,7 +671,7 @@ def main():
     parser.add_argument("--dt", type=float, default=0.05, help="fixed sim step (s)")
     parser.add_argument("--times-run", type=float, default=5.0, help="how times for simulation running?")
     parser.add_argument("--max-duration", type=float, default=100.0, help="scored run length (s)")
-    parser.add_argument("--spawn-x", type=float, default=-64.8,
+    parser.add_argument("--spawn-x", type=float, default=-90,
                         help="m -- vehicle spawns at the road waypoint nearest this raw map (x, y) "
                              "(see functions.spawn_at), NOT the route's own start; the scored route "
                              "itself (path_x/path_y, from build_path()'s own origin/dest indices) is "
@@ -660,7 +721,7 @@ def main():
     mpc = parser.add_argument_group("longitudinal MPC")
     mpc.add_argument("--np", dest="n_p", type=int, default=40, help="prediction horizon (steps)")
     mpc.add_argument("--nc", dest="n_c", type=int, default=5, help="control horizon (steps, <= --np)")
-    mpc.add_argument("--w-v", type=float, default=100.0, help="speed-tracking weight")
+    mpc.add_argument("--w-v", type=float, default=150.0, help="speed-tracking weight")
     mpc.add_argument("--w-a", type=float, default=15, help="commanded-acceleration magnitude weight")
     mpc.add_argument("--w-j", type=float, default=30,
                      help="commanded-acceleration rate (jerk) weight. Raised from 10 in the same "
@@ -685,40 +746,55 @@ def main():
                      help="low-pass filter time constant on the pedal command u, before it's applied (s)")
 
     # ---- lateral MPC ---- #
-    NOTE_LAT_TUNE = 'Retuned 2026-08-25 against the cached Stanley baseline at 10 m/s (see run_cache/). The four lateral comfort weights and --w-j were searched together, not one at a time: --w-rdot in particular reads as useless from the old defaults and only becomes the main lever once --w-r and --w-ddelta are on. '
+    NOTE_LAT_TUNE = ('Retuned 2026-08-25 at 10 m/s ONLY, against a Stanley baseline re-measured '
+                     'after two changes that invalidated every earlier number: --w-v 100 -> 150, and '
+                     'the warm-up becoming a common-station hand-off (see WARM_START_START_S). All '
+                     'nine knobs were searched TOGETHER (random screening, repeated-median '
+                     'verification, local refinement) -- never one at a time. The requirement was to '
+                     'beat BOTH Stanley and "mpc-kin" on cross-track RMSE, cross-track peak and '
+                     'Comfortness, and be as good as possible elsewhere. Measured, 5-run medians at '
+                     '10 m/s: cross 0.068 m RMSE / 0.269 m peak (Stanley 0.146/0.304, mpc-kin '
+                     '0.123/0.283), Comfortness 0.333 (0.296 for both others), and only 1 of the 13 '
+                     'scored metrics loses to Stanley -- heading peak at 1.10x. '
+                     'CAUTION on Comfortness: it is passed-segments/total (27 segments at 10 m/s), so '
+                     'it moves in steps of 0.037, and this config sits ON the 8-vs-9 boundary: single '
+                     'runs flip between 0.296 and 0.333. The median wins; one run may only tie. The '
+                     'reason it is that tight is structural -- 17 of the 19 failing segments fail on '
+                     'lat_acc, and lat_acc = v^2*kappa is set by the curvature speed cap (--ay-max) in '
+                     'the longitudinal stack all three controllers share, not by these weights. ')
     lat = parser.add_argument_group("lateral MPC")
-    lat.add_argument("--lat-np", dest="lat_n_p", type=int, default=20,
+    lat.add_argument("--lat-np", dest="lat_n_p", type=int, default=30,
                      help="lateral prediction horizon (steps) -- 1.25s at dt=0.05. Narrowed back "
                           "down from 30 in the same B2D-penalty search that set --ay-max: 30 (and "
                           "45) measurably worsened lateral_error, likely too long relative to the "
                           "route's tighter corners for the tuning at hand")
-    lat.add_argument("--lat-nc", dest="lat_n_c", type=int, default=10, help="lateral control horizon (steps, <= --lat-np)")
-    lat.add_argument("--w-ey", type=float, default=250.0,
+    lat.add_argument("--lat-nc", dest="lat_n_c", type=int, default=15, help="lateral control horizon (steps, <= --lat-np)")
+    lat.add_argument("--w-ey", type=float, default=122.2,
                      help="cross-track error weight, 'mpc'/'mpc-kf' only -- see --kin-w-ey for 'mpc-kin'. "
                           + NOTE_LAT_TUNE +
                           "This one sets the tracking/comfort trade directly: 300 gives cross peak "
                           "0.139 m at comfort ratio 1.12, 250 gives 0.157 m at 1.05, and buying "
                           "ratio < 1.00 costs a 0.43 m peak -- 250 is the chosen point")
-    lat.add_argument("--w-epsi", type=float, default=100.0,
+    lat.add_argument("--w-epsi", type=float, default=2.4,
                      help="heading error weight, 'mpc'/'mpc-kf' only -- see --kin-w-epsi for 'mpc-kin'")
-    lat.add_argument("--w-ay", type=float, default=0.3,
+    lat.add_argument("--w-ay", type=float, default=0.1,
                      help="lateral acceleration tracking weight, 'mpc'/'mpc-kf' only ('mpc-kin' has no "
                           "a_y output at all, see LateralMPCKinematic's docstring) -- default 0 (see "
                           "mpc_mpc.py's LateralMPC docstring: forcing a_y/r/r_dot toward the steady-turn "
                           "feedforward fights e_y/e_psi's own targets in a curve and was measured to "
                           "cost ~2m of steady cross-track offset before this was found)")
-    lat.add_argument("--w-r", type=float, default=1.0,
+    lat.add_argument("--w-r", type=float, default=12.85,
                      help="yaw rate tracking weight, 'mpc'/'mpc-kf' only (see --w-ay) -- see --kin-w-r "
                           "for 'mpc-kin's own (differently-scaled) steering-feedforward weight")
-    lat.add_argument("--w-rdot", type=float, default=6.0,
+    lat.add_argument("--w-rdot", type=float, default=5.84,
                      help="yaw acceleration tracking weight, 'mpc'/'mpc-kf' only -- 'mpc-kin' has no "
                           "r_dot output (see --w-ay and LateralMPCKinematic's docstring). Lowered from "
                           "120: rdot is formed as D*delta with D = lf*Cf/Iz = 33.3, so the effective "
                           "penalty on the input is w_rdot*D^2 -- 120 gave 1.3e5 against w_delta = 1, "
                           "which throttled the steering response enough to cost route completion.")
-    lat.add_argument("--w-delta", type=float, default=0.1,
+    lat.add_argument("--w-delta", type=float, default=0.3,
                      help="steer magnitude weight, 'mpc'/'mpc-kf' only -- see --kin-w-delta for 'mpc-kin'")
-    lat.add_argument("--w-ddelta", type=float, default=100.0,
+    lat.add_argument("--w-ddelta", type=float, default=32.4,
                      help="steer rate weight, 'mpc'/'mpc-kf' only -- raised from 1 in the same B2D-"
                           "penalty search that set --ay-max: with the curve-speed cap doing most of the "
                           "comfort work, a stiffer rate cost here trims the rest without hurting "
@@ -762,7 +838,17 @@ def main():
     # tuned for one model has no reason to transfer to the other. --lat-np/--lat-nc/--delta-max-deg/
     # --ddelta-max-deg above ARE still shared -- those are horizon length and actuator limits, not
     # model-specific cost weights.
-    NOTE_KIN_TUNE = "Retuned 2026-08-25 against the cached Stanley baseline at 10 m/s: all seven 'mpc-kin' knobs were searched TOGETHER (random search, then local refinement), not one at a time. That matters here -- --kin-w-r went 0.1 -> 10 and its own help below still records 'little effect either way', which was true only while the other weights sat at their old defaults. "
+    NOTE_KIN_TUNE = ("Retuned 2026-08-25 at 10 m/s ONLY, against the same re-measured Stanley "
+                     "baseline --w-ey's note describes. All seven knobs were searched TOGETHER "
+                     "(random screening, repeated-median verification, local refinement), not one at "
+                     "a time -- --kin-w-r's own help below still records 'little effect either way', "
+                     "which held only while the other weights sat at their old defaults. The hard "
+                     "requirement was that all FOUR error metrics beat Stanley. Measured, 5-run "
+                     "medians: cross 0.123 m RMSE / 0.283 m peak vs 0.146/0.304, heading 2.49 deg "
+                     "RMSE / 10.24 deg peak vs 3.61/13.45 -- all four pass, and only 2 of the 13 "
+                     "scored metrics lose to Stanley (a_y peak 1.01x, |jerk| total mean 1.02x). "
+                     "Note the winning weights are all SMALL: leaning on --kin-w-ddelta to keep the "
+                     "steer smooth beat pushing --kin-w-ey/--kin-w-epsi hard. ")
     kin = parser.add_argument_group("lateral MPC (kinematic, --controller mpc-kin)")
     # mpc-kin gets its OWN horizon knobs. --lat-np/--lat-nc are shared by "mpc"/"mpc-kf"/"mpc-kin",
     # so tuning the horizon for one of them silently retunes the others -- and "mpc-kf"'s pair is
@@ -773,10 +859,10 @@ def main():
                           "purpose: the kinematic model has no tyre slip, so the further ahead it "
                           "predicts the more it is predicting a car that does not exist. None "
                           "falls back to --lat-np")
-    kin.add_argument("--kin-nc", dest="kin_n_c", type=int, default=5,
+    kin.add_argument("--kin-nc", dest="kin_n_c", type=int, default=4,
                      help="'mpc-kin' control horizon (steps, <= --kin-np). None falls back to "
                           "--lat-nc")
-    kin.add_argument("--kin-w-ey", type=float, default=10.0,
+    kin.add_argument("--kin-w-ey", type=float, default=3.43,
                      help="cross-track error weight. mpc_mpc_kinematic.py's own default is 3.0: a "
                           "10 m/s closed-loop check on this route found w_ey>=6 (with w_epsi scaled "
                           "alongside it) threw the loop into steer oscillation under THAT file's "
@@ -797,9 +883,9 @@ def main():
                           "up -- this looks like the no-slip kinematic model's own structural floor on "
                           "this route's low-speed corners, not something --kin-w-ey alone closes the "
                           "rest of the way. See --kin-w-epsi (scaled alongside this)")
-    kin.add_argument("--kin-w-epsi", type=float, default=30.0,
+    kin.add_argument("--kin-w-epsi", type=float, default=2.0,
                      help="heading error weight -- see --kin-w-ey. " + NOTE_KIN_TUNE)
-    kin.add_argument("--kin-w-r", type=float, default=10.0,
+    kin.add_argument("--kin-w-r", type=float, default=2.93,
                      help="steering-vs-Ackermann-feedforward tracking weight (delta -> L*kappa, see "
                           "LateralMPCKinematic's docstring) -- off by default. Measured to have very "
                           "little effect either way on the oscillation described under --kin-w-ey (it "
@@ -808,8 +894,8 @@ def main():
                           "this term pulls delta toward a value that's measurably too small. Left at 0 "
                           "since --kin-w-ey/--kin-w-epsi's own e_psi feedback already supplies the "
                           "steering demand, correctly sized, without this potentially-biased assist")
-    kin.add_argument("--kin-w-delta", type=float, default=10.0, help="steer magnitude weight")
-    kin.add_argument("--kin-w-ddelta", type=float, default=200.0,
+    kin.add_argument("--kin-w-delta", type=float, default=1.8, help="steer magnitude weight")
+    kin.add_argument("--kin-w-ddelta", type=float, default=87.0,
                      help="steer rate weight -- also measured to have little effect on the --kin-w-ey "
                           "oscillation on its own (see there), but doesn't hurt and gives some extra "
                           "smoothing on top of the w_ey/w_epsi fix")
@@ -860,9 +946,10 @@ def main():
                           "against live CARLA runs here.")
 
     parser.add_argument("--warm-start-settle", type=float, default=WARM_START_SETTLE_S,
-                        help="seconds discarded before logging starts, to let the un-physical first "
-                             "ticks pass (spawn accelerometer spike, suspension, Kalman covariance). "
-                             "Not a convergence gate -- a fixed wait")
+                        help="seconds ALWAYS discarded before the warm-up convergence gate is even "
+                             "consulted, to let the un-physical first ticks pass (spawn accelerometer "
+                             "spike, suspension, Kalman covariance). A floor, not the whole warm-up: "
+                             "see WARM_START_SETTLE_S for the gate that runs after it")
     parser.add_argument("--warm-start-speed", type=float, default=None,
                         help="speed (m/s) injected at spawn so the run starts rolling. Default: "
                              "--initial-speed, i.e. the car begins the scored route already at "

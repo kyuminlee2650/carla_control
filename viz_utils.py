@@ -32,6 +32,7 @@ import multiprocessing as mp
 import os
 import signal
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -361,6 +362,54 @@ def _drawtext_font():
         return None
 
 
+_FFMPEG = None
+
+
+def _ffmpeg_exe():
+    """(실행 파일 경로, drawtext 를 쓸 수 있는지). 아무 ffmpeg 도 못 찾으면 (None, False).
+
+    imageio-ffmpeg 가 들고 오는 정적 빌드를 먼저 보되, 거기에 drawtext 가 없으면 시스템 ffmpeg
+    으로 넘어간다 -- imageio-ffmpeg 0.6.0 이 딸려 보내는 ffmpeg 7.0.2 빌드가 정확히 그렇다.
+    buildconf 에는 --enable-libfreetype 이 적혀 있는데 정작 필터 목록에 drawtext 가 없어서
+    'No such filter: drawtext' 로 죽는다. 라벨은 부가 기능이지만 filter_complex 안에 들어가
+    있으므로 그래프 전체가 실패했고, 그래서 합치기가 통째로 안 됐다 (Ubuntu 22.04 의
+    /usr/bin/ffmpeg 4.4.2 에는 drawtext 가 있다).
+
+    둘 다 drawtext 가 없으면 라벨만 포기하고 합치기 자체는 진행한다 -- 폰트를 못 찾았을 때와
+    같은 처리다. 결과는 프로세스 수명 동안 캐시한다 (합치기/이어붙이기가 매번 -filters 를
+    돌릴 이유가 없다).
+    """
+    global _FFMPEG
+    if _FFMPEG is not None:
+        return _FFMPEG
+
+    candidates = []
+    try:
+        import imageio_ffmpeg
+        candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        pass
+    system = shutil.which("ffmpeg")
+    if system:
+        candidates.append(system)
+
+    fallback = None
+    for exe in candidates:
+        try:
+            out = subprocess.run([exe, "-hide_banner", "-filters"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=30).stdout
+        except Exception:
+            continue
+        if b" drawtext " in out:
+            _FFMPEG = (exe, True)
+            return _FFMPEG
+        if fallback is None:
+            fallback = exe          # 합치기는 되지만 라벨은 못 얹는 빌드
+
+    _FFMPEG = (fallback, False)
+    return _FFMPEG
+
+
 def stack_videos_side_by_side(entries, out_path, fps, delete_inputs=True):
     """여러 주행 영상을 좌우로 이어붙여 하나의 mp4 로 만든다. 성공하면 out_path, 실패하면 None.
 
@@ -380,14 +429,12 @@ def stack_videos_side_by_side(entries, out_path, fps, delete_inputs=True):
     if len(entries) < 2:
         return None
 
-    try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as exc:
-        print(f"  ! 영상 합치기 실패: ffmpeg 를 찾지 못했습니다 ({exc})")
+    exe, can_label = _ffmpeg_exe()
+    if exe is None:
+        print("  ! 영상 합치기 실패: ffmpeg 를 찾지 못했습니다")
         return None
 
-    font = _drawtext_font()
+    font = _drawtext_font() if can_label else None
     longest = max(fr for _, _, fr in entries)
 
     cmd = [exe, "-y", "-hide_banner", "-loglevel", "error"]
@@ -454,14 +501,12 @@ def concat_videos_sequential(entries, out_path, delete_inputs=True):
     if len(entries) < 2:
         return None
 
-    try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as exc:
-        print(f"  ! 영상 이어붙이기 실패: ffmpeg 를 찾지 못했습니다 ({exc})")
+    exe, can_label = _ffmpeg_exe()
+    if exe is None:
+        print("  ! 영상 이어붙이기 실패: ffmpeg 를 찾지 못했습니다")
         return None
 
-    font = _drawtext_font()
+    font = _drawtext_font() if can_label else None
 
     cmd = [exe, "-y", "-hide_banner", "-loglevel", "error"]
     for _, path, _ in entries:
