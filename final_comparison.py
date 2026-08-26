@@ -746,55 +746,60 @@ def main():
                      help="low-pass filter time constant on the pedal command u, before it's applied (s)")
 
     # ---- lateral MPC ---- #
-    NOTE_LAT_TUNE = ('Retuned 2026-08-25 at 10 m/s ONLY, against a Stanley baseline re-measured '
-                     'after two changes that invalidated every earlier number: --w-v 100 -> 150, and '
-                     'the warm-up becoming a common-station hand-off (see WARM_START_START_S). All '
-                     'nine knobs were searched TOGETHER (random screening, repeated-median '
-                     'verification, local refinement) -- never one at a time. The requirement was to '
-                     'beat BOTH Stanley and "mpc-kin" on cross-track RMSE, cross-track peak and '
-                     'Comfortness, and be as good as possible elsewhere. Measured, 5-run medians at '
-                     '10 m/s: cross 0.068 m RMSE / 0.269 m peak (Stanley 0.146/0.304, mpc-kin '
-                     '0.123/0.283), Comfortness 0.333 (0.296 for both others), and only 1 of the 13 '
-                     'scored metrics loses to Stanley -- heading peak at 1.10x. '
-                     'CAUTION on Comfortness: it is passed-segments/total (27 segments at 10 m/s), so '
-                     'it moves in steps of 0.037, and this config sits ON the 8-vs-9 boundary: single '
-                     'runs flip between 0.296 and 0.333. The median wins; one run may only tie. The '
-                     'reason it is that tight is structural -- 17 of the 19 failing segments fail on '
-                     'lat_acc, and lat_acc = v^2*kappa is set by the curvature speed cap (--ay-max) in '
-                     'the longitudinal stack all three controllers share, not by these weights. ')
+    NOTE_LAT_TUNE = (
+                     'Retuned 2026-08-26 at 10 AND 15 m/s together, against the cached Stanley baseline in '
+                     'run_cache/ (10 m/s cross 0.135/0.303 m, heading 3.31/13.24 deg, Comfortness 0.270; 15 '
+                     'm/s 0.160/0.436 m, 3.59/14.88 deg, 0.097). All nine knobs were searched TOGETHER '
+                     '(population perturbation -- every weight jittered log-normally at once, never one at a '
+                     'time), scored on repeated medians, and the finalists re-verified over 15 runs per speed. '
+                     'The requirement was: beat BOTH Stanley and "mpc-kin" on cross-track RMSE and peak at '
+                     'both speeds, hold cross-track RMSE <= 0.07 m / peak <= 0.17 m at 10 m/s, and hold the '
+                     'BEST Comfortness of the three at both speeds. Measured, 15-run medians -- 10 m/s: cross '
+                     '0.041 m RMSE / 0.121 m peak, heading 2.52/12.10 deg, Comfortness 0.371 (mpc-kin 0.333, '
+                     'Stanley 0.270); 15 m/s: cross 0.047/0.192 m, heading 2.52/12.36 deg, Comfortness 0.129 '
+                     '(mpc-kin 0.097, Stanley 0.097). CAUTION on Comfortness: it is passed-segments/total (35 '
+                     'segments at 10 m/s, 31 at 15), so it moves in steps of ~0.03 and single runs flip by one '
+                     'segment -- rank configs on repeated medians only. At 15 m/s the margin over Stanley IS '
+                     'one segment; it held over 9- and 15-run medians but do not expect a single run to show '
+                     'it. The reason it is that tight is structural: most failing segments fail on lat_acc, '
+                     'and lat_acc = v^2*kappa is set by the curvature speed cap (--ay-max) in the longitudinal '
+                     'stack all three controllers share, not by these weights.')
     lat = parser.add_argument_group("lateral MPC")
-    lat.add_argument("--lat-np", dest="lat_n_p", type=int, default=30,
-                     help="lateral prediction horizon (steps) -- 1.25s at dt=0.05. Narrowed back "
-                          "down from 30 in the same B2D-penalty search that set --ay-max: 30 (and "
-                          "45) measurably worsened lateral_error, likely too long relative to the "
-                          "route's tighter corners for the tuning at hand")
-    lat.add_argument("--lat-nc", dest="lat_n_c", type=int, default=15, help="lateral control horizon (steps, <= --lat-np)")
-    lat.add_argument("--w-ey", type=float, default=122.2,
+    lat.add_argument("--lat-np", dest="lat_n_p", type=int, default=22,
+                     help="lateral prediction horizon (steps) -- 1.1s at dt=0.05. Set by the joint "
+                          "10+15 m/s search NOTE_LAT_TUNE describes, together with --lat-nc; "
+                          "the pair was searched alongside the weights, not fixed first. Longer "
+                          "horizons (28-35) were sampled and lost: they smooth the corner entry "
+                          "but give back cross-track peak on this route's tighter corners")
+    lat.add_argument("--lat-nc", dest="lat_n_c", type=int, default=9, help="lateral control horizon (steps, <= --lat-np)")
+    lat.add_argument("--w-ey", type=float, default=637.9681,
                      help="cross-track error weight, 'mpc'/'mpc-kf' only -- see --kin-w-ey for 'mpc-kin'. "
                           + NOTE_LAT_TUNE +
-                          "This one sets the tracking/comfort trade directly: 300 gives cross peak "
-                          "0.139 m at comfort ratio 1.12, 250 gives 0.157 m at 1.05, and buying "
-                          "ratio < 1.00 costs a 0.43 m peak -- 250 is the chosen point")
-    lat.add_argument("--w-epsi", type=float, default=2.4,
+                          "This one sets the tracking/comfort trade directly and the 2026-08-26 "
+                          "search pushed it far higher than the old 122: paired with --w-ddelta "
+                          "~99 and --w-epsi ~25 it buys cross-track peak 0.121 m at 10 m/s "
+                          "WITHOUT losing Comfortness, which is the combination single-weight "
+                          "sweeps of this knob never found")
+    lat.add_argument("--w-epsi", type=float, default=24.8441,
                      help="heading error weight, 'mpc'/'mpc-kf' only -- see --kin-w-epsi for 'mpc-kin'")
-    lat.add_argument("--w-ay", type=float, default=0.1,
+    lat.add_argument("--w-ay", type=float, default=0.2293,
                      help="lateral acceleration tracking weight, 'mpc'/'mpc-kf' only ('mpc-kin' has no "
                           "a_y output at all, see LateralMPCKinematic's docstring) -- default 0 (see "
                           "mpc_mpc.py's LateralMPC docstring: forcing a_y/r/r_dot toward the steady-turn "
                           "feedforward fights e_y/e_psi's own targets in a curve and was measured to "
                           "cost ~2m of steady cross-track offset before this was found)")
-    lat.add_argument("--w-r", type=float, default=12.85,
+    lat.add_argument("--w-r", type=float, default=4.0009,
                      help="yaw rate tracking weight, 'mpc'/'mpc-kf' only (see --w-ay) -- see --kin-w-r "
                           "for 'mpc-kin's own (differently-scaled) steering-feedforward weight")
-    lat.add_argument("--w-rdot", type=float, default=5.84,
+    lat.add_argument("--w-rdot", type=float, default=4.1942,
                      help="yaw acceleration tracking weight, 'mpc'/'mpc-kf' only -- 'mpc-kin' has no "
                           "r_dot output (see --w-ay and LateralMPCKinematic's docstring). Lowered from "
                           "120: rdot is formed as D*delta with D = lf*Cf/Iz = 33.3, so the effective "
                           "penalty on the input is w_rdot*D^2 -- 120 gave 1.3e5 against w_delta = 1, "
                           "which throttled the steering response enough to cost route completion.")
-    lat.add_argument("--w-delta", type=float, default=0.3,
+    lat.add_argument("--w-delta", type=float, default=0.4501,
                      help="steer magnitude weight, 'mpc'/'mpc-kf' only -- see --kin-w-delta for 'mpc-kin'")
-    lat.add_argument("--w-ddelta", type=float, default=32.4,
+    lat.add_argument("--w-ddelta", type=float, default=99.0259,
                      help="steer rate weight, 'mpc'/'mpc-kf' only -- raised from 1 in the same B2D-"
                           "penalty search that set --ay-max: with the curve-speed cap doing most of the "
                           "comfort work, a stiffer rate cost here trims the rest without hurting "
@@ -838,31 +843,33 @@ def main():
     # tuned for one model has no reason to transfer to the other. --lat-np/--lat-nc/--delta-max-deg/
     # --ddelta-max-deg above ARE still shared -- those are horizon length and actuator limits, not
     # model-specific cost weights.
-    NOTE_KIN_TUNE = ("Retuned 2026-08-25 at 10 m/s ONLY, against the same re-measured Stanley "
-                     "baseline --w-ey's note describes. All seven knobs were searched TOGETHER "
-                     "(random screening, repeated-median verification, local refinement), not one at "
-                     "a time -- --kin-w-r's own help below still records 'little effect either way', "
-                     "which held only while the other weights sat at their old defaults. The hard "
-                     "requirement was that all FOUR error metrics beat Stanley. Measured, 5-run "
-                     "medians: cross 0.123 m RMSE / 0.283 m peak vs 0.146/0.304, heading 2.49 deg "
-                     "RMSE / 10.24 deg peak vs 3.61/13.45 -- all four pass, and only 2 of the 13 "
-                     "scored metrics lose to Stanley (a_y peak 1.01x, |jerk| total mean 1.02x). "
-                     "Note the winning weights are all SMALL: leaning on --kin-w-ddelta to keep the "
-                     "steer smooth beat pushing --kin-w-ey/--kin-w-epsi hard. ")
+    NOTE_KIN_TUNE = (
+                     'Retuned 2026-08-26 at 10 m/s, against the cached Stanley baseline in run_cache/ (cross '
+                     '0.135/0.303 m, heading 3.31/13.24 deg, Comfortness 0.270). All seven knobs were searched '
+                     'TOGETHER (population perturbation -- every weight jittered log-normally at once, never '
+                     'one at a time), scored on repeated medians. The hard requirement was that all FOUR error '
+                     'metrics beat Stanley with real margin. Measured, 14-run medians at 10 m/s: cross 0.103 m '
+                     'RMSE / 0.259 m peak, heading 2.36 / 9.53 deg -- ratios 0.76 / 0.86 / 0.71 / 0.72, plus '
+                     'Comfortness 0.333 vs 0.270. The 5 metrics that still lose to Stanley are all in the MEAN '
+                     'family (a_y mean/peak, yaw-rate mean, yaw-accel mean, |jerk| total mean): tracking the '
+                     'curvature accurately forces a_y = v^2*kappa, so those means cannot be won without giving '
+                     'the path back. Note the winning weights are SMALL on --kin-w-delta and LARGE on --kin-w- '
+                     'ey relative to the old defaults -- leaning on the steer-magnitude cost was what the old '
+                     'tuning did, and it cost cross-track margin.')
     kin = parser.add_argument_group("lateral MPC (kinematic, --controller mpc-kin)")
     # mpc-kin gets its OWN horizon knobs. --lat-np/--lat-nc are shared by "mpc"/"mpc-kf"/"mpc-kin",
     # so tuning the horizon for one of them silently retunes the others -- and "mpc-kf"'s pair is
     # already fixed by its own search. Default None = fall back to the shared value, so leaving
     # these alone reproduces exactly what this script did before they existed.
-    kin.add_argument("--kin-np", dest="kin_n_p", type=int, default=15,
+    kin.add_argument("--kin-np", dest="kin_n_p", type=int, default=14,
                      help="'mpc-kin' prediction horizon (steps). Shorter than --lat-np's 20 on "
                           "purpose: the kinematic model has no tyre slip, so the further ahead it "
                           "predicts the more it is predicting a car that does not exist. None "
                           "falls back to --lat-np")
-    kin.add_argument("--kin-nc", dest="kin_n_c", type=int, default=4,
+    kin.add_argument("--kin-nc", dest="kin_n_c", type=int, default=3,
                      help="'mpc-kin' control horizon (steps, <= --kin-np). None falls back to "
                           "--lat-nc")
-    kin.add_argument("--kin-w-ey", type=float, default=3.43,
+    kin.add_argument("--kin-w-ey", type=float, default=18.5776,
                      help="cross-track error weight. mpc_mpc_kinematic.py's own default is 3.0: a "
                           "10 m/s closed-loop check on this route found w_ey>=6 (with w_epsi scaled "
                           "alongside it) threw the loop into steer oscillation under THAT file's "
@@ -883,9 +890,9 @@ def main():
                           "up -- this looks like the no-slip kinematic model's own structural floor on "
                           "this route's low-speed corners, not something --kin-w-ey alone closes the "
                           "rest of the way. See --kin-w-epsi (scaled alongside this)")
-    kin.add_argument("--kin-w-epsi", type=float, default=2.0,
+    kin.add_argument("--kin-w-epsi", type=float, default=2.0164,
                      help="heading error weight -- see --kin-w-ey. " + NOTE_KIN_TUNE)
-    kin.add_argument("--kin-w-r", type=float, default=2.93,
+    kin.add_argument("--kin-w-r", type=float, default=1.14,
                      help="steering-vs-Ackermann-feedforward tracking weight (delta -> L*kappa, see "
                           "LateralMPCKinematic's docstring) -- off by default. Measured to have very "
                           "little effect either way on the oscillation described under --kin-w-ey (it "
@@ -893,9 +900,12 @@ def main():
                           "speed the real car needs more delta than that for the same curvature, so "
                           "this term pulls delta toward a value that's measurably too small. Left at 0 "
                           "since --kin-w-ey/--kin-w-epsi's own e_psi feedback already supplies the "
-                          "steering demand, correctly sized, without this potentially-biased assist")
-    kin.add_argument("--kin-w-delta", type=float, default=1.8, help="steer magnitude weight")
-    kin.add_argument("--kin-w-ddelta", type=float, default=87.0,
+                          "steering demand, correctly sized, without this potentially-biased assist. "
+                          "The 2026-08-26 joint search nevertheless settled on ~1.14 rather than "
+                          "0: with --kin-w-delta driven down to ~0.11 the steer command needs "
+                          "SOME anchor, and a mildly-too-small Ackermann target beat none")
+    kin.add_argument("--kin-w-delta", type=float, default=0.1126, help="steer magnitude weight")
+    kin.add_argument("--kin-w-ddelta", type=float, default=84.4172,
                      help="steer rate weight -- also measured to have little effect on the --kin-w-ey "
                           "oscillation on its own (see there), but doesn't hurt and gives some extra "
                           "smoothing on top of the w_ey/w_epsi fix")
